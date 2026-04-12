@@ -1,5 +1,18 @@
 {
   "enabledPlugins": {
     "telegram@claude-plugins-official": true
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "FILE_PATH=$(cat - | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d.get('tool_input',{}).get('file_path',''))\" 2>/dev/null); if echo \"$FILE_PATH\" | grep -q 'briefing-book/docs/'; then python3 ~/Edwin/briefing-book/scripts/obsidian-publish --all 2>/dev/null; fi"
+          }
+        ]
+      }
+    ]
   }
 }

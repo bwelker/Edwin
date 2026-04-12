@@ -33,7 +33,7 @@ That's it. `setup.sh` installs the infrastructure (Qdrant, Neo4j, Ollama) and op
 
 If you set up Telegram during setup, launch with the channel flag instead:
 ```bash
-claude --channels plugin:telegram@claude-plugins-official
+claude --channels plugin:telegram@claude-plugins-official mcp:events
 ```
 
 ### Requirements
@@ -113,7 +113,7 @@ Edwin ships with Telegram as the default communication channel. Telegram's BotFa
    The repo includes `.claude/settings.json` which enables the plugin automatically, but the plugin binary must be installed once per machine.
 4. **Launch Edwin with the channel:**
    ```bash
-   claude --channels plugin:telegram@claude-plugins-official
+   claude --channels plugin:telegram@claude-plugins-official mcp:events
    ```
 5. **Pair your phone.** Open Telegram and DM your bot. It will reply with a pairing code.
 6. **Approve the pairing.** In the Claude Code terminal:

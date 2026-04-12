@@ -343,7 +343,7 @@ ACCESSEOF
     echo "  To connect your phone:"
     echo "    1. Install the plugin (first time only):"
     echo "         claude /install-plugin telegram@claude-plugins-official"
-    echo "    2. Launch Edwin:  claude --channels plugin:telegram@claude-plugins-official"
+    echo "    2. Launch Edwin:  claude --channels plugin:telegram@claude-plugins-official mcp:events"
     echo "    3. Open Telegram and message @${TELEGRAM_BOT_USERNAME}"
     echo "    4. You'll get a pairing code -- enter it in the terminal:"
     echo "         /telegram:access pair <CODE>"
@@ -370,7 +370,7 @@ echo "  Next step:"
 echo "    cd $EDWIN_HOME"
 if [[ -n "$TELEGRAM_BOT_USERNAME" ]]; then
 echo "    claude /install-plugin telegram@claude-plugins-official   # first time only"
-echo "    claude --channels plugin:telegram@claude-plugins-official"
+echo "    claude --channels plugin:telegram@claude-plugins-official mcp:events"
 else
 echo "    claude"
 fi
