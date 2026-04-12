@@ -1,0 +1,823 @@
+#!/usr/bin/env python3
+"""
+O365 CLI -- Microsoft Graph API wrapper for Teams, Mail, Calendar
+
+Standalone tool for ad-hoc real-time queries against Microsoft Graph.
+Different from connectors/o365/ which handles batch sync.
+
+Auth config (checked in order):
+  1. Environment variables: AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, EDWIN_O365_EMAIL
+  2. Credential file: ~/.edwin/credentials/o365/env
+"""
+
+import os
+import sys
+import json
+import argparse
+import requests
+from datetime import datetime, timedelta
+from pathlib import Path
+
+try:
+    import pytz
+except ImportError:
+    pytz = None
+
+
+def _load_credential_env():
+    """Load credentials from ~/.edwin/credentials/o365/env if not already in environment."""
+    env_file = Path.home() / ".edwin" / "credentials" / "o365" / "env"
+    if not env_file.exists():
+        return
+    with open(env_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and val and key not in os.environ:
+                    os.environ[key] = val
+
+
+# Load credential file as fallback
+_load_credential_env()
+
+TENANT_ID = os.environ.get("AZURE_TENANT_ID", "")
+CLIENT_ID = os.environ.get("AZURE_CLIENT_ID", "")
+EMAIL_ADDRESS = os.environ.get("EDWIN_O365_EMAIL", "")
+
+DELEGATED_TOKEN_FILE = Path.home() / ".edwin" / "credentials" / "o365" / "delegated-token.json"
+DELEGATED_REDIRECT_URI = "http://localhost:8400/callback"
+DELEGATED_SCOPES = "Chat.ReadWrite ChatMessage.Send Chat.Create Chat.ReadWrite.All offline_access"
+
+
+def _require_config():
+    """Validate that required config values are present."""
+    missing = []
+    if not TENANT_ID:
+        missing.append("AZURE_TENANT_ID")
+    if not CLIENT_ID:
+        missing.append("AZURE_CLIENT_ID")
+    if not EMAIL_ADDRESS:
+        missing.append("EDWIN_O365_EMAIL")
+    if missing:
+        print(f"Missing required config: {', '.join(missing)}", file=sys.stderr)
+        print("Set via environment variables or ~/.edwin/credentials/o365/env", file=sys.stderr)
+        sys.exit(1)
+
+
+def get_client_secret():
+    """Get client secret from environment or credential file."""
+    secret = os.environ.get("AZURE_CLIENT_SECRET", "")
+    if secret:
+        return secret
+    # Already loaded from credential file by _load_credential_env
+    print("AZURE_CLIENT_SECRET not found in environment or ~/.edwin/credentials/o365/env", file=sys.stderr)
+    sys.exit(1)
+
+
+def get_access_token():
+    """Get Microsoft Graph API access token (app-only / client credentials)"""
+    _require_config()
+    secret = get_client_secret()
+    token_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+
+    data = {
+        "client_id": CLIENT_ID,
+        "client_secret": secret,
+        "scope": "https://graph.microsoft.com/.default",
+        "grant_type": "client_credentials"
+    }
+
+    response = requests.post(token_url, data=data)
+    response.raise_for_status()
+    return response.json()["access_token"]
+
+
+def get_delegated_token():
+    """Get delegated (user) access token for operations that require user context (e.g. Teams send).
+    Uses cached refresh token if available, otherwise initiates OAuth login flow."""
+    _require_config()
+    DELEGATED_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    # Try cached refresh token first
+    if DELEGATED_TOKEN_FILE.exists():
+        with open(DELEGATED_TOKEN_FILE) as f:
+            cached = json.load(f)
+
+        # Check if access token is still valid (with 5 min buffer)
+        expires_at = cached.get("expires_at", 0)
+        if expires_at > datetime.now().timestamp() + 300:
+            return cached["access_token"]
+
+        # Try refresh
+        if cached.get("refresh_token"):
+            secret = get_client_secret()
+            token_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+            data = {
+                "client_id": CLIENT_ID,
+                "client_secret": secret,
+                "refresh_token": cached["refresh_token"],
+                "grant_type": "refresh_token",
+                "scope": DELEGATED_SCOPES,
+            }
+            response = requests.post(token_url, data=data)
+            if response.status_code == 200:
+                tokens = response.json()
+                tokens["expires_at"] = datetime.now().timestamp() + tokens.get("expires_in", 3600)
+                with open(DELEGATED_TOKEN_FILE, "w") as f:
+                    json.dump(tokens, f, indent=2)
+                return tokens["access_token"]
+            else:
+                print("Refresh token expired. Need to re-login.", file=sys.stderr)
+
+    # No valid token -- need interactive login
+    return _delegated_login_flow()
+
+
+def _delegated_login_flow():
+    """One-time interactive OAuth login to get delegated tokens."""
+    import http.server
+    import urllib.parse
+    import threading
+    import webbrowser
+
+    secret = get_client_secret()
+    auth_code = [None]
+
+    class CallbackHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            query = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(query)
+            if "code" in params:
+                auth_code[0] = params["code"][0]
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(b"<h1>Login successful!</h1><p>You can close this tab.</p>")
+            else:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b"<h1>Error</h1><p>No auth code received.</p>")
+            threading.Thread(target=self.server.shutdown).start()
+
+        def log_message(self, format, *args):
+            pass  # Suppress server logs
+
+    server = http.server.HTTPServer(("127.0.0.1", 8400), CallbackHandler)
+
+    auth_url = (
+        f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/authorize?"
+        f"client_id={CLIENT_ID}&response_type=code&redirect_uri={DELEGATED_REDIRECT_URI}"
+        f"&scope={DELEGATED_SCOPES.replace(' ', '%20')}&response_mode=query"
+    )
+
+    print(f"\nOpening browser for Microsoft login...", file=sys.stderr)
+    print(f"   If browser doesn't open, go to:\n   {auth_url}\n", file=sys.stderr)
+    webbrowser.open(auth_url)
+
+    server.handle_request()  # Wait for callback
+    server.server_close()
+
+    if not auth_code[0]:
+        print("No authorization code received.", file=sys.stderr)
+        sys.exit(1)
+
+    # Exchange auth code for tokens
+    token_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+    data = {
+        "client_id": CLIENT_ID,
+        "client_secret": secret,
+        "code": auth_code[0],
+        "redirect_uri": DELEGATED_REDIRECT_URI,
+        "grant_type": "authorization_code",
+        "scope": DELEGATED_SCOPES,
+    }
+
+    response = requests.post(token_url, data=data)
+    if response.status_code != 200:
+        print(f"Token exchange failed: {response.text[:300]}", file=sys.stderr)
+        sys.exit(1)
+
+    tokens = response.json()
+    tokens["expires_at"] = datetime.now().timestamp() + tokens.get("expires_in", 3600)
+
+    with open(DELEGATED_TOKEN_FILE, "w") as f:
+        json.dump(tokens, f, indent=2)
+
+    print("Delegated auth successful. Token cached.", file=sys.stderr)
+    return tokens["access_token"]
+
+
+def search_teams(args):
+    """Search Teams messages"""
+    token = get_access_token()
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Get user's Teams chats
+    url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_ADDRESS}/chats"
+    params = {"$expand": "lastMessagePreview"}
+
+    if args.max:
+        params["$top"] = args.max
+
+    response = requests.get(url, headers=headers, params=params)
+    response.raise_for_status()
+    chats = response.json().get("value", [])
+
+    # Filter by query if provided
+    if args.query:
+        query_lower = args.query.lower()
+        filtered_chats = []
+        for chat in chats:
+            # Get chat messages to search content
+            messages_url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_ADDRESS}/chats/{chat['id']}/messages"
+            messages_params = {"$top": 50}
+            messages_response = requests.get(messages_url, headers=headers, params=messages_params)
+
+            if messages_response.status_code == 200:
+                messages = messages_response.json().get("value", [])
+                # Search in message bodies and senders
+                for msg in messages:
+                    body = msg.get("body", {}).get("content", "") if msg.get("body") else ""
+                    body = body.lower() if body else ""
+
+                    from_field = msg.get("from")
+                    sender = ""
+                    if from_field and from_field.get("user"):
+                        sender = from_field.get("user", {}).get("displayName", "").lower()
+
+                    if query_lower in body or query_lower in sender:
+                        filtered_chats.append(chat)
+                        break
+        chats = filtered_chats
+
+    # Format output
+    if args.json:
+        print(json.dumps(chats, indent=2))
+    else:
+        for chat in chats:
+            chat_type = chat.get("chatType", "unknown")
+            topic = chat.get("topic", "(no topic)")
+            last_msg = chat.get("lastMessagePreview") or {}
+            preview = (last_msg.get("body") or {}).get("content", "")[:100]
+            timestamp = last_msg.get("createdDateTime", "")
+
+            print(f"Chat ID: {chat['id']}")
+            print(f"Type: {chat_type}")
+            print(f"Topic: {topic}")
+            print(f"Last message: {timestamp}")
+            print(f"Preview: {preview}")
+            print()
+
+
+def get_chat_messages(args):
+    """Get messages from a specific Teams chat"""
+    token = get_access_token()
+    headers = {"Authorization": f"Bearer {token}"}
+
+    url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_ADDRESS}/chats/{args.chat_id}/messages"
+    params = {}
+
+    if args.max:
+        params["$top"] = args.max
+
+    response = requests.get(url, headers=headers, params=params)
+    response.raise_for_status()
+    messages = response.json().get("value", [])
+
+    # Filter by sender if provided
+    if args.from_user:
+        from_lower = args.from_user.lower()
+        messages = [m for m in messages if from_lower in m.get("from", {}).get("user", {}).get("displayName", "").lower()]
+
+    # Format output
+    if args.json:
+        print(json.dumps(messages, indent=2))
+    else:
+        for msg in messages:
+            sender = (msg.get("from") or {}).get("user", {}).get("displayName", "Unknown") if msg.get("from") else "System"
+            timestamp = msg.get("createdDateTime", "")
+            body = msg.get("body", {}).get("content", "")
+
+            print(f"From: {sender}")
+            print(f"Time: {timestamp}")
+            print(f"Message: {body}")
+            print("-" * 80)
+            print()
+
+
+def search_mail(args):
+    """Search emails"""
+    token = get_access_token()
+    headers = {"Authorization": f"Bearer {token}"}
+
+    url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_ADDRESS}/messages"
+    params = {
+        "$select": "subject,from,receivedDateTime,importance,isRead,bodyPreview"
+    }
+
+    # Handle search vs filter separately
+    search_terms = []
+    filters = []
+
+    if args.query:
+        # Use $search with KQL syntax for text search
+        search_terms.append(f'"{args.query}"')
+
+    if args.from_user:
+        # Use $search for partial name matching
+        search_terms.append(f'"{args.from_user}"')
+
+    # These still use $filter (they work fine)
+    if args.unread:
+        filters.append("isRead eq false")
+    if args.important:
+        filters.append("importance eq 'high'")
+
+    # Apply search parameters
+    if search_terms:
+        params["$search"] = " AND ".join(search_terms)
+        # Don't include $orderby when using $search (Graph API restriction)
+    else:
+        # Only add orderby when not using search
+        params["$orderby"] = "receivedDateTime desc"
+
+    # Apply filters if any
+    if filters:
+        params["$filter"] = " and ".join(filters)
+
+    if args.max:
+        params["$top"] = args.max
+
+    response = requests.get(url, headers=headers, params=params)
+    response.raise_for_status()
+    emails = response.json().get("value", [])
+
+    # Format output
+    if args.json:
+        print(json.dumps(emails, indent=2))
+    else:
+        for email in emails:
+            sender = email.get("from", {}).get("emailAddress", {}).get("name", "Unknown")
+            subject = email.get("subject", "(no subject)")
+            timestamp = email.get("receivedDateTime", "")
+            preview = email.get("bodyPreview", "")[:100]
+            important = "[HIGH] " if email.get("importance") == "high" else ""
+            unread = "[UNREAD] " if not email.get("isRead") else ""
+
+            print(f"{unread}{important}From: {sender}")
+            print(f"Subject: {subject}")
+            print(f"Time: {timestamp}")
+            print(f"Preview: {preview}")
+            print()
+
+
+def read_mail(args):
+    """Read full email body by message ID or subject search"""
+    token = get_access_token()
+    headers = {"Authorization": f"Bearer {token}"}
+
+    message_id = args.message_id
+
+    # If it looks like a search term rather than an ID, find the message first
+    if not message_id or len(message_id) < 50:
+        # Treat as search
+        url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_ADDRESS}/messages"
+        params = {
+            "$search": f'"{message_id}"',
+            "$select": "id,subject,from,receivedDateTime",
+            "$top": 1
+        }
+        response = requests.get(url, headers=headers, params=params)
+        response.raise_for_status()
+        results = response.json().get("value", [])
+        if not results:
+            print(f"No email found matching: {message_id}", file=sys.stderr)
+            sys.exit(1)
+        message_id = results[0]["id"]
+        print(f"Found: {results[0].get('subject', '(no subject)')}")
+        print(f"From: {results[0].get('from', {}).get('emailAddress', {}).get('name', 'Unknown')}")
+        print(f"Date: {results[0].get('receivedDateTime', '')}")
+        print("=" * 80)
+
+    # Fetch full message
+    url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_ADDRESS}/messages/{message_id}"
+    params = {
+        "$select": "subject,from,toRecipients,ccRecipients,receivedDateTime,body,importance,hasAttachments"
+    }
+
+    response = requests.get(url, headers=headers, params=params)
+    response.raise_for_status()
+    email = response.json()
+
+    if args.json:
+        print(json.dumps(email, indent=2))
+    else:
+        sender = email.get("from", {}).get("emailAddress", {})
+        to_list = [r.get("emailAddress", {}).get("address", "") for r in email.get("toRecipients", [])]
+        cc_list = [r.get("emailAddress", {}).get("address", "") for r in email.get("ccRecipients", [])]
+
+        print(f"From: {sender.get('name', '')} <{sender.get('address', '')}>")
+        print(f"To: {', '.join(to_list)}")
+        if cc_list:
+            print(f"CC: {', '.join(cc_list)}")
+        print(f"Subject: {email.get('subject', '(no subject)')}")
+        print(f"Date: {email.get('receivedDateTime', '')}")
+        if email.get("importance") == "high":
+            print("Importance: HIGH")
+        if email.get("hasAttachments"):
+            print("Attachments: Yes")
+        print("=" * 80)
+
+        body = email.get("body", {})
+        content = body.get("content", "")
+        content_type = body.get("contentType", "text")
+
+        if content_type == "html":
+            # Strip HTML tags for readable output
+            import re
+            # Remove style and script blocks
+            content = re.sub(r'<style[^>]*>.*?</style>', '', content, flags=re.DOTALL | re.IGNORECASE)
+            content = re.sub(r'<script[^>]*>.*?</script>', '', content, flags=re.DOTALL | re.IGNORECASE)
+            # Replace common HTML elements
+            content = re.sub(r'<br\s*/?>', '\n', content, flags=re.IGNORECASE)
+            content = re.sub(r'</?p[^>]*>', '\n', content, flags=re.IGNORECASE)
+            content = re.sub(r'</?div[^>]*>', '\n', content, flags=re.IGNORECASE)
+            content = re.sub(r'</?tr[^>]*>', '\n', content, flags=re.IGNORECASE)
+            content = re.sub(r'</?td[^>]*>', ' | ', content, flags=re.IGNORECASE)
+            content = re.sub(r'</?li[^>]*>', '\n- ', content, flags=re.IGNORECASE)
+            # Remove remaining tags
+            content = re.sub(r'<[^>]+>', '', content)
+            # Clean up whitespace
+            content = re.sub(r'\n{3,}', '\n\n', content)
+            content = content.strip()
+
+        print(content)
+
+
+def send_mail(args):
+    """Send an email"""
+    token = get_access_token()
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    # Build recipients
+    to_recipients = [{"emailAddress": {"address": addr.strip()}} for addr in args.to.split(",")]
+
+    cc_recipients = []
+    if args.cc:
+        cc_recipients = [{"emailAddress": {"address": addr.strip()}} for addr in args.cc.split(",")]
+
+    message = {
+        "subject": args.subject,
+        "body": {
+            "contentType": "HTML" if args.html else "Text",
+            "content": args.body
+        },
+        "toRecipients": to_recipients
+    }
+
+    if cc_recipients:
+        message["ccRecipients"] = cc_recipients
+
+    if args.importance:
+        message["importance"] = args.importance
+
+    if args.reply_to:
+        # This is a reply -- fetch original and reply
+        url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_ADDRESS}/messages/{args.reply_to}/reply"
+        payload = {"message": message, "comment": args.body}
+        response = requests.post(url, headers=headers, json=payload)
+    elif args.draft:
+        # Create as draft only
+        url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_ADDRESS}/messages"
+        message["isDraft"] = True
+        response = requests.post(url, headers=headers, json=message)
+    else:
+        # Send immediately
+        url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_ADDRESS}/sendMail"
+        payload = {"message": message, "saveToSentItems": True}
+        response = requests.post(url, headers=headers, json=payload)
+
+    if response.status_code in (200, 201, 202):
+        if args.draft:
+            msg_id = response.json().get("id", "")
+            print(f"Draft created (ID: {msg_id[:20]}...)")
+        else:
+            print(f"Email sent to {args.to}")
+    else:
+        print(f"Failed ({response.status_code}): {response.text[:200]}", file=sys.stderr)
+        sys.exit(1)
+
+
+def create_event(args):
+    """Create a calendar event"""
+    token = get_access_token()
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    tz_name = os.environ.get("EDWIN_TIMEZONE", "Eastern Standard Time")
+
+    event = {
+        "subject": args.subject,
+        "start": {
+            "dateTime": args.start,
+            "timeZone": tz_name
+        },
+        "end": {
+            "dateTime": args.end,
+            "timeZone": tz_name
+        }
+    }
+
+    if args.body:
+        event["body"] = {"contentType": "HTML" if args.html else "Text", "content": args.body}
+
+    if args.location:
+        event["location"] = {"displayName": args.location}
+
+    if args.attendees:
+        event["attendees"] = [
+            {"emailAddress": {"address": addr.strip()}, "type": "required"}
+            for addr in args.attendees.split(",")
+        ]
+
+    if args.teams:
+        event["isOnlineMeeting"] = True
+        event["onlineMeetingProvider"] = "teamsForBusiness"
+
+    if args.all_day:
+        event["isAllDay"] = True
+
+    url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_ADDRESS}/events"
+    response = requests.post(url, headers=headers, json=event)
+
+    if response.status_code == 201:
+        evt = response.json()
+        print(f"Event created: {evt.get('subject')}")
+        if evt.get("onlineMeeting"):
+            print(f"   Teams link: {evt['onlineMeeting'].get('joinUrl', '')}")
+        print(f"   ID: {evt.get('id', '')[:30]}...")
+    else:
+        print(f"Failed ({response.status_code}): {response.text[:200]}", file=sys.stderr)
+        sys.exit(1)
+
+
+def delete_event(args):
+    """Delete/cancel a calendar event"""
+    token = get_access_token()
+    headers = {"Authorization": f"Bearer {token}"}
+
+    url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_ADDRESS}/events/{args.event_id}"
+
+    if args.cancel:
+        # Send cancellation to attendees
+        cancel_url = f"{url}/cancel"
+        payload = {"comment": args.comment or "Meeting cancelled"}
+        response = requests.post(cancel_url, headers={**headers, "Content-Type": "application/json"}, json=payload)
+    else:
+        response = requests.delete(url, headers=headers)
+
+    if response.status_code == 204 or response.status_code == 202:
+        print("Event deleted/cancelled")
+    else:
+        print(f"Failed ({response.status_code}): {response.text[:200]}", file=sys.stderr)
+        sys.exit(1)
+
+
+def check_availability(args):
+    """Check free/busy for users"""
+    token = get_access_token()
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    tz_name = os.environ.get("EDWIN_TIMEZONE", "Eastern Standard Time")
+    schedules = [addr.strip() for addr in args.users.split(",")]
+
+    payload = {
+        "schedules": schedules,
+        "startTime": {"dateTime": args.start, "timeZone": tz_name},
+        "endTime": {"dateTime": args.end, "timeZone": tz_name},
+        "availabilityViewInterval": args.interval or 30
+    }
+
+    url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_ADDRESS}/calendar/getSchedule"
+    response = requests.post(url, headers=headers, json=payload)
+
+    if response.status_code == 200:
+        data = response.json()
+        for sched in data.get("value", []):
+            email = sched.get("scheduleId", "")
+            print(f"\n=== {email} ===")
+            print(f"Availability: {sched.get('availabilityView', '')}")
+            for item in sched.get("scheduleItems", []):
+                start = item.get("start", {}).get("dateTime", "")
+                end = item.get("end", {}).get("dateTime", "")
+                subj = item.get("subject", "(private)")
+                status = item.get("status", "")
+                print(f"  {start} - {end} | {status} | {subj}")
+    else:
+        print(f"Failed ({response.status_code}): {response.text[:200]}", file=sys.stderr)
+        sys.exit(1)
+
+
+def send_teams_message(args):
+    """Send a Teams chat message (requires delegated auth)"""
+    token = get_delegated_token()
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    # Delegated auth uses /me/ not /users/{id}/
+    url = f"https://graph.microsoft.com/v1.0/me/chats/{args.chat_id}/messages"
+    payload = {
+        "body": {
+            "contentType": "html" if args.html else "text",
+            "content": args.message
+        }
+    }
+
+    response = requests.post(url, headers=headers, json=payload)
+
+    if response.status_code == 201:
+        print("Teams message sent")
+    else:
+        print(f"Failed ({response.status_code}): {response.text[:200]}", file=sys.stderr)
+        sys.exit(1)
+
+
+def get_calendar(args):
+    """Get calendar events"""
+    token = get_access_token()
+    headers = {"Authorization": f"Bearer {token}"}
+    headers["Prefer"] = 'outlook.timezone="America/New_York"'
+
+    # Parse date range
+    if pytz:
+        tz = pytz.timezone("America/New_York")
+    else:
+        from datetime import timezone
+        tz = timezone(timedelta(hours=-5))
+
+    if args.from_date:
+        start = datetime.fromisoformat(args.from_date)
+        if start.tzinfo is None and pytz:
+            start = pytz.timezone("America/New_York").localize(start)
+    else:
+        if pytz:
+            start = datetime.now(pytz.timezone("America/New_York")).replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    if args.to_date:
+        end = datetime.fromisoformat(args.to_date)
+        if end.tzinfo is None and pytz:
+            end = pytz.timezone("America/New_York").localize(end)
+    else:
+        end = start + timedelta(days=7)
+
+    url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_ADDRESS}/calendar/calendarView"
+    params = {
+        "startDateTime": start.isoformat(),
+        "endDateTime": end.isoformat(),
+        "$select": "subject,start,end,isAllDay,location,organizer,isCancelled",
+        "$orderby": "start/dateTime"
+    }
+
+    response = requests.get(url, headers=headers, params=params)
+    response.raise_for_status()
+    events = response.json().get("value", [])
+
+    # Filter out cancelled
+    events = [e for e in events if not e.get("isCancelled", False)]
+
+    # Format output
+    if args.json:
+        print(json.dumps(events, indent=2))
+    else:
+        for event in events:
+            subject = event.get("subject", "(no subject)")
+            is_all_day = event.get("isAllDay", False)
+            location = event.get("location", {}).get("displayName", "")
+
+            if is_all_day:
+                time_str = "All day"
+            else:
+                start_str = event["start"]["dateTime"]
+                dt = datetime.fromisoformat(start_str.split(".")[0])
+                time_str = dt.strftime("%-I:%M %p")
+
+            print(f"{time_str} -- {subject}")
+            if location:
+                print(f"  Location: {location}")
+            print()
+
+def main():
+    parser = argparse.ArgumentParser(description="O365 CLI -- Microsoft Graph API wrapper")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # Teams search
+    teams_parser = subparsers.add_parser("teams", help="Search Teams messages")
+    teams_parser.add_argument("--query", help="Search query")
+    teams_parser.add_argument("--max", type=int, help="Max results")
+    teams_parser.add_argument("--json", action="store_true", help="JSON output")
+
+    # Teams messages from chat
+    messages_parser = subparsers.add_parser("messages", help="Get messages from a Teams chat")
+    messages_parser.add_argument("chat_id", help="Chat ID")
+    messages_parser.add_argument("--from-user", help="Filter by sender name")
+    messages_parser.add_argument("--max", type=int, help="Max messages")
+    messages_parser.add_argument("--json", action="store_true", help="JSON output")
+
+    # Mail search
+    mail_parser = subparsers.add_parser("mail", help="Search emails")
+    mail_parser.add_argument("--query", help="Search query")
+    mail_parser.add_argument("--from-user", help="Filter by sender")
+    mail_parser.add_argument("--unread", action="store_true", help="Only unread")
+    mail_parser.add_argument("--important", action="store_true", help="Only important")
+    mail_parser.add_argument("--max", type=int, help="Max results")
+    mail_parser.add_argument("--json", action="store_true", help="JSON output")
+
+    # Mail read
+    read_parser = subparsers.add_parser("read", help="Read full email body")
+    read_parser.add_argument("message_id", help="Message ID or search term")
+    read_parser.add_argument("--json", action="store_true", help="JSON output")
+
+    # Calendar
+    calendar_parser = subparsers.add_parser("calendar", help="Get calendar events")
+    calendar_parser.add_argument("--from-date", help="Start date (ISO format)")
+    calendar_parser.add_argument("--to-date", help="End date (ISO format)")
+    calendar_parser.add_argument("--json", action="store_true", help="JSON output")
+
+    # Send email
+    send_parser = subparsers.add_parser("send", help="Send an email")
+    send_parser.add_argument("--to", required=True, help="Recipient(s), comma-separated")
+    send_parser.add_argument("--cc", help="CC recipient(s), comma-separated")
+    send_parser.add_argument("--subject", required=True, help="Email subject")
+    send_parser.add_argument("--body", required=True, help="Email body")
+    send_parser.add_argument("--html", action="store_true", help="Body is HTML")
+    send_parser.add_argument("--importance", choices=["low", "normal", "high"], help="Importance level")
+    send_parser.add_argument("--draft", action="store_true", help="Create as draft only (don't send)")
+    send_parser.add_argument("--reply-to", help="Message ID to reply to")
+
+    # Create calendar event
+    event_parser = subparsers.add_parser("event", help="Create a calendar event")
+    event_parser.add_argument("--subject", required=True, help="Event subject")
+    event_parser.add_argument("--start", required=True, help="Start datetime (e.g. 2026-03-10T10:00:00)")
+    event_parser.add_argument("--end", required=True, help="End datetime")
+    event_parser.add_argument("--body", help="Event description")
+    event_parser.add_argument("--html", action="store_true", help="Body is HTML")
+    event_parser.add_argument("--location", help="Location")
+    event_parser.add_argument("--attendees", help="Attendee emails, comma-separated")
+    event_parser.add_argument("--teams", action="store_true", help="Add Teams meeting link")
+    event_parser.add_argument("--all-day", action="store_true", help="All-day event")
+
+    # Delete/cancel event
+    cancel_parser = subparsers.add_parser("cancel", help="Delete/cancel a calendar event")
+    cancel_parser.add_argument("event_id", help="Event ID to delete")
+    cancel_parser.add_argument("--cancel", action="store_true", help="Send cancellation to attendees")
+    cancel_parser.add_argument("--comment", help="Cancellation comment")
+
+    # Check availability
+    avail_parser = subparsers.add_parser("availability", help="Check free/busy for users")
+    avail_parser.add_argument("--users", required=True, help="Email addresses, comma-separated")
+    avail_parser.add_argument("--start", required=True, help="Start datetime")
+    avail_parser.add_argument("--end", required=True, help="End datetime")
+    avail_parser.add_argument("--interval", type=int, default=30, help="Interval in minutes (default 30)")
+
+    # Send Teams message
+    teams_send_parser = subparsers.add_parser("teams-send", help="Send a Teams chat message")
+    teams_send_parser.add_argument("--chat-id", required=True, help="Teams chat ID")
+    teams_send_parser.add_argument("--message", required=True, help="Message content")
+    teams_send_parser.add_argument("--html", action="store_true", help="Message is HTML")
+
+    args = parser.parse_args()
+
+    try:
+        if args.command == "teams":
+            search_teams(args)
+        elif args.command == "messages":
+            get_chat_messages(args)
+        elif args.command == "mail":
+            search_mail(args)
+        elif args.command == "read":
+            read_mail(args)
+        elif args.command == "calendar":
+            get_calendar(args)
+        elif args.command == "send":
+            send_mail(args)
+        elif args.command == "event":
+            create_event(args)
+        elif args.command == "cancel":
+            delete_event(args)
+        elif args.command == "availability":
+            check_availability(args)
+        elif args.command == "teams-send":
+            send_teams_message(args)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

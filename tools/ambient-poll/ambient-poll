@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""
+Edwin Ambient Polling
+
+Checks calendar, Teams, and Limitless on a cadence and writes a
+"what's happening now" snapshot. Gives Edwin awareness of the user's
+current context even when not in an active conversation.
+
+Data sources are optional -- the tool gracefully skips any that aren't configured.
+
+Usage:
+    ambient-poll snap              # Take a snapshot now
+    ambient-poll snap --json       # Output JSON
+    ambient-poll history           # Show last 5 snapshots
+
+Reads from:
+  - ~/Edwin/data/o365/calendar/YYYY-MM/YYYY-MM-DD.md (today's calendar)
+  - ~/Edwin/data/o365/teams-daily/*/YYYY-MM-DD.md (today's Teams messages)
+  - ~/Edwin/data/limitless/lifelogs/YYYY-MM/*.md (today's Limitless)
+
+Writes to: ~/Edwin/data/ambient/YYYY-MM-DD-HHMM.json
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, date, timedelta
+from pathlib import Path
+from collections import defaultdict
+
+EDWIN_HOME = Path(os.environ.get("EDWIN_HOME", Path.home() / "Edwin"))
+DATA_DIR = EDWIN_HOME / "data"
+OUTPUT_DIR = DATA_DIR / "ambient"
+
+
+def get_todays_calendar() -> list[dict]:
+    """Get today's calendar events. Returns empty list if calendar data not available."""
+    today = date.today()
+    cal_file = DATA_DIR / "o365" / "calendar" / today.strftime("%Y-%m") / f"{today.isoformat()}.md"
+
+    if not cal_file.exists():
+        return []
+
+    events = []
+    content = cal_file.read_text()
+    blocks = content.split("---")
+
+    for block in blocks:
+        meta = {}
+        for line in block.strip().split("\n"):
+            if ":" in line:
+                key, _, val = line.partition(":")
+                key = key.strip()
+                val = val.strip()
+                if key in ("subject", "start", "end", "organizer", "online"):
+                    meta[key] = val
+
+        if meta.get("subject") and meta.get("start"):
+            events.append(meta)
+
+    return events
+
+
+def get_current_meeting(events: list[dict]) -> dict | None:
+    """Determine if the user is currently in a meeting."""
+    now = datetime.now()
+
+    for event in events:
+        try:
+            start = datetime.strptime(event["start"], "%Y-%m-%d %H:%M")
+            end = datetime.strptime(event["end"], "%Y-%m-%d %H:%M")
+            if start <= now <= end:
+                return event
+        except (ValueError, KeyError):
+            continue
+
+    return None
+
+
+def get_next_meeting(events: list[dict]) -> dict | None:
+    """Get the next upcoming meeting."""
+    now = datetime.now()
+    upcoming = []
+
+    for event in events:
+        try:
+            start = datetime.strptime(event["start"], "%Y-%m-%d %H:%M")
+            if start > now:
+                upcoming.append((start, event))
+        except (ValueError, KeyError):
+            continue
+
+    if upcoming:
+        upcoming.sort(key=lambda x: x[0])
+        return upcoming[0][1]
+
+    return None
+
+
+def get_teams_activity() -> dict:
+    """Get today's Teams message activity. Returns empty data if Teams not configured."""
+    today = date.today().isoformat()
+    teams_dir = DATA_DIR / "o365" / "teams-daily"
+
+    if not teams_dir.exists():
+        return {"total_messages": 0, "active_chats": [], "available": False}
+
+    total = 0
+    active_chats = []
+
+    for chat_dir in teams_dir.iterdir():
+        if not chat_dir.is_dir():
+            continue
+
+        daily_file = chat_dir / f"{today}.md"
+        if not daily_file.exists():
+            continue
+
+        # Count messages in this file
+        content = daily_file.read_text()
+        msg_count = content.count("source: o365-teams")
+        if msg_count > 0:
+            # Get the most recent sender
+            lines = content.strip().split("\n")
+            last_from = ""
+            last_date = ""
+            for line in lines:
+                if line.startswith("from:"):
+                    last_from = line.split(":", 1)[1].strip()
+                elif line.startswith("date:"):
+                    last_date = line.split(":", 1)[1].strip()
+
+            active_chats.append({
+                "chat": chat_dir.name,
+                "messages": msg_count,
+                "last_from": last_from,
+                "last_date": last_date,
+            })
+            total += msg_count
+
+    # Sort by most recent activity
+    active_chats.sort(key=lambda c: c.get("last_date", ""), reverse=True)
+
+    return {
+        "total_messages": total,
+        "active_chats": active_chats[:10],  # Top 10 most active
+        "available": True,
+    }
+
+
+def get_limitless_activity() -> dict:
+    """Get today's Limitless lifelog activity. Returns empty data if Limitless not configured."""
+    today = date.today()
+    limitless_dir = DATA_DIR / "limitless" / "lifelogs" / today.strftime("%Y-%m")
+
+    if not limitless_dir.exists():
+        return {"conversations": 0, "topics": [], "available": False}
+
+    conversations = []
+    for f in sorted(limitless_dir.glob(f"{today.isoformat()}*.md")):
+        # Extract topic from filename
+        name = f.stem
+        # Format: YYYY-MM-DD-HHMM-topic-title
+        parts = name.split("-", 4)
+        topic = parts[4].replace("-", " ").title() if len(parts) > 4 else "Unknown"
+
+        # Get file size as proxy for conversation length
+        size = f.stat().st_size
+
+        conversations.append({
+            "topic": topic,
+            "file": f.name,
+            "size_kb": round(size / 1024, 1),
+        })
+
+    return {
+        "conversations": len(conversations),
+        "topics": conversations[-5:],  # Last 5
+        "available": True,
+    }
+
+
+def take_snapshot() -> dict:
+    """Take a complete ambient snapshot."""
+    now = datetime.now()
+
+    events = get_todays_calendar()
+    current_meeting = get_current_meeting(events)
+    next_meeting = get_next_meeting(events)
+    teams = get_teams_activity()
+    limitless = get_limitless_activity()
+
+    # Track which data sources are available
+    sources = {
+        "calendar": len(events) > 0 or (DATA_DIR / "o365" / "calendar").exists(),
+        "teams": teams.get("available", False),
+        "limitless": limitless.get("available", False),
+    }
+
+    snapshot = {
+        "timestamp": now.isoformat(),
+        "date": now.strftime("%Y-%m-%d"),
+        "time": now.strftime("%H:%M"),
+        "day_of_week": now.strftime("%A"),
+        "sources": sources,
+        "calendar": {
+            "total_events": len(events),
+            "current_meeting": current_meeting,
+            "next_meeting": next_meeting,
+            "all_events": [e.get("subject", "?") for e in events],
+        },
+        "teams": {k: v for k, v in teams.items() if k != "available"},
+        "limitless": {k: v for k, v in limitless.items() if k != "available"},
+        "summary": _build_summary(current_meeting, next_meeting, teams, limitless, sources),
+    }
+
+    return snapshot
+
+
+def _build_summary(current: dict | None, next_mtg: dict | None,
+                   teams: dict, limitless: dict, sources: dict) -> str:
+    """Build a one-line human-readable summary."""
+    parts = []
+
+    if current:
+        parts.append(f"In meeting: {current.get('subject', '?')}")
+    elif next_mtg:
+        try:
+            start = datetime.strptime(next_mtg["start"], "%Y-%m-%d %H:%M")
+            delta = start - datetime.now()
+            mins = int(delta.total_seconds() / 60)
+            if mins > 0:
+                parts.append(f"Next meeting in {mins}m: {next_mtg.get('subject', '?')}")
+        except (ValueError, KeyError):
+            pass
+    elif sources.get("calendar"):
+        parts.append("No upcoming meetings today")
+
+    if sources.get("teams"):
+        if teams["total_messages"] > 0:
+            parts.append(f"{teams['total_messages']} Teams messages across {len(teams['active_chats'])} chats")
+        else:
+            parts.append("No Teams activity today")
+
+    if sources.get("limitless"):
+        if limitless["conversations"] > 0:
+            parts.append(f"{limitless['conversations']} Limitless conversations")
+
+    if not parts:
+        parts.append("No data sources available")
+
+    return " | ".join(parts)
+
+
+def save_snapshot(snapshot: dict):
+    """Save snapshot to file."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    filename = f"{snapshot['date']}-{snapshot['time'].replace(':', '')}.json"
+    filepath = OUTPUT_DIR / filename
+    filepath.write_text(json.dumps(snapshot, indent=2))
+    return filepath
+
+
+def show_history(count: int = 5):
+    """Show recent snapshots."""
+    if not OUTPUT_DIR.exists():
+        print("No snapshots yet.")
+        return
+
+    files = sorted(OUTPUT_DIR.glob("*.json"), reverse=True)[:count]
+    for f in files:
+        try:
+            snap = json.loads(f.read_text())
+            print(f"[{snap.get('time', '?')}] {snap.get('summary', 'no summary')}")
+        except Exception:
+            print(f"[?] Error reading {f.name}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Edwin Ambient Polling")
+    parser.add_argument("command", choices=["snap", "history"])
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--count", type=int, default=5)
+    args = parser.parse_args()
+
+    if args.command == "history":
+        show_history(args.count)
+        return
+
+    snapshot = take_snapshot()
+    filepath = save_snapshot(snapshot)
+
+    if args.json:
+        print(json.dumps(snapshot, indent=2))
+    else:
+        print(f"Snapshot saved: {filepath}")
+        print(f"Summary: {snapshot['summary']}")
+        print(f"Calendar: {snapshot['calendar']['total_events']} events")
+        if snapshot['sources'].get('teams'):
+            print(f"Teams: {snapshot['teams']['total_messages']} messages")
+        if snapshot['sources'].get('limitless'):
+            print(f"Limitless: {snapshot['limitless']['conversations']} conversations")
+
+
+if __name__ == "__main__":
+    main()

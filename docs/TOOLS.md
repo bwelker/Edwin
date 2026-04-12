@@ -8,22 +8,29 @@ Reference for every real-time surface Edwin can reach. Use this BEFORE defaultin
 
 ## Real-Time Communication Channels
 
-### O365 Connector (Ad-Hoc Mode)
-**Path:** `connectors/o365/o365`
-**What it does:** Live access to your Microsoft 365 -- email, calendar, Teams, availability.
+### O365 Graph CLI (Real-Time Queries)
+**Path:** `tools/o365/o365`
+**What it does:** Full Microsoft Graph API CLI wrapper for ad-hoc real-time queries -- mail search, calendar, Teams, send email, availability, events. Different from the connector (batch sync).
 **Commands:**
 - `o365 mail --query "search term" --max N --json` -- search Outlook inbox
 - `o365 mail --from-user "name" --unread --json` -- filter by sender/status
+- `o365 read <message_id_or_search>` -- read full email body
 - `o365 send --to "email" --subject "subj" --body "text"` -- send email (Level 2)
-- `o365 calendar --today` / `--week` / `--json` -- view O365 calendar
+- `o365 send --draft --to "email" --subject "subj" --body "text"` -- create draft
+- `o365 calendar --from-date "..." --to-date "..." --json` -- view calendar events
 - `o365 event --subject "..." --start "..." --end "..." --attendees "..."` -- create events
-- `o365 cancel --event-id "..."` -- cancel an event
-- `o365 teams --max N --json` -- list recent Teams chats
-- `o365 teams-send` -- send Teams messages
-- `o365 availability --email "..." --date "..."` -- check free/busy
-**Auth:** App token via `~/.edwin/credentials/o365/env` (AZURE_CLIENT_SECRET)
+- `o365 cancel <event_id> [--cancel --comment "..."]` -- delete/cancel event
+- `o365 teams --query "..." --max N --json` -- search Teams chats
+- `o365 messages <chat_id> --from-user "..." --max N` -- get messages from a chat
+- `o365 teams-send --chat-id "..." --message "..."` -- send Teams messages (delegated auth)
+- `o365 availability --users "..." --start "..." --end "..."` -- check free/busy
+**Auth:** `~/.edwin/credentials/o365/env` with AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, EDWIN_O365_EMAIL. Delegated token cached at `~/.edwin/credentials/o365/delegated-token.json`.
 **When to use:** Email search, reading full email bodies, Teams chat history, calendar checks. FIRST REACH for anything work email/Teams related.
-**Full body reads:** Use Python with the connector's auth to GET individual messages with `$select=body` -- the CLI only returns bodyPreview.
+
+### O365 Connector (Batch Sync)
+**Path:** `connectors/o365/o365`
+**What it does:** Batch sync of O365 data into Edwin markdown files. Not for ad-hoc queries -- use the Graph CLI above.
+**Auth:** Same credentials as the Graph CLI.
 
 ### Google Connector (Ad-Hoc Mode)
 **Path:** `connectors/google/google`
@@ -164,6 +171,7 @@ All at `~/Edwin/connectors/{name}/{name} sync [source]`
 
 | Tool | Path | Purpose |
 |------|------|---------|
+| O365 Graph CLI | `tools/o365/o365` | Microsoft Graph API wrapper -- mail, calendar, Teams, send, events, availability. Ad-hoc real-time queries (not batch sync). |
 | Indexer | `tools/indexer/indexer` | Embed markdown into Qdrant (requires Python 3.12). Commands: `sync`, `sync --force`, `sync --dry-run`, `sync --source <name>`, `status`, `verify` |
 | Librarian | `tools/librarian/librarian` | Monitor connector freshness, search quality. Commands: `health`, `freshness`, `quality`, `curate`, `full` |
 | Identity Registry | `tools/identity/registry.py` | Canonical people database. Commands: `init`, `add`, `alias`, `resolve`, `search`, `list`, `show`, `stats`, `seed-contacts` |
@@ -228,6 +236,7 @@ These run via Plombery triggers or on-demand. They invoke Claude to execute a SK
 | **pm-wake** | `tools/pm-wake/pm-wake` | Reactivate deferred PM items when due | Daily 6 AM |
 | **pm-dedup** | `tools/pm-dedup/pm-dedup` | Detect and cancel near-duplicate PM items | Weekly |
 | **pm-recurring** | `tools/pm-recurring/pm-recurring` | Instantiate weekly PM items from templates | Sunday 4 AM |
+| **ambient-poll** | `tools/ambient-poll/ambient-poll` | Periodic "what's happening now" snapshots (calendar, Teams, Limitless) | Every 30 min |
 | **deep-research** | `tools/deep-research/deep-research` | Iterative checkpointed research agent CLI | Manual (subagent) |
 | **contacts** | `connectors/contacts/contacts` | Apple Contacts -> identity registry sync | Weekly |
 | **plaud** | `connectors/plaud/plaud` | Plaud Note Pro meeting recordings + transcripts | Daily 9 PM |
