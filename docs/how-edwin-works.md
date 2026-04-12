@@ -141,7 +141,64 @@ Edwin isn't just reactive. With the right skills and schedule configured, it:
 
 ---
 
-## 5. Prospective Memory (PM)
+## 5. Tools -- What Edwin Can Reach
+
+Connectors sync data in the background, but Edwin also has real-time tools it can use during a conversation. These fall into three categories.
+
+### Ad-hoc connector commands
+
+The connectors aren't just background sync jobs. Edwin can query them on-demand to answer questions in real time. When you ask "what's on my calendar?" or "did Jason reply?", Edwin runs a connector command and gets a live answer -- not a stale copy from the last sync.
+
+Examples:
+- `connectors/o365/o365 mail --query "budget" --max 10` -- search Outlook inbox right now
+- `connectors/o365/o365 calendar --today` -- pull today's calendar live
+- `connectors/o365/o365 teams --max 20` -- recent Teams messages
+- `connectors/o365/o365 availability --email "jason@company.com" --date "2026-04-14"` -- check someone's free/busy
+- `connectors/google/google sync mail` -- force a Gmail sync
+- `connectors/limitless/limitless sync lifelogs` -- pull latest Limitless recordings
+
+This is often how Edwin answers "did X happen?" questions -- by querying the source directly rather than searching the archive.
+
+### MCP tools
+
+MCP (Model Context Protocol) servers give Edwin native tool access -- functions it can call directly during a conversation, like a programmer calling a library.
+
+**Local MCP servers** (always available):
+- **Qdrant** -- semantic search across all indexed data. "What did we discuss about X?" queries go here.
+- **Neo4j** -- knowledge graph queries. Relationship lookups, entity connections, multi-hop reasoning.
+- **PM** -- prospective memory. Add tasks, check due dates, search commitments.
+
+**Cloud MCP servers** (available if configured via Claude Code):
+- **Gmail** -- rich email search with full message content
+- **Google Calendar** -- calendar operations, free time search
+- **Linear** -- issues, projects, cycles, comments
+- **Atlassian** -- Jira issues, Confluence pages, search via JQL/CQL
+- **Fireflies** -- meeting transcripts, summaries, participant search
+- **Brex** -- expense reports, card management
+
+Cloud MCPs are optional. Edwin works without them, but they add richer access to services where you've configured them.
+
+### Standalone tools
+
+Utility scripts that run as CLI commands. Edwin invokes these when a task calls for specialized logic:
+
+- **email-unanswered** -- find email threads you haven't replied to
+- **teams-unanswered** -- find Teams threads awaiting your response
+- **pr-monitor** -- Bitbucket PR aging report
+- **librarian** -- system health check (connector freshness, search quality)
+- **deep-research** -- autonomous research agent with checkpointing
+- **identity registry** -- canonical people database (resolve aliases, search contacts)
+- **session-watcher** -- monitors your sessions for idle/threshold and triggers auto-summarization
+- **systems-report** -- full health report (API costs, pipeline status, Qdrant, Neo4j)
+- **pm-wake** / **pm-dedup** / **pm-recurring** -- PM maintenance utilities
+
+These tools are what make Edwin operational rather than just conversational. They're the difference between "I can discuss your email" and "here are the 4 threads you haven't replied to, sorted by urgency."
+
+See `docs/TOOLS.md` for the full tool inventory with commands, paths, and auth requirements.
+
+---
+
+## 6. Prospective Memory (PM)
 
 Edwin tracks what needs to happen -- tasks, commitments, follow-ups, intentions. This is the prospective memory system, backed by a local SQLite database.
 
@@ -168,26 +225,38 @@ PM items show up in the **Action Tracker** section of the briefing book as a liv
 
 ---
 
-## 6. Skills and Scheduled Work
+## 7. Skills and Scheduled Work
 
 ### What skills are
 
-Skills are packaged workflows -- plain markdown files (`SKILL.md`) that teach Edwin how to perform a recurring task. They're portable, readable, and editable. Any LLM that can read text can execute a skill.
+Skills are packaged workflows -- just markdown files. Each skill lives at `skills/{name}/SKILL.md` and contains step-by-step instructions that teach Edwin how to perform a task. They're human-readable, editable in any text editor, and portable -- any LLM that can read text can execute a skill.
+
+This is Edwin's procedural memory. The vector store knows *what happened*. Skills know *how to do things*.
+
+### Scheduled vs. on-demand
+
+**Scheduled skills** fire automatically via Plombery on a cron trigger. You configure them once and they run forever -- morning briefs at 6 AM, PM capture at 10 PM, ops dashboard every hour. You don't think about them unless something breaks.
+
+**On-demand skills** run when you ask. "Prep me for my 1:1 with Sarah" triggers the pre-1on1-brief skill. "Run nightwatch for 4 hours" triggers the overnight loop. You can also run any scheduled skill on demand -- "run the morning brief now" works fine.
 
 ### Available skills
 
-| Skill | What it does | Default schedule |
-|-------|-------------|-----------------|
+| Skill | What it does | Schedule |
+|-------|-------------|----------|
 | **morning-brief** | Compiles your day ahead -- calendar, priorities, overnight activity, commitments due | Weekdays 6:00 AM |
 | **daily-agenda** | Deep meeting prep for every meeting on today's calendar | Weekdays 6:05 AM |
+| **monday-prep** | Status report, talking points, risk radar for leadership meeting | Friday 2:00 PM |
 | **ops-dashboard** | System health check -- writes status pages to briefing book | Hourly |
 | **pm-capture** | Extracts commitments and tasks from the day's meetings, email, and messages | Daily 10:00 PM |
 | **limitless-analysis** | Deep review of ambient conversation recordings | Daily 10:30 PM |
 | **weekly-dispatch** | Full week retrospective -- wins, commitments, team signals, red flags | Friday 8:00 PM |
 | **overnight-loop** | Autonomous overnight work -- research, maintenance, briefing book updates | Daily 9:00 PM |
+| **intent-check** | Scans recent data for decision/expectation violations | Weekdays 7:30 AM |
+| **pre-1on1-brief** | Focused 1:1 meeting prep -- last meeting recap, commitments, talking points | On demand |
 | **morning-brief-daily-archive** | Archives old morning briefs | Daily 5:55 AM |
 | **weekly-archive** | Archives old weekly dispatches | Monday 5:50 AM |
-| **intent-check** | Reviews open intentions and flags stale items | On demand |
+
+See `docs/SKILLS.md` for detailed descriptions of each skill, including inputs, outputs, and scheduling.
 
 ### The overnight loop (nightwatch)
 
@@ -218,7 +287,50 @@ You don't need to check it regularly. It's there when you want to see what's run
 
 ---
 
-## 7. How Edwin Gets Smarter
+## 8. Boot Sequence
+
+When Edwin starts a new session, it doesn't start blank. Here's what happens before it responds to your first message:
+
+1. **Temporal grounding.** Edwin checks the current date, time, and day of week. No guessing at what time it is.
+2. **Last session context.** Reads the conversation state from the previous session -- where things left off, what was in progress, what decisions were made.
+3. **Capability awareness.** Loads `docs/TOOLS.md` and `docs/SKILLS.md` so it knows what tools are available and what skills it can execute. This is how Edwin knows it can search your email, check your calendar, or run a research agent -- it reads its own capability manifest at startup.
+4. **PM check.** Queries the prospective memory system for overdue and due-today items. If you made a commitment yesterday that's due today, Edwin knows about it before you say anything.
+5. **Semantic retrieval.** Searches the vector store for context relevant to your first message. If you open with "what happened with the deployment?", Edwin immediately pulls related chunks from past conversations, emails, and meeting transcripts.
+
+This is why Edwin feels like it "remembers" across sessions. It doesn't have persistent memory in the LLM sense -- it reconstructs context at startup from structured state files and semantic search. The quality of that reconstruction depends on how much data has been indexed and how well the previous session was summarized.
+
+---
+
+## 9. Session Lifecycle
+
+Edwin sessions aren't fire-and-forget. Each session feeds the next one.
+
+### During a session
+
+Edwin captures decisions, commitments, open loops, and mental notes inline as the conversation progresses. Commitments get added to PM automatically. Notes get tagged for later retrieval.
+
+### When a session ends
+
+Edwin produces a session summary -- a structured markdown file that captures:
+- **Gist** -- what happened, written as if briefing a future version of itself with zero context
+- **Decisions** -- what was decided and why
+- **Tension map** -- open loops with stakes, what breaks if dropped
+- **Commitments** -- what you owe others, what others owe you, what Edwin owes you
+- **Key identifiers** -- file paths, URLs, ticket numbers, dollar amounts preserved verbatim
+
+Summaries are written to `memory/sessions/` and get indexed into the vector store on the next indexer run.
+
+### Session-to-session continuity
+
+The next session reads the previous summary during boot (step 2 above). This creates a chain -- each session knows what the last one accomplished, what's still open, and where the conversation would naturally pick up.
+
+The **session-watcher** tool monitors for idle sessions and token thresholds, triggering auto-summarization so context isn't lost even if a session ends abruptly.
+
+Over time, the accumulated session summaries become a rich, searchable log of every decision, commitment, and conversation you've had with Edwin.
+
+---
+
+## 10. How Edwin Gets Smarter
 
 Edwin starts thin. Within hours it gets useful. Within a week it gets good. Here's what compounds:
 
@@ -236,7 +348,7 @@ The practical effect: conversations get shorter and more useful. Edwin needs les
 
 ---
 
-## 8. Extending Edwin
+## 11. Extending Edwin
 
 Everything in Edwin is files. Markdown, TypeScript, Python. No proprietary formats, no vendor lock-in.
 
@@ -258,7 +370,7 @@ If Telegram doesn't fit your workflow, build a channel for Slack, WhatsApp, Sign
 
 ---
 
-## 9. Key Commands and Paths
+## 12. Key Commands and Paths
 
 ### Directory structure
 
@@ -267,7 +379,9 @@ If Telegram doesn't fit your workflow, build a channel for Slack, WhatsApp, Sign
 | `data/` | Raw synced data from connectors, organized by source and date |
 | `briefing-book/docs/` | The briefing book -- Edwin's organized output (open with Obsidian) |
 | `connectors/` | 15 data connectors (Python CLIs) |
-| `skills/` | 10 skill definitions (SKILL.md files) |
+| `skills/` | 12 skill definitions (SKILL.md files) |
+| `docs/TOOLS.md` | Full tool inventory -- every command Edwin can reach |
+| `docs/SKILLS.md` | Skill index -- every workflow Edwin knows how to execute |
 | `tools/indexer/` | Embeds markdown into Qdrant for semantic search |
 | `tools/plombery/` | Job scheduler with web dashboard |
 | `mcp-servers/` | MCP integrations (Qdrant, Neo4j, PM, events channel) |
