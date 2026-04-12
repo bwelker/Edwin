@@ -49,6 +49,8 @@ Edwin solves this by ingesting every electronic communication channel you have. 
 
 The result: when you ask Edwin to prep you for a meeting, draft a reply, or find that thing someone said last week -- it already has the context. You don't have to explain the backstory. Edwin was there.
 
+If there's a channel of information I didn't think of -- a platform you use, a data source that matters to your workflow -- have your agent build a connector and contribute it back. I'd love to have it and use it myself.
+
 ## Ambient Intelligence
 
 The most important data sources aren't the ones you type -- they're the ones that capture what happens around you. Edwin supports **ambient listening** through three connectors:
