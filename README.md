@@ -31,10 +31,17 @@ claude
 
 That's it. `setup.sh` installs the infrastructure (Qdrant, Neo4j, Ollama) and optionally configures Telegram for mobile access. `claude` starts the onboarding wizard -- a guided conversation where Edwin learns who you are and configures itself for your life. Takes about 15 minutes.
 
-If you set up Telegram during setup, launch with the channel flag instead:
+If you set up Telegram during setup, launch with the channel flags:
 ```bash
-claude --channels plugin:telegram@claude-plugins-official mcp:events
+claude --dangerously-load-development-channels plugin:telegram@claude-plugins-official server:events
 ```
+
+Without Telegram:
+```bash
+claude --dangerously-load-development-channels server:events
+```
+
+**Why `--dangerously-load-development-channels`?** The events channel is a custom MCP server that receives HTTP POST notifications from the job scheduler, monitoring scripts, and webhooks, then pushes them into your active Claude Code session as real-time alerts. Because it's not an official Anthropic plugin, Claude Code requires this flag to load it as a channel source. The name sounds scary but it just means "load channel servers that aren't in the official plugin registry." Without it, the events server starts and appears healthy, but notifications silently fail to reach the session -- scheduled skills, job alerts, and the overnight loop won't fire.
 
 ### Requirements
 
@@ -113,8 +120,9 @@ Edwin ships with Telegram as the default communication channel. Telegram's BotFa
    The repo includes `.claude/settings.json` which enables the plugin automatically, but the plugin binary must be installed once per machine.
 4. **Launch Edwin with the channel:**
    ```bash
-   claude --channels plugin:telegram@claude-plugins-official mcp:events
+   claude --dangerously-load-development-channels plugin:telegram@claude-plugins-official server:events
    ```
+   The `--dangerously-load-development-channels` flag is required because the events channel is a custom MCP server, not an official plugin. Without it, event notifications silently fail to reach the session.
 5. **Pair your phone.** Open Telegram and DM your bot. It will reply with a pairing code.
 6. **Approve the pairing.** In the Claude Code terminal:
    ```

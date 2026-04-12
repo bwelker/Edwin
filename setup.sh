@@ -343,7 +343,7 @@ ACCESSEOF
     echo "  To connect your phone:"
     echo "    1. Install the plugin (first time only):"
     echo "         claude /install-plugin telegram@claude-plugins-official"
-    echo "    2. Launch Edwin:  claude --channels plugin:telegram@claude-plugins-official mcp:events"
+    echo "    2. Launch Edwin:  claude --dangerously-load-development-channels plugin:telegram@claude-plugins-official server:events"
     echo "    3. Open Telegram and message @${TELEGRAM_BOT_USERNAME}"
     echo "    4. You'll get a pairing code -- enter it in the terminal:"
     echo "         /telegram:access pair <CODE>"
@@ -370,7 +370,11 @@ echo "  Next step:"
 echo "    cd $EDWIN_HOME"
 if [[ -n "$TELEGRAM_BOT_USERNAME" ]]; then
 echo "    claude /install-plugin telegram@claude-plugins-official   # first time only"
-echo "    claude --channels plugin:telegram@claude-plugins-official mcp:events"
+echo "    claude --dangerously-load-development-channels plugin:telegram@claude-plugins-official server:events"
+echo ""
+echo "  Note: --dangerously-load-development-channels is required for the events channel"
+echo "  (a custom MCP server, not an official plugin). Without it, event notifications"
+echo "  silently fail to reach the session."
 else
 echo "    claude"
 fi
