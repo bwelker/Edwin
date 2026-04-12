@@ -14,7 +14,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 
 // --- Configuration -----------------------------------------------------------
 
-const PORT = parseInt(process.env.EVENTS_PORT || "8788", 10);
+const PORT = parseInt(process.env.EVENTS_PORT || "8790", 10);
 
 // --- Logging (stderr so it doesn't pollute MCP stdio) ------------------------
 

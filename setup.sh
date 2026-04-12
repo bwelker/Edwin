@@ -199,6 +199,10 @@ EDWIN_NEO4J_PASS=changeme
 # Ollama endpoint
 EDWIN_OLLAMA_URL=http://localhost:11434
 
+# Events channel URL (used by Plombery to post job/skill events)
+EVENTS_URL=http://127.0.0.1:8790/job-complete
+SKILL_EVENTS_URL=http://127.0.0.1:8790/run-skill
+
 # ── User Config (filled by setup wizard) ──
 # EDWIN_EMAIL=
 # AZURE_TENANT_ID=

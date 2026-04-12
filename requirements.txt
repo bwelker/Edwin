@@ -1,0 +1,39 @@
+# Edwin -- Python Dependencies
+# Install: pip install -r requirements.txt
+# Note: Python 3.12 required for indexer (fastembed/onnxruntime segfault on 3.14)
+
+# ── Core ────────────────────────────────────────────────────────────────────────
+requests>=2.31.0
+python-dateutil>=2.8.0
+pytz>=2024.1
+pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# ── Connectors ──────────────────────────────────────────────────────────────────
+
+# Google (connectors/google)
+google-auth>=2.20.0
+google-auth-oauthlib>=1.0.0
+google-api-python-client>=2.90.0
+
+# Retry logic (connectors/o365, others)
+tenacity>=8.2.0
+
+# ── Tools ───────────────────────────────────────────────────────────────────────
+
+# Plombery scheduler (tools/plombery)
+plombery>=0.5.0
+apscheduler>=3.10.0,<4.0.0
+
+# Memory indexer (tools/indexer) -- requires Python 3.12
+qdrant-client>=1.17.0
+anthropic>=0.40.0
+fastembed>=0.4.0
+
+# ── MCP Servers ─────────────────────────────────────────────────────────────────
+
+# Shared by neo4j and pm MCP servers
+mcp>=1.0.0
+
+# Neo4j knowledge graph (mcp-servers/neo4j)
+neo4j>=5.0.0

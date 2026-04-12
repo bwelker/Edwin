@@ -15,8 +15,8 @@ from plombery.pipeline.context import pipeline_context
 EDWIN_HOME = Path(os.environ.get("EDWIN_HOME", Path.home() / "Edwin"))
 PYTHON = os.environ.get("PYTHON", sys.executable)
 PYTHON_312 = os.environ.get("PYTHON_312", PYTHON)
-EVENTS_URL = os.environ.get("EVENTS_URL", "http://127.0.0.1:8788/job-complete")
-SKILL_EVENTS_URL = os.environ.get("SKILL_EVENTS_URL", "http://127.0.0.1:8788/run-skill")
+EVENTS_URL = os.environ.get("EVENTS_URL", "http://127.0.0.1:8790/job-complete")
+SKILL_EVENTS_URL = os.environ.get("SKILL_EVENTS_URL", "http://127.0.0.1:8790/run-skill")
 PLOMBERY_PORT = int(os.environ.get("PLOMBERY_PORT", "8899"))
 
 
@@ -134,6 +134,14 @@ def trigger_ops_dashboard():
 @task
 def trigger_intent_check():
     return fire_skill_event("intent-check")
+
+@task
+def trigger_pre_1on1_brief():
+    return fire_skill_event("pre-1on1-brief")
+
+@task
+def trigger_monday_prep():
+    return fire_skill_event("monday-prep")
 
 
 # -- Connector sync tasks --
@@ -370,5 +378,7 @@ register_pipeline(id="skill-weekly-dispatch", name="Skill: Weekly Dispatch", des
 register_pipeline(id="skill-nightwatch", name="Skill: Nightwatch", description="Overnight autonomous work session. Loops picking the highest-leverage task each cycle -- operator work and architect work.", tasks=[trigger_nightwatch, notify_complete], triggers=[Trigger(id="t24", name="Daily 9 PM", schedule=CronTrigger(hour=21))])
 register_pipeline(id="skill-ops-dashboard", name="Skill: Ops Dashboard", description="Generate operational status pages -- pipeline health, indexing coverage, memory system health, and capability inventory.", tasks=[trigger_ops_dashboard, notify_complete], triggers=[Trigger(id="t28", name="Every hour", schedule=IntervalTrigger(hours=1))])
 register_pipeline(id="skill-intent-check", name="Skill: Intent Check", description="Scan recent data for violations of decisions, expectations, and org rules. Checks against the intent/decision graph.", tasks=[trigger_intent_check, notify_complete], triggers=[Trigger(id="t39b", name="Weekdays 7:30 AM", schedule=CronTrigger(day_of_week="mon-fri", hour=7, minute=30))])
+register_pipeline(id="skill-pre-1on1-brief", name="Skill: Pre-1on1 Brief", description="On-demand pre-meeting brief for upcoming 1-on-1s. No automatic schedule -- trigger manually or via events channel.", tasks=[trigger_pre_1on1_brief, notify_complete], triggers=[])
+register_pipeline(id="skill-monday-prep", name="Skill: Monday Prep", description="Friday Monday-prep automation -- compile status report, talking points, and risk areas for Monday leadership meeting.", tasks=[trigger_monday_prep, notify_complete], triggers=[Trigger(id="t42", name="Friday 5 PM", schedule=CronTrigger(day_of_week="fri", hour=17))])
 
 app = get_app()
