@@ -52,6 +52,11 @@ Walk through available connectors and ask which they want to enable:
 
 Capture: which connectors to enable. Note which need API keys or OAuth.
 
+Then mention cloud MCPs:
+> "Beyond local connectors, Claude Code has built-in cloud integrations for Gmail, Google Calendar, Linear, Atlassian, Fireflies, and Brex. These give me richer real-time access -- for example, the Gmail MCP lets me read full email bodies and create drafts, while the local connector just syncs summaries. You can enable these anytime in Claude Code's Settings > Integrations. See `docs/connector-setup.md` Section 3 for details."
+
+Note which cloud MCPs are relevant based on what the user said about their tools.
+
 ### Phase 4: "Skills" (2 min)
 
 Explain:
@@ -492,6 +497,9 @@ Always add:
 Conditionally add:
 - "Set up Obsidian vault and cloud sync for briefing book" -- type: task, owner: user, due: tomorrow (only if they didn't set it up during Step 3)
 - One task per connector that still needs OAuth or API key setup -- type: task, owner: user, due: spread across the next 2-3 days. Format: "Set up [connector name] connector -- [what's needed, e.g. OAuth login, API key]"
+- If they use Google: "Enable Gmail and Google Calendar cloud MCPs in Claude Code Settings > Integrations" -- type: task, owner: user, due: tomorrow
+- If they use Jira/Confluence: "Enable Atlassian cloud MCP in Claude Code Settings > Integrations" -- type: task, owner: user, due: tomorrow
+- If they use Fireflies: "Enable Fireflies cloud MCP in Claude Code Settings > Integrations" -- type: task, owner: user, due: tomorrow
 
 ### Step 5: Operations check -- show it's alive
 

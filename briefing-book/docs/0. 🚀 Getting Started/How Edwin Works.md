@@ -176,7 +176,7 @@ MCP (Model Context Protocol) servers give Edwin native tool access -- functions 
 - **Fireflies** -- meeting transcripts, summaries, participant search
 - **Brex** -- expense reports, card management
 
-Cloud MCPs are optional. Edwin works without them, but they add richer access to services where you've configured them.
+Cloud MCPs are optional. Edwin works without them, but they add richer access to services where you've configured them. To enable them, go to **Settings > Integrations** in Claude Code, search for the service name (e.g. "Gmail"), and enable it -- you'll authenticate via OAuth in your browser. They're worth it because cloud MCPs give Edwin live read/write access during a conversation, while local connectors only sync snapshots on a schedule. See `docs/connector-setup.md` Section 3 for details on each one.
 
 ### Standalone tools
 

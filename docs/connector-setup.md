@@ -229,6 +229,38 @@ Syncs meeting recordings and transcripts from Plaud Note Pro.
 
 ---
 
+## Section 3: Cloud MCP Integrations
+
+Beyond local connectors, Claude Code has built-in cloud integrations that give Edwin richer real-time access to external services. These run as cloud MCP servers -- no API keys to manage, no credential files. You enable them in Claude Code and they just work.
+
+**How to enable:** In Claude Code, go to **Settings > Integrations** > search for the integration name > enable it. You'll authenticate via OAuth in your browser.
+
+### Gmail (Recommended if you use Google)
+
+Rich email search with full message content, thread reading, and draft creation. The local `google` connector syncs email summaries on a schedule -- the Gmail MCP lets Edwin read full email bodies, search by any criteria, and create drafts in real time. If you use Gmail, this is worth enabling.
+
+### Google Calendar (Recommended if you use Google)
+
+Full calendar CRUD -- create, update, and delete events, find free time slots, check availability. The local `google` connector only reads calendar data on sync. The cloud MCP gives Edwin live read/write access to your calendar during a conversation.
+
+### Linear (If you use Linear)
+
+Issues, projects, cycles, documents, comments. If your team uses Linear for project management, this lets Edwin search issues, create/update tickets, and track cycles without you switching apps.
+
+### Atlassian / Rovo (If you use Jira or Confluence)
+
+Jira issues, Confluence pages, JQL/CQL search, issue creation and transitions. If your team uses Atlassian, this gives Edwin direct access to your project tracker and wiki. Supplements the local `atlassian` connector, which syncs snapshots -- the cloud MCP provides live read/write access.
+
+### Fireflies (If you use Fireflies)
+
+Meeting transcripts, summaries, participant search. The local `fireflies` connector syncs transcripts to disk on a daily schedule. The cloud MCP gives Edwin real-time access to search and read transcripts during a conversation -- useful when you need meeting context immediately after a call.
+
+### Brex (If you use Brex)
+
+Expense reports, card management, spending limits, user lookup. Optional -- only relevant if your company uses Brex for corporate cards and expenses.
+
+---
+
 ## Common Environment Variables
 
 These apply across all connectors:
