@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""
+Full PM <-> Obsidian sync loop.
+
+1. Pull edits from Obsidian vault back to docs/ (obsidian-watcher)
+2. Detect and apply changes to PM database (pm-sync)
+3. Re-export PM to Action Tracker and publish (pm-export)
+
+Run this on a schedule (e.g., every 15-30 min during work hours).
+
+Usage:
+    pm-loop                  # full loop
+    pm-loop --dry-run        # show what would happen
+"""
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+SCRIPTS_DIR = Path(__file__).resolve().parent
+
+
+def run(cmd: list[str], description: str, dry_run: bool = False) -> bool:
+    """Run a script and report result."""
+    if dry_run:
+        print(f"\n--- {description} (dry-run) ---")
+        cmd = cmd + ["--dry-run"] if "--dry-run" not in cmd else cmd
+
+    print(f"\n--- {description} ---")
+    result = subprocess.run(cmd, capture_output=False, text=True)
+    return result.returncode == 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Full PM <-> Obsidian sync loop")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would happen")
+    args = parser.parse_args()
+
+    watcher = str(SCRIPTS_DIR / "obsidian-watcher")
+    sync = str(SCRIPTS_DIR / "pm-sync")
+    export = str(SCRIPTS_DIR / "pm-export")
+
+    # Step 1: Pull Obsidian edits to docs/
+    if args.dry_run:
+        run(
+            [sys.executable, watcher, "--status"],
+            "Step 1: Check Obsidian vault edits (dry-run)",
+        )
+    else:
+        run(
+            [sys.executable, watcher, "--sync"],
+            "Step 1: Pull Obsidian vault edits",
+        )
+
+    # Step 2: Detect and apply PM changes
+    sync_cmd = [sys.executable, sync]
+    if args.dry_run:
+        sync_cmd.append("--dry-run")
+    run(sync_cmd, "Step 2: Sync edits to PM database")
+
+    # Step 3: Re-export and publish
+    if not args.dry_run:
+        run(
+            [sys.executable, export],
+            "Step 3: Re-export PM and publish",
+        )
+    else:
+        run(
+            [sys.executable, export, "--status"],
+            "Step 3: PM export status",
+        )
+
+    print("\n--- Loop complete ---")
+
+
+if __name__ == "__main__":
+    main()

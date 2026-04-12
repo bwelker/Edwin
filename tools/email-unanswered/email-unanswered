@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""
+Edwin Email Unanswered Detector
+
+Scans O365 mail data to find emails from others that the user hasn't replied to.
+Similar to teams-unanswered but for email threads.
+
+Usage:
+    email-unanswered scan              # Generate report
+    email-unanswered scan --days 5     # Lookback period (default 5)
+    email-unanswered scan --json       # Output JSON
+
+Reads from: ~/Edwin/data/o365/mail/YYYY-MM/*.md
+Writes to:  ~/Edwin/briefing-book/docs/1. Briefs/Email Unanswered.md
+
+Configuration:
+    Set USER_EMAILS in ~/.edwin/config.env (comma-separated) or EDWIN_USER_EMAILS env var.
+    Set SKIP_SENDERS in ~/.edwin/config.env (comma-separated) or EDWIN_SKIP_EMAIL_SENDERS env var.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, date, timedelta
+from pathlib import Path
+from collections import defaultdict
+
+DATA_DIR = Path.home() / "Edwin" / "data" / "o365" / "mail"
+OUTPUT_FILE = Path.home() / "Edwin" / "briefing-book" / "docs" / "1. \U0001f4cb Briefs" / "Email Unanswered.md"
+
+
+def _load_config_value(env_key: str, config_key: str, default: str = "") -> str:
+    """Load a config value from env var or ~/.edwin/config.env."""
+    val = os.environ.get(env_key)
+    if val:
+        return val
+    config_file = Path.home() / ".edwin" / "config.env"
+    if config_file.exists():
+        for line in config_file.read_text().splitlines():
+            if line.startswith(f"{config_key}="):
+                return line.split("=", 1)[1].strip()
+    return default
+
+
+def _get_user_emails() -> set[str]:
+    """Get the user's email addresses from config."""
+    raw = _load_config_value("EDWIN_USER_EMAILS", "USER_EMAILS")
+    if raw:
+        return {e.strip().lower() for e in raw.split(",") if e.strip()}
+    return set()
+
+
+# Skip automated/system emails -- sensible defaults plus user overrides
+DEFAULT_SKIP_SENDERS = {
+    "no-reply", "noreply", "notification", "alert", "digest",
+    "sharepoint", "teams.mail.microsoft",
+    "outlook.mail.microsoft", "microsoft.com",
+    "linkedin.com", "apple.com", "amazon.com",
+    "mailer-daemon", "mail delivery", "postmaster",
+}
+
+# Skip these subjects
+SKIP_SUBJECTS = {
+    "spam quarantine", "reaction daily digest", "daily summary",
+    "your events are being dropped", "recording has expired",
+}
+
+
+def _get_skip_senders() -> set[str]:
+    """Get skip senders from config, merged with defaults."""
+    raw = _load_config_value("EDWIN_SKIP_EMAIL_SENDERS", "SKIP_EMAIL_SENDERS")
+    extra = {s.strip().lower() for s in raw.split(",") if s.strip()} if raw else set()
+    return DEFAULT_SKIP_SENDERS | extra
+
+
+def should_skip(from_addr: str, subject: str, user_emails: set[str], skip_senders: set[str]) -> bool:
+    """Check if this email should be skipped."""
+    from_lower = from_addr.lower()
+    subj_lower = subject.lower()
+
+    for skip in skip_senders:
+        if skip in from_lower:
+            return True
+
+    for skip in SKIP_SUBJECTS:
+        if skip in subj_lower:
+            return True
+
+    # Skip if from user themselves
+    for addr in user_emails:
+        if addr in from_lower:
+            return True
+
+    return False
+
+
+def parse_email(filepath: Path) -> dict | None:
+    """Parse an email markdown file."""
+    try:
+        content = filepath.read_text()[:2000]
+    except Exception:
+        return None
+
+    meta = {}
+    in_frontmatter = False
+    for line in content.split("\n"):
+        if line.strip() == "---":
+            if in_frontmatter:
+                break
+            in_frontmatter = True
+            continue
+        if in_frontmatter and ":" in line:
+            key, _, value = line.partition(":")
+            meta[key.strip()] = value.strip()
+
+    if not meta.get("from") or not meta.get("subject"):
+        return None
+
+    # Extract sender email
+    from_field = meta["from"]
+    email_match = re.search(r"<([^>]+)>", from_field)
+    from_email = email_match.group(1) if email_match else from_field
+
+    # Extract sender name
+    name_match = re.match(r"([^<]+)", from_field)
+    from_name = name_match.group(1).strip() if name_match else from_email
+
+    return {
+        "from": from_name,
+        "from_email": from_email,
+        "subject": meta.get("subject", ""),
+        "date": meta.get("date", "")[:10],
+        "read": meta.get("read", "False") == "True",
+        "file": str(filepath),
+    }
+
+
+def scan_unanswered(lookback_days: int) -> list[dict]:
+    """Find emails that might need a reply."""
+    user_emails = _get_user_emails()
+    skip_senders = _get_skip_senders()
+    today = date.today()
+    unanswered = []
+
+    # Track threads by subject (simplified)
+    threads = defaultdict(list)
+
+    for i in range(lookback_days):
+        d = today - timedelta(days=i)
+        month_dir = DATA_DIR / d.strftime("%Y-%m")
+        if not month_dir.exists():
+            continue
+
+        for f in sorted(month_dir.glob(f"{d.isoformat()}*.md")):
+            email = parse_email(f)
+            if not email:
+                continue
+
+            # Normalize subject for thread matching (remove Re:, Fw:, etc.)
+            subject = re.sub(r"^(Re|RE|Fw|FW|Fwd|FWD):\s*", "", email["subject"]).strip()
+            is_user = any(addr in email["from_email"].lower() for addr in user_emails)
+
+            threads[subject].append({
+                **email,
+                "is_user": is_user,
+                "normalized_subject": subject,
+            })
+
+    # For each thread, check if the last email is from someone else
+    for subject, msgs in threads.items():
+        msgs.sort(key=lambda m: m.get("date", ""))
+        last_msg = msgs[-1]
+
+        if last_msg.get("is_user"):
+            continue  # User sent the last message
+
+        if should_skip(last_msg["from_email"], last_msg["subject"], user_emails, skip_senders):
+            continue
+
+        # Count messages from others since user's last reply
+        pending_count = 0
+        for m in reversed(msgs):
+            if m.get("is_user"):
+                break
+            pending_count += 1
+
+        try:
+            age = (today - datetime.strptime(last_msg["date"], "%Y-%m-%d").date()).days
+        except ValueError:
+            age = -1
+
+        unanswered.append({
+            "from": last_msg["from"],
+            "from_email": last_msg["from_email"],
+            "subject": last_msg["subject"],
+            "date": last_msg["date"],
+            "age_days": age,
+            "pending_count": pending_count,
+            "read": last_msg["read"],
+        })
+
+    unanswered.sort(key=lambda u: u["age_days"], reverse=True)
+    return unanswered
+
+
+def generate_report(unanswered: list[dict], lookback_days: int) -> str:
+    """Generate markdown report."""
+    today = date.today().isoformat()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    lines = [
+        f"# Email Unanswered -- {today}",
+        "",
+        f"**Generated:** {now} ET",
+        f"**Lookback:** {lookback_days} days",
+        f"**Unanswered threads:** {len(unanswered)}",
+        "",
+    ]
+
+    if not unanswered:
+        lines.append("All clear -- no unanswered emails detected.")
+        return "\n".join(lines)
+
+    # Critical: unread + >2 days
+    critical = [u for u in unanswered if u["age_days"] >= 2 and not u["read"]]
+    if critical:
+        lines.append("## Unread & Unanswered (2+ days)")
+        lines.append("")
+        lines.append("| From | Subject | Date | Age |")
+        lines.append("|------|---------|------|-----|")
+        for u in critical:
+            lines.append(f"| {u['from']} | {u['subject'][:50]} | {u['date']} | {u['age_days']}d |")
+        lines.append("")
+
+    lines.append("## All Unanswered")
+    lines.append("")
+    lines.append("| From | Subject | Date | Age | Read |")
+    lines.append("|------|---------|------|-----|------|")
+    for u in unanswered:
+        read_flag = "yes" if u["read"] else "**no**"
+        lines.append(
+            f"| {u['from']} | {u['subject'][:50]} | {u['date']} "
+            f"| {u['age_days']}d | {read_flag} |"
+        )
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Edwin Email Unanswered Detector")
+    parser.add_argument("command", choices=["scan"])
+    parser.add_argument("--days", type=int, default=5)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+
+    unanswered = scan_unanswered(args.days)
+
+    if args.json:
+        print(json.dumps(unanswered, indent=2))
+        return
+
+    report = generate_report(unanswered, args.days)
+    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT_FILE.write_text(report)
+
+    critical = [u for u in unanswered if u["age_days"] >= 2 and not u["read"]]
+    print(f"Report written to {OUTPUT_FILE}")
+    print(f"Unanswered: {len(unanswered)}, Critical (unread 2+ days): {len(critical)}")
+
+
+if __name__ == "__main__":
+    main()

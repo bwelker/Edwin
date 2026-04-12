@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""
+Edwin Systems Health Report -- nightly diagnostics + cost tracking.
+
+Generates a markdown report covering:
+  1. API costs (daily + MTD)
+  2. Pipeline health (connector freshness)
+  3. Vector store health (Qdrant)
+  4. Knowledge graph health (Neo4j)
+  5. Indexer status (context coverage)
+  6. Job handler status (if available)
+
+Usage:
+    report                    # Generate and publish to briefing book
+    report --stdout            # Print to stdout instead
+    report --date 2026-04-03  # Report for a specific date
+"""
+
+import json
+import os
+import sys
+import subprocess
+from datetime import datetime, timedelta
+from pathlib import Path
+from urllib.request import urlopen, Request
+from urllib.error import URLError
+
+import pytz
+
+
+# -- Config -------------------------------------------------------------------
+
+PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
+DATA_DIR = PROJECT_DIR / "data"
+TOOLS_DIR = PROJECT_DIR / "tools"
+BRIEFING_DIR = PROJECT_DIR / "briefing-book" / "docs"
+
+# Obsidian vault path -- configure via env var or ~/.edwin/obsidian-vault-path
+OBSIDIAN_VAULT = None
+_vault_env = os.environ.get("OBSIDIAN_VAULT_PATH")
+if _vault_env:
+    OBSIDIAN_VAULT = Path(_vault_env).expanduser()
+else:
+    _vault_config = Path.home() / ".edwin" / "obsidian-vault-path"
+    if _vault_config.exists():
+        OBSIDIAN_VAULT = Path(_vault_config.read_text().strip()).expanduser()
+
+ADMIN_KEY_FILE = Path.home() / ".edwin" / "credentials" / "anthropic" / "admin-env"
+QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
+NEO4J_URL = os.environ.get("NEO4J_URL", "http://localhost:7474")
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+ET = pytz.timezone(os.environ.get("EDWIN_TIMEZONE", "America/New_York"))
+
+QDRANT_COLLECTION = os.environ.get("QDRANT_COLLECTION", "edwin-memory")
+
+
+# -- Helpers ------------------------------------------------------------------
+
+def _load_admin_key():
+    if not ADMIN_KEY_FILE.exists():
+        return None
+    for line in ADMIN_KEY_FILE.read_text().splitlines():
+        if line.startswith("ANTHROPIC_ADMIN_API_KEY="):
+            return line.split("=", 1)[1].strip()
+    return None
+
+
+def _api_get(url, api_key):
+    req = Request(url, headers={
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+    })
+    try:
+        with urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _qdrant_get(path):
+    try:
+        with urlopen(f"{QDRANT_URL}{path}", timeout=10) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return None
+
+
+def _check_service(url, timeout=5):
+    try:
+        urlopen(url, timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+
+# -- Report Sections ----------------------------------------------------------
+
+def section_api_costs(admin_key, report_date):
+    """API cost report for today and MTD."""
+    lines = ["## API Costs"]
+
+    if not admin_key:
+        lines.append("*Admin API key not configured. Skipping cost report.*")
+        return lines
+
+    # Latest available costs (yesterday -- today's data not available until day ends)
+    latest_day = report_date - timedelta(days=1)
+    today = latest_day.strftime("%Y-%m-%dT00:00:00Z")
+    tomorrow = report_date.strftime("%Y-%m-%dT00:00:00Z")
+    data = _api_get(
+        f"https://api.anthropic.com/v1/organizations/cost_report"
+        f"?starting_at={today}&ending_at={tomorrow}&bucket_width=1d"
+        f"&group_by%5B%5D=description",
+        admin_key
+    )
+
+    if "error" in data:
+        lines.append(f"*Error fetching costs: {data['error']}*")
+        return lines
+
+    # Parse today's costs
+    today_total = 0
+    by_model = {}
+    for bucket in data.get("data", []):
+        for r in bucket.get("results", []):
+            amt = float(r.get("amount", "0")) / 100
+            model = r.get("model", "other")
+            today_total += amt
+            by_model[model] = by_model.get(model, 0) + amt
+
+    lines.append(f"\n**Latest day ({latest_day.strftime('%Y-%m-%d')}):** ${today_total:.2f}")
+    if by_model:
+        lines.append("")
+        lines.append("| Model | Cost |")
+        lines.append("|-------|------|")
+        for m, c in sorted(by_model.items(), key=lambda x: -x[1]):
+            if c > 0.001:
+                lines.append(f"| {m or 'n/a'} | ${c:.2f} |")
+
+    # MTD costs
+    month_start = report_date.replace(day=1).strftime("%Y-%m-%dT00:00:00Z")
+    mtd_data = _api_get(
+        f"https://api.anthropic.com/v1/organizations/cost_report"
+        f"?starting_at={month_start}&ending_at={tomorrow}&bucket_width=1d"
+        f"&group_by%5B%5D=description",
+        admin_key
+    )
+
+    mtd_total = 0
+    mtd_by_model = {}
+    for bucket in mtd_data.get("data", []):
+        for r in bucket.get("results", []):
+            amt = float(r.get("amount", "0")) / 100
+            model = r.get("model", "other")
+            mtd_total += amt
+            mtd_by_model[model] = mtd_by_model.get(model, 0) + amt
+
+    lines.append(f"\n**Month-to-date ({report_date.strftime('%B')}):** ${mtd_total:.2f}")
+    if mtd_by_model:
+        lines.append("")
+        lines.append("| Model | MTD Cost |")
+        lines.append("|-------|----------|")
+        for m, c in sorted(mtd_by_model.items(), key=lambda x: -x[1]):
+            if c > 0.01:
+                lines.append(f"| {m or 'n/a'} | ${c:.2f} |")
+
+    # Daily trend (last 7 days)
+    week_ago = (report_date - timedelta(days=6)).strftime("%Y-%m-%dT00:00:00Z")
+    trend_data = _api_get(
+        f"https://api.anthropic.com/v1/organizations/cost_report"
+        f"?starting_at={week_ago}&ending_at={tomorrow}&bucket_width=1d",
+        admin_key
+    )
+
+    daily_costs = []
+    for bucket in trend_data.get("data", []):
+        day = bucket.get("starting_at", "")[:10]
+        day_total = sum(float(r.get("amount", "0")) / 100 for r in bucket.get("results", []))
+        daily_costs.append((day, day_total))
+
+    if daily_costs:
+        lines.append("\n**Daily trend (7 days):**")
+        lines.append("")
+        lines.append("| Date | Cost |")
+        lines.append("|------|------|")
+        for day, cost in sorted(daily_costs):
+            lines.append(f"| {day} | ${cost:.2f} |")
+
+    return lines
+
+
+def section_pipeline(report_date):
+    """Connector freshness check."""
+    lines = ["## Pipeline Health"]
+
+    try:
+        result = subprocess.run(
+            ["python3", str(TOOLS_DIR / "librarian" / "librarian"), "freshness"],
+            capture_output=True, text=True, timeout=60
+        )
+        output = result.stdout + result.stderr
+    except Exception as e:
+        lines.append(f"*Librarian error: {e}*")
+        return lines
+
+    stale = []
+    healthy = []
+    for line in output.split("\n"):
+        # Extract just the connector info after the last ]
+        parts = line.split("] ")
+        info = parts[-1].strip() if parts else line.strip()
+        if not info:
+            continue
+        if "[STALE]" in line:
+            stale.append(info)
+        elif "[OK]" in line:
+            healthy.append(info)
+
+    lines.append("")
+    if stale:
+        lines.append(f"**Stale ({len(stale)}):**")
+        for s in stale:
+            lines.append(f"- {s}")
+    lines.append(f"\n**Healthy ({len(healthy)}):**")
+    for h in healthy:
+        lines.append(f"- {h}")
+
+    return lines
+
+
+def section_qdrant():
+    """Qdrant vector store health."""
+    lines = ["## Vector Store (Qdrant)"]
+
+    data = _qdrant_get(f"/collections/{QDRANT_COLLECTION}")
+    if not data:
+        lines.append(f"*Qdrant not responding at {QDRANT_URL}*")
+        return lines
+
+    result = data.get("result", {})
+    points = result.get("points_count", 0)
+    status = result.get("status", "unknown")
+    vectors = result.get("vectors_count", 0)
+    segments = result.get("segments_count", 0)
+
+    lines.append("")
+    lines.append(f"| Metric | Value |")
+    lines.append(f"|--------|-------|")
+    lines.append(f"| Collection | {QDRANT_COLLECTION} |")
+    lines.append(f"| Status | {status} |")
+    lines.append(f"| Points | {points:,} |")
+    lines.append(f"| Vectors | {vectors:,} |")
+    lines.append(f"| Segments | {segments} |")
+
+    # Context coverage from indexer state
+    state_file = TOOLS_DIR / "indexer" / ".index-state.json"
+    if state_file.exists():
+        try:
+            state = json.loads(state_file.read_text())
+            files = state.get("files", {})
+            total = len(files)
+            context_done = sum(1 for v in files.values() if v.get("context_done"))
+            total_chunks = sum(v.get("chunks", 0) for v in files.values())
+            last_run = state.get("last_run", "unknown")
+
+            lines.append("")
+            lines.append("**Indexer:**")
+            lines.append(f"- Files tracked: {total:,}")
+            lines.append(f"- Total chunks: {total_chunks:,}")
+            lines.append(f"- Context prefixed: {context_done:,} / {total:,} ({100*context_done/total:.1f}%)" if total else "- Context: n/a")
+            lines.append(f"- Last run: {last_run}")
+
+            # Per-source context breakdown
+            source_ctx = {}
+            for k, v in files.items():
+                # Determine source from path
+                parts = k.split("/")
+                src = parts[0] if parts else "unknown"
+                source_ctx.setdefault(src, {"total": 0, "done": 0})
+                source_ctx[src]["total"] += 1
+                if v.get("context_done"):
+                    source_ctx[src]["done"] += 1
+
+            if source_ctx:
+                lines.append("")
+                lines.append("**Context by source:**")
+                lines.append("")
+                lines.append("| Source | Files | Context Done | % |")
+                lines.append("|--------|-------|-------------|---|")
+                for src in sorted(source_ctx.keys()):
+                    s = source_ctx[src]
+                    pct = 100 * s["done"] / s["total"] if s["total"] else 0
+                    lines.append(f"| {src} | {s['total']} | {s['done']} | {pct:.0f}% |")
+
+        except (json.JSONDecodeError, IOError):
+            lines.append("*Indexer state file unreadable*")
+
+    return lines
+
+
+def section_neo4j():
+    """Neo4j knowledge graph health."""
+    lines = ["## Knowledge Graph (Neo4j)"]
+
+    if not _check_service(f"{NEO4J_URL}"):
+        lines.append(f"*Neo4j not responding at {NEO4J_URL}*")
+        return lines
+
+    # Use the MCP server stats if available, otherwise just report up/down
+    lines.append("")
+    lines.append("- Status: **online**")
+
+    # Try to get stats via cypher
+    try:
+        import base64
+        neo4j_user = os.environ.get("NEO4J_USER", "neo4j")
+        neo4j_pass = os.environ.get("NEO4J_PASSWORD", "")
+        if not neo4j_pass:
+            # Try credentials file
+            neo4j_creds = Path.home() / ".edwin" / "credentials" / "neo4j" / "env"
+            if neo4j_creds.exists():
+                for line in neo4j_creds.read_text().splitlines():
+                    if line.startswith("NEO4J_PASSWORD="):
+                        neo4j_pass = line.split("=", 1)[1].strip()
+                        break
+        if neo4j_pass:
+            auth = base64.b64encode(f"{neo4j_user}:{neo4j_pass}".encode()).decode()
+            req = Request(
+                f"{NEO4J_URL}/db/neo4j/tx/commit",
+                data=json.dumps({"statements": [
+                    {"statement": "MATCH (n:Entity) RETURN count(n) as entities"},
+                ]}).encode(),
+                headers={
+                    "Authorization": f"Basic {auth}",
+                    "Content-Type": "application/json",
+                },
+            )
+            with urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read())
+                entities = result["results"][0]["data"][0]["row"][0]
+                lines.append(f"- Entities: {entities:,}")
+        else:
+            lines.append("- Entity count: unavailable (no credentials configured)")
+    except Exception:
+        lines.append("- Entity count: unavailable")
+
+    return lines
+
+
+def section_infrastructure():
+    """Docker and Ollama status."""
+    lines = ["## Infrastructure"]
+
+    # Docker
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}}: {{.Status}}"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.stdout.strip():
+            lines.append("")
+            lines.append("**Docker:**")
+            for line in result.stdout.strip().split("\n"):
+                lines.append(f"- {line}")
+    except Exception:
+        lines.append("- Docker: unavailable")
+
+    # Ollama
+    lines.append("")
+    lines.append("**Ollama:**")
+    if _check_service(f"{OLLAMA_URL}/api/tags"):
+        try:
+            with urlopen(f"{OLLAMA_URL}/api/tags", timeout=5) as resp:
+                models = json.loads(resp.read()).get("models", [])
+                for m in models:
+                    size_gb = m.get("size", 0) / 1e9
+                    lines.append(f"- {m['name']}: {size_gb:.1f} GB")
+        except Exception:
+            lines.append("- Online (details unavailable)")
+    else:
+        lines.append("- **OFFLINE**")
+
+    return lines
+
+
+# -- Main ---------------------------------------------------------------------
+
+def generate_report(report_date=None):
+    if report_date is None:
+        report_date = datetime.now(ET).date()
+    elif isinstance(report_date, str):
+        report_date = datetime.strptime(report_date, "%Y-%m-%d").date()
+
+    admin_key = _load_admin_key()
+
+    lines = [
+        "---",
+        f"date: {report_date}",
+        "type: systems-report",
+        "---",
+        "",
+        f"# Edwin Systems Report -- {report_date}",
+        f"*Generated {datetime.now(ET).strftime('%Y-%m-%d %I:%M %p ET')}*",
+        "",
+    ]
+
+    lines.extend(section_api_costs(admin_key, datetime.combine(report_date, datetime.min.time())))
+    lines.append("")
+    lines.extend(section_pipeline(report_date))
+    lines.append("")
+    lines.extend(section_qdrant())
+    lines.append("")
+    lines.extend(section_neo4j())
+    lines.append("")
+    lines.extend(section_infrastructure())
+
+    return "\n".join(lines)
+
+
+def main():
+    import argparse
+    p = argparse.ArgumentParser(description="Edwin Systems Health Report")
+    p.add_argument("--stdout", action="store_true", help="Print to stdout")
+    p.add_argument("--date", help="Report date (YYYY-MM-DD)")
+    args = p.parse_args()
+
+    report_date = args.date or datetime.now(ET).strftime("%Y-%m-%d")
+    report = generate_report(report_date)
+
+    if args.stdout:
+        print(report)
+    else:
+        # Write to briefing book
+        output_dir = BRIEFING_DIR / "1. \U0001f4cb Briefs"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"Systems Report -- {report_date}.md"
+        output_path.write_text(report + "\n", encoding="utf-8")
+        print(f"Report written: {output_path}", file=sys.stderr)
+
+        # Publish to Obsidian if configured
+        if OBSIDIAN_VAULT:
+            vault_path = OBSIDIAN_VAULT / "1. \U0001f4cb Briefs" / f"Systems Report -- {report_date}.md"
+            vault_path.parent.mkdir(parents=True, exist_ok=True)
+            vault_path.write_text(report + "\n", encoding="utf-8")
+            print(f"Published to Obsidian: {vault_path}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

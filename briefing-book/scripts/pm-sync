@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""
+Sync Obsidian edits back to PM database.
+
+Reads Action Tracker markdown files from the Obsidian vault (or docs/),
+compares against the last export state (.pm-state.json), and applies changes:
+
+  - [x] checkbox  -> pm_complete (mark done)
+  - [-] checkbox  -> pm_update status=cancelled
+  - due date changed -> pm_update due_date=...
+  - due: _none_ -> due: YYYY-MM-DD  -> pm_update due_date=...
+  - sub-bullet note -> pm_update context (append)
+
+Usage:
+    pm-sync                      # detect and apply changes
+    pm-sync --dry-run            # show what would change without applying
+    pm-sync --from-vault         # read from Obsidian vault instead of docs/
+"""
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import sys
+from datetime import datetime
+from pathlib import Path
+
+DB_PATH = Path(
+    os.environ.get(
+        "PM_DB_PATH",
+        str(Path.home() / "Edwin/data/pm/prospective.db"),
+    )
+)
+
+SCRIPTS_DIR = Path(__file__).resolve().parent
+DOCS_DIR = SCRIPTS_DIR.parent / "docs"
+TRACKER_DIR = DOCS_DIR / "3. \U0001f3af Action Tracker"
+
+# Obsidian vault path -- configure via env var or ~/.edwin/obsidian-vault-path
+_vault_env = os.environ.get("OBSIDIAN_VAULT_PATH")
+if _vault_env:
+    VAULT_DIR = Path(_vault_env).expanduser() / "3. \U0001f3af Action Tracker"
+else:
+    _vault_config = Path.home() / ".edwin" / "obsidian-vault-path"
+    if _vault_config.exists():
+        VAULT_DIR = Path(_vault_config.read_text().strip()).expanduser() / "3. \U0001f3af Action Tracker"
+    else:
+        VAULT_DIR = None
+
+STATE_FILE = SCRIPTS_DIR.parent / ".pm-state.json"
+SYNC_LOG = Path.home() / "Edwin/memory/pm-sync-log.md"
+
+# Regex to parse a PM item line
+# Matches: - [x] Description text | due: 2026-03-28 | owner: user | pm-abc123
+ITEM_RE = re.compile(
+    r"^- \[(?P<checkbox>[x \-])\] (?P<rest>.*\|\s*(?P<pm_id>pm-[a-f0-9]+))\s*$"
+)
+
+# Extract due date from the metadata portion
+DUE_RE = re.compile(r"due:\s*(?P<due>[0-9]{4}-[0-9]{2}-[0-9]{2}|_none_)")
+
+# Extract notes from sub-bullets
+NOTE_RE = re.compile(r"^\s+-\s+note:\s*(?P<note>.+)$")
+
+
+def load_state() -> dict:
+    """Load the last export state."""
+    if not STATE_FILE.exists():
+        print("ERROR: No .pm-state.json found. Run pm-export first.", file=sys.stderr)
+        sys.exit(1)
+    return json.loads(STATE_FILE.read_text())
+
+
+def parse_file(path: Path) -> dict[str, dict]:
+    """Parse a markdown file and extract PM item states."""
+    items = {}
+    if not path.exists():
+        return items
+
+    lines = path.read_text().splitlines()
+    current_id = None
+
+    for line in lines:
+        # Try to match an item line
+        m = ITEM_RE.match(line)
+        if m:
+            pm_id = m.group("pm_id")
+            checkbox = m.group("checkbox")
+            rest = m.group("rest")
+
+            # Extract due date
+            due_match = DUE_RE.search(rest)
+            due = due_match.group("due") if due_match else ""
+            if due == "_none_":
+                due = ""
+
+            items[pm_id] = {
+                "checkbox": f"[{checkbox}]",
+                "due_date": due,
+                "notes": [],
+            }
+            current_id = pm_id
+            continue
+
+        # Check for notes sub-bullet
+        if current_id:
+            note_m = NOTE_RE.match(line)
+            if note_m:
+                items[current_id]["notes"].append(note_m.group("note").strip())
+            elif line.strip() and not line.startswith("  "):
+                # Non-indented non-empty line means we're past sub-bullets
+                current_id = None
+
+    return items
+
+
+def scan_all_files(source_dir: Path) -> dict[str, dict]:
+    """Parse all Action Tracker markdown files."""
+    all_items = {}
+    for md_file in sorted(source_dir.glob("*.md")):
+        items = parse_file(md_file)
+        all_items.update(items)
+    return all_items
+
+
+def diff_state(old_state: dict, current: dict[str, dict]) -> list[dict]:
+    """Compare current file state against export state. Return list of changes."""
+    changes = []
+    old_items = old_state.get("items", {})
+
+    for pm_id, cur in current.items():
+        old = old_items.get(pm_id)
+        if not old:
+            # Item not in state -- skip (might be manually added)
+            continue
+
+        # Check checkbox change
+        if cur["checkbox"] != old["checkbox"]:
+            if cur["checkbox"] == "[x]":
+                changes.append({
+                    "pm_id": pm_id,
+                    "action": "complete",
+                    "detail": "marked done",
+                    "description": old.get("description", ""),
+                })
+            elif cur["checkbox"] == "[-]":
+                changes.append({
+                    "pm_id": pm_id,
+                    "action": "cancel",
+                    "detail": "marked not doing",
+                    "description": old.get("description", ""),
+                })
+            elif cur["checkbox"] == "[ ]" and old["checkbox"] in ("[x]", "[-]"):
+                changes.append({
+                    "pm_id": pm_id,
+                    "action": "reopen",
+                    "detail": "reopened",
+                    "description": old.get("description", ""),
+                })
+
+        # Check due date change
+        old_due = old.get("due_date", "")
+        cur_due = cur.get("due_date", "")
+        if cur_due != old_due:
+            if cur_due and not old_due:
+                changes.append({
+                    "pm_id": pm_id,
+                    "action": "set_due",
+                    "detail": f"due date set to {cur_due}",
+                    "due_date": cur_due,
+                    "description": old.get("description", ""),
+                })
+            elif cur_due and old_due:
+                changes.append({
+                    "pm_id": pm_id,
+                    "action": "reschedule",
+                    "detail": f"rescheduled {old_due} -> {cur_due}",
+                    "due_date": cur_due,
+                    "description": old.get("description", ""),
+                })
+            elif not cur_due and old_due:
+                changes.append({
+                    "pm_id": pm_id,
+                    "action": "clear_due",
+                    "detail": f"due date cleared (was {old_due})",
+                    "description": old.get("description", ""),
+                })
+
+        # Check for new notes
+        if cur.get("notes"):
+            changes.append({
+                "pm_id": pm_id,
+                "action": "add_note",
+                "detail": f"note added: {'; '.join(cur['notes'])}",
+                "notes": cur["notes"],
+                "description": old.get("description", ""),
+            })
+
+    return changes
+
+
+def apply_changes(changes: list[dict], dry_run: bool = False) -> int:
+    """Apply changes to PM database. Returns count of applied changes."""
+    if not changes:
+        return 0
+
+    if dry_run:
+        for c in changes:
+            print(f"  [{c['pm_id']}] {c['action']}: {c['detail']}")
+        return len(changes)
+
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    now = datetime.now().isoformat(timespec="seconds")
+    applied = 0
+
+    for c in changes:
+        pm_id = c["pm_id"]
+
+        # Verify item exists
+        row = conn.execute("SELECT * FROM items WHERE id = ?", (pm_id,)).fetchone()
+        if not row:
+            print(f"  WARNING: {pm_id} not found in database, skipping", file=sys.stderr)
+            continue
+
+        action = c["action"]
+
+        if action == "complete":
+            conn.execute(
+                "UPDATE items SET status = 'done', completed_at = ?, updated_at = ? WHERE id = ?",
+                (now, now, pm_id),
+            )
+            print(f"  done: [{pm_id}] {c.get('description', '')[:60]}")
+
+        elif action == "cancel":
+            conn.execute(
+                "UPDATE items SET status = 'cancelled', updated_at = ? WHERE id = ?",
+                (now, pm_id),
+            )
+            print(f"  cancelled: [{pm_id}] {c.get('description', '')[:60]}")
+
+        elif action == "reopen":
+            conn.execute(
+                "UPDATE items SET status = 'open', completed_at = NULL, updated_at = ? WHERE id = ?",
+                (now, pm_id),
+            )
+            print(f"  reopened: [{pm_id}] {c.get('description', '')[:60]}")
+
+        elif action in ("set_due", "reschedule"):
+            conn.execute(
+                "UPDATE items SET due_date = ?, updated_at = ? WHERE id = ?",
+                (c["due_date"], now, pm_id),
+            )
+            print(f"  {action}: [{pm_id}] -> {c['due_date']}")
+
+        elif action == "clear_due":
+            conn.execute(
+                "UPDATE items SET due_date = NULL, updated_at = ? WHERE id = ?",
+                (now, pm_id),
+            )
+            print(f"  cleared due: [{pm_id}]")
+
+        elif action == "add_note":
+            # Append notes to context field
+            existing = dict(row).get("context") or ""
+            new_notes = "\n".join(c["notes"])
+            separator = "\n---\n" if existing else ""
+            updated_context = f"{existing}{separator}[{datetime.now().strftime('%Y-%m-%d')}] {new_notes}"
+            conn.execute(
+                "UPDATE items SET context = ?, updated_at = ? WHERE id = ?",
+                (updated_context, now, pm_id),
+            )
+            print(f"  note: [{pm_id}] {new_notes[:60]}")
+
+        applied += 1
+
+    conn.commit()
+    conn.close()
+    return applied
+
+
+def log_sync(changes: list[dict]) -> None:
+    """Append sync results to the sync log."""
+    if not changes:
+        return
+
+    SYNC_LOG.parent.mkdir(parents=True, exist_ok=True)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    entries = [f"\n## Sync -- {now}\n"]
+    for c in changes:
+        entries.append(f"- [{c['pm_id']}] **{c['action']}**: {c['detail']}")
+
+    content = "\n".join(entries) + "\n"
+
+    if not SYNC_LOG.exists():
+        header = "# PM Sync Log\n\nChanges applied from Obsidian Action Tracker edits.\n"
+        SYNC_LOG.write_text(header + content)
+    else:
+        with open(SYNC_LOG, "a") as f:
+            f.write(content)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Sync Obsidian Action Tracker edits to PM")
+    parser.add_argument("--dry-run", action="store_true", help="Show changes without applying")
+    parser.add_argument(
+        "--from-vault",
+        action="store_true",
+        help="Read from Obsidian vault instead of docs/",
+    )
+    args = parser.parse_args()
+
+    if not DB_PATH.exists():
+        print(f"ERROR: PM database not found at {DB_PATH}", file=sys.stderr)
+        sys.exit(1)
+
+    # Load last export state
+    state = load_state()
+
+    # Parse current files
+    if args.from_vault:
+        if not VAULT_DIR or not VAULT_DIR.exists():
+            print("ERROR: Obsidian vault not configured or not found. Set OBSIDIAN_VAULT_PATH env var.", file=sys.stderr)
+            sys.exit(1)
+        source = VAULT_DIR
+    else:
+        source = TRACKER_DIR
+
+    if not source.exists():
+        print(f"ERROR: Source directory not found: {source}", file=sys.stderr)
+        sys.exit(1)
+
+    current = scan_all_files(source)
+    print(f"Parsed {len(current)} items from {source}")
+
+    # Diff against state
+    changes = diff_state(state, current)
+
+    if not changes:
+        print("No changes detected.")
+        return
+
+    print(f"Found {len(changes)} change(s):")
+
+    # Apply
+    applied = apply_changes(changes, dry_run=args.dry_run)
+
+    if not args.dry_run and applied > 0:
+        log_sync(changes)
+        print(f"\nApplied {applied} change(s). Logged to {SYNC_LOG}")
+        print("Run pm-export to regenerate Action Tracker with updated state.")
+
+
+if __name__ == "__main__":
+    main()

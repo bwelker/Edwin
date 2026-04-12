@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""
+Overnight folder cleanup -- archive stale logs and drafts.
+
+Moves files older than N days from Overnight subfolders to archive/.
+Leaves pending-approval items alone but reports stale ones.
+
+Usage:
+    overnight-cleanup              # run with defaults (7 days)
+    overnight-cleanup --days 14    # custom age threshold
+    overnight-cleanup --dry-run    # show what would move, don't move
+"""
+
+import argparse
+import os
+import shutil
+from datetime import datetime, timedelta
+from pathlib import Path
+
+
+# Obsidian vault path -- configure via env var or ~/.edwin/obsidian-vault-path
+_vault_env = os.environ.get("OBSIDIAN_VAULT_PATH")
+if _vault_env:
+    VAULT_DIR = Path(_vault_env).expanduser()
+else:
+    _vault_config = Path.home() / ".edwin" / "obsidian-vault-path"
+    if _vault_config.exists():
+        VAULT_DIR = Path(_vault_config.read_text().strip()).expanduser()
+    else:
+        VAULT_DIR = None
+
+OVERNIGHT_DIR = VAULT_DIR / "5. \U0001f319 Overnight" if VAULT_DIR else None
+
+ARCHIVE_SUBFOLDERS = ["logs", "drafts"]
+STALE_SUBFOLDER = "pending-approval"
+STALE_THRESHOLD_DAYS = 3
+
+
+def get_file_age_days(path: Path) -> int:
+    """Get file age in days from modification time."""
+    mtime = datetime.fromtimestamp(path.stat().st_mtime)
+    return (datetime.now() - mtime).days
+
+
+def archive_old_files(subfolder: str, max_age_days: int, dry_run: bool = False) -> list[str]:
+    """Move files older than max_age_days to archive/ subfolder."""
+    source = OVERNIGHT_DIR / subfolder
+    archive = source / "archive"
+    moved = []
+
+    if not source.exists():
+        return moved
+
+    if not dry_run:
+        archive.mkdir(exist_ok=True)
+
+    for f in source.iterdir():
+        if f.is_dir():
+            continue
+        if f.name.startswith("."):
+            continue
+
+        age = get_file_age_days(f)
+        if age > max_age_days:
+            dest = archive / f.name
+            if dry_run:
+                moved.append(f"  [dry-run] Would move: {f.name} ({age} days old)")
+            else:
+                shutil.move(str(f), str(dest))
+                moved.append(f"  Moved: {f.name} ({age} days old)")
+
+    return moved
+
+
+def check_stale_pending(threshold_days: int = STALE_THRESHOLD_DAYS) -> list[str]:
+    """Report pending-approval items older than threshold."""
+    pending = OVERNIGHT_DIR / STALE_SUBFOLDER
+    stale = []
+
+    if not pending.exists():
+        return stale
+
+    for f in pending.iterdir():
+        if f.is_dir() or f.name.startswith("."):
+            continue
+
+        age = get_file_age_days(f)
+        if age >= threshold_days:
+            stale.append(f"  STALE ({age} days): {f.name}")
+
+    return stale
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Archive old overnight files")
+    parser.add_argument("--days", type=int, default=7, help="Archive files older than N days (default 7)")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be done without doing it")
+    args = parser.parse_args()
+
+    if not OVERNIGHT_DIR or not OVERNIGHT_DIR.exists():
+        print("ERROR: Obsidian vault not configured or overnight directory not found.", file=sys.stderr)
+        print("Set OBSIDIAN_VAULT_PATH env var or run obsidian-publish --setup.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Overnight cleanup -- archiving files > {args.days} days old")
+    if args.dry_run:
+        print("(DRY RUN -- no files will be moved)\n")
+    print()
+
+    total_moved = 0
+    for subfolder in ARCHIVE_SUBFOLDERS:
+        results = archive_old_files(subfolder, args.days, args.dry_run)
+        if results:
+            print(f"{subfolder}/:")
+            for r in results:
+                print(r)
+            total_moved += len(results)
+        else:
+            print(f"{subfolder}/: nothing to archive")
+        print()
+
+    # Check pending-approval for stale items
+    stale = check_stale_pending()
+    if stale:
+        print(f"pending-approval/ -- {len(stale)} stale item(s):")
+        for s in stale:
+            print(s)
+    else:
+        print("pending-approval/: all items fresh")
+    print()
+
+    print(f"Done. {total_moved} file(s) archived. {len(stale)} stale pending item(s).")
+
+
+if __name__ == "__main__":
+    main()

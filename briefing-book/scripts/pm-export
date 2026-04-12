@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""
+Export PM items to interactive markdown files in the briefing book Action Tracker.
+
+Generates triage-friendly views that the user can edit in Obsidian:
+  - Check a box [x] to mark done
+  - Use [-] to mark not doing / cancelled
+  - Change due dates inline
+  - Add due: YYYY-MM-DD where due: _none_ appears
+  - Add sub-bullet notes
+
+Saves export state to .pm-state.json so pm-sync can detect what changed.
+
+Usage:
+    pm-export                    # export + publish to Obsidian vault
+    pm-export --no-publish       # export to docs/ only
+    pm-export --status           # show what would be generated (dry run)
+"""
+
+import argparse
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+from collections import defaultdict
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+DB_PATH = Path(
+    os.environ.get(
+        "PM_DB_PATH",
+        str(Path.home() / "Edwin/data/pm/prospective.db"),
+    )
+)
+
+SCRIPTS_DIR = Path(__file__).resolve().parent
+DOCS_DIR = SCRIPTS_DIR.parent / "docs"
+TRACKER_DIR = DOCS_DIR / "3. \U0001f3af Action Tracker"
+STATE_FILE = SCRIPTS_DIR.parent / ".pm-state.json"
+PUBLISH_SCRIPT = SCRIPTS_DIR / "obsidian-publish"
+
+
+def get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def query_items(conn: sqlite3.Connection, where: str, params: list = None) -> list[dict]:
+    """Query PM items with given WHERE clause."""
+    sql = f"""
+        SELECT id, type, owner, counterparty, description, context,
+               due_date, status, priority, created_at, updated_at, completed_at
+        FROM items
+        WHERE {where}
+        ORDER BY due_date ASC NULLS LAST, priority DESC, created_at DESC
+    """
+    rows = conn.execute(sql, params or []).fetchall()
+    return [dict(r) for r in rows]
+
+
+def format_item_line(item: dict) -> str:
+    """Format a single PM item as an interactive markdown checkbox line."""
+    # Checkbox state
+    status = item["status"]
+    if status == "done":
+        checkbox = "[x]"
+    elif status == "cancelled":
+        checkbox = "[-]"
+    else:
+        checkbox = "[ ]"
+
+    # Description -- first sentence for the main line
+    desc = item["description"].strip()
+
+    # Metadata parts
+    parts = []
+
+    # Due date
+    due = item.get("due_date")
+    if due:
+        parts.append(f"due: {due}")
+    else:
+        parts.append("due: _none_")
+
+    # Owner
+    owner = item.get("owner", "")
+    if owner:
+        parts.append(f"owner: {owner}")
+
+    # Counterparty
+    cp = item.get("counterparty", "")
+    if cp:
+        parts.append(f"with: {cp}")
+
+    # Priority
+    pri = item.get("priority", "")
+    if pri:
+        parts.append(f"pri: {pri}")
+
+    # Type (only if notable)
+    item_type = item.get("type", "task")
+    if item_type in ("commitment_by_user", "commitment_to_user"):
+        type_label = "owes" if item_type == "commitment_by_user" else "owed"
+        parts.append(f"type: {type_label}")
+
+    # PM ID (always last -- anchor for parsing)
+    parts.append(item["id"])
+
+    meta = " | ".join(parts)
+    line = f"- {checkbox} {desc} | {meta}"
+
+    # Optionally append context as sub-line
+    ctx = item.get("_show_context")
+    if ctx and item.get("context"):
+        line += f"\n  **Reason:** {item['context']}"
+
+    return line
+
+
+def group_by_owner(items: list[dict]) -> dict[str, list[dict]]:
+    """Group items by owner."""
+    groups = defaultdict(list)
+    for item in items:
+        owner = item.get("owner", "unknown") or "unknown"
+        groups[owner.strip().title()].append(item)
+
+    # Sort: user first, edwin second, then alphabetical
+    def sort_key(name):
+        if name.lower() == "edwin":
+            return (1, name)
+        return (2, name)
+
+    return dict(sorted(groups.items(), key=lambda kv: sort_key(kv[0])))
+
+
+def generate_file(title: str, description: str, items: list[dict], group: bool = True) -> str:
+    """Generate a markdown file with interactive PM items."""
+    now = datetime.now().strftime("%Y-%m-%dT%H:%M")
+
+    lines = [
+        "---",
+        f"generated: {now}",
+        "source: pm-export",
+        f"items: {len(items)}",
+        "---",
+        "",
+        f"# {title}",
+        "",
+        description,
+        "",
+    ]
+
+    if not items:
+        lines.append("*No items.*")
+        return "\n".join(lines) + "\n"
+
+    if group:
+        grouped = group_by_owner(items)
+        for owner, owner_items in grouped.items():
+            lines.append(f"## {owner} ({len(owner_items)})")
+            lines.append("")
+            for item in owner_items:
+                lines.append(format_item_line(item))
+            lines.append("")
+    else:
+        for item in items:
+            lines.append(format_item_line(item))
+        lines.append("")
+
+    # Footer with instructions
+    lines.extend([
+        "---",
+        "",
+        "**How to edit:**",
+        "- `[x]` = mark done",
+        "- `[-]` = not doing / cancel",
+        "- Change `due: YYYY-MM-DD` to reschedule",
+        "- Replace `due: _none_` with `due: YYYY-MM-DD` to set a date",
+        "- Add a sub-bullet `  - note: your text` to add context",
+    ])
+
+    return "\n".join(lines) + "\n"
+
+
+def save_state(all_items: list[dict]) -> None:
+    """Save export state for pm-sync diffing."""
+    state = {
+        "exported_at": datetime.now().isoformat(timespec="seconds"),
+        "items": {},
+    }
+
+    for item in all_items:
+        status = item["status"]
+        if status == "done":
+            cb = "[x]"
+        elif status == "cancelled":
+            cb = "[-]"
+        else:
+            cb = "[ ]"
+
+        state["items"][item["id"]] = {
+            "checkbox": cb,
+            "due_date": item.get("due_date") or "",
+            "description": item["description"],
+            "status": item["status"],
+        }
+
+    STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
+
+
+def publish_tracker():
+    """Run obsidian-publish for the Action Tracker section."""
+    try:
+        subprocess.run(
+            [sys.executable, str(PUBLISH_SCRIPT), "--section", "3. \U0001f3af Action Tracker"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"WARNING: publish failed: {e.stderr}", file=sys.stderr)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Export PM to briefing book Action Tracker")
+    parser.add_argument("--no-publish", action="store_true", help="Don't publish to Obsidian vault")
+    parser.add_argument("--status", action="store_true", help="Dry run -- show counts only")
+    args = parser.parse_args()
+
+    if not DB_PATH.exists():
+        print(f"ERROR: PM database not found at {DB_PATH}", file=sys.stderr)
+        sys.exit(1)
+
+    conn = get_conn()
+    today = date.today()
+    # Week ends next Sunday. On Sunday itself (weekday=6), look ahead 7 days
+    # so "this week" always has a meaningful range.
+    days_until_sunday = (6 - today.weekday()) % 7 or 7
+    week_end = today + timedelta(days=days_until_sunday)
+    next_week_end = week_end + timedelta(days=7)
+
+    # Query each view
+    overdue = query_items(
+        conn,
+        "due_date < ? AND status NOT IN ('done', 'cancelled', 'waiting', 'blocked', 'scheduled')",
+        [today.isoformat()],
+    )
+
+    due_today = query_items(
+        conn,
+        "due_date = ? AND status NOT IN ('done', 'cancelled', 'waiting', 'blocked', 'scheduled')",
+        [today.isoformat()],
+    )
+
+    due_this_week = query_items(
+        conn,
+        "due_date > ? AND due_date <= ? AND status NOT IN ('done', 'cancelled', 'waiting', 'blocked', 'scheduled')",
+        [today.isoformat(), week_end.isoformat()],
+    )
+
+    due_next_week = query_items(
+        conn,
+        "due_date > ? AND due_date <= ? AND status NOT IN ('done', 'cancelled', 'waiting', 'blocked', 'scheduled')",
+        [week_end.isoformat(), next_week_end.isoformat()],
+    )
+
+    needs_date = query_items(
+        conn,
+        "due_date IS NULL AND status NOT IN ('done', 'cancelled', 'waiting', 'blocked', 'scheduled')",
+    )
+
+    blocked = query_items(
+        conn,
+        "status IN ('waiting', 'blocked', 'scheduled')",
+    )
+
+    recently_done = query_items(
+        conn,
+        "status = 'done' AND completed_at >= ?",
+        [(today - timedelta(days=7)).isoformat()],
+    )
+
+    conn.close()
+
+    if args.status:
+        print(f"Overdue:         {len(overdue)}")
+        print(f"Due today:       {len(due_today)}")
+        print(f"Due this week:   {len(due_this_week)}")
+        print(f"Due next week:   {len(due_next_week)}")
+        print(f"Blocked/Waiting: {len(blocked)}")
+        print(f"Needs due date:  {len(needs_date)}")
+        print(f"Recently done:   {len(recently_done)}")
+        print(f"Total active:    {len(overdue) + len(due_today) + len(due_this_week) + len(due_next_week) + len(needs_date)}")
+        return
+
+    # Generate files
+    TRACKER_DIR.mkdir(parents=True, exist_ok=True)
+
+    files = {
+        "Overdue.md": generate_file(
+            f"Overdue -- {today.strftime('%B %d, %Y')}",
+            f"**{len(overdue)} items** past their due date. Mark done, cancel, or reschedule.",
+            overdue,
+        ),
+        "Due Today.md": generate_file(
+            f"Due Today -- {today.strftime('%A, %B %d')}",
+            f"**{len(due_today)} items** due today.",
+            due_today,
+        ),
+        "This Week.md": generate_file(
+            f"Due This Week -- through {week_end.strftime('%B %d')}",
+            f"**{len(due_this_week)} items** due between now and {week_end.strftime('%A')}.",
+            due_this_week,
+        ),
+        "Next Week.md": generate_file(
+            f"Due Next Week -- {(week_end + timedelta(days=1)).strftime('%B %d')} to {next_week_end.strftime('%B %d')}",
+            f"**{len(due_next_week)} items** due next week.",
+            due_next_week,
+        ),
+        "Needs Date.md": generate_file(
+            "Needs Due Date",
+            f"**{len(needs_date)} items** with no due date. Add `due: YYYY-MM-DD` to schedule them.",
+            needs_date,
+        ),
+        "Blocked.md": generate_file(
+            "Blocked / Waiting / Scheduled",
+            f"**{len(blocked)} items** blocked, waiting, or scheduled (meeting booked). These won't appear in your active views.",
+            [{**item, "_show_context": True} for item in blocked],
+        ),
+        "Recently Completed.md": generate_file(
+            "Recently Completed",
+            f"**{len(recently_done)} items** completed in the last 7 days.",
+            recently_done,
+            group=False,
+        ),
+    }
+
+    for filename, content in files.items():
+        path = TRACKER_DIR / filename
+        path.write_text(content)
+        print(f"  wrote: {filename}")
+
+    # Save state for pm-sync
+    all_items = overdue + due_today + due_this_week + due_next_week + blocked + needs_date + recently_done
+    save_state(all_items)
+    print(f"  state: {len(all_items)} items tracked in .pm-state.json")
+
+    # Publish to Obsidian
+    if not args.no_publish:
+        publish_tracker()
+        print("  published to Obsidian vault")
+
+
+if __name__ == "__main__":
+    main()

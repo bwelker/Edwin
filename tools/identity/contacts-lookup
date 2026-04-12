@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# contacts-lookup -- Query Apple Contacts from the command line
+# Usage:
+#   contacts-lookup phone <number>      -- Find contact by phone number
+#   contacts-lookup email <address>     -- Find contact by email
+#   contacts-lookup name <query>        -- Search by name
+#   contacts-lookup info <name>         -- Get full contact details
+#   contacts-lookup resolve-chats       -- Resolve all recent iMessage chat IDs to names
+
+set -euo pipefail
+
+# Find the iCloud contacts database (largest source)
+AB_DIR="$HOME/Library/Application Support/AddressBook/Sources"
+DB=""
+MAX=0
+for d in "$AB_DIR"/*/; do
+  f="$d/AddressBook-v22.abcddb"
+  if [ -f "$f" ]; then
+    c=$(sqlite3 "$f" "SELECT COUNT(*) FROM ZABCDRECORD" 2>/dev/null || echo 0)
+    if [ "$c" -gt "$MAX" ]; then
+      MAX=$c
+      DB=$f
+    fi
+  fi
+done
+
+if [ -z "$DB" ]; then
+  echo "Error: No contacts database found" >&2
+  exit 1
+fi
+
+cmd="${1:-help}"
+query="${2:-}"
+
+case "$cmd" in
+  phone)
+    # Strip everything except digits
+    digits=$(echo "$query" | tr -cd '0-9')
+    # Use last 10 digits for matching
+    if [ ${#digits} -ge 10 ]; then
+      digits="${digits: -10}"
+    fi
+    sqlite3 -separator ' | ' "$DB" "
+      SELECT r.ZFIRSTNAME, r.ZLASTNAME, p.ZFULLNUMBER
+      FROM ZABCDRECORD r
+      JOIN ZABCDPHONENUMBER p ON p.ZOWNER = r.Z_PK
+      WHERE REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(p.ZFULLNUMBER,' ',''),'-',''),'(',''),')',''),'+','') LIKE '%${digits}%'
+    " 2>/dev/null
+    ;;
+
+  email)
+    sqlite3 -separator ' | ' "$DB" "
+      SELECT r.ZFIRSTNAME, r.ZLASTNAME, e.ZADDRESS
+      FROM ZABCDRECORD r
+      JOIN ZABCDEMAILADDRESS e ON e.ZOWNER = r.Z_PK
+      WHERE LOWER(e.ZADDRESS) LIKE '%$(echo "$query" | tr '[:upper:]' '[:lower:]')%'
+    " 2>/dev/null
+    ;;
+
+  name)
+    sqlite3 -separator ' | ' "$DB" "
+      SELECT r.ZFIRSTNAME, r.ZLASTNAME, r.ZORGANIZATION
+      FROM ZABCDRECORD r
+      WHERE LOWER(COALESCE(r.ZFIRSTNAME,'') || ' ' || COALESCE(r.ZLASTNAME,'')) LIKE '%$(echo "$query" | tr '[:upper:]' '[:lower:]')%'
+      OR LOWER(COALESCE(r.ZORGANIZATION,'')) LIKE '%$(echo "$query" | tr '[:upper:]' '[:lower:]')%'
+      ORDER BY r.ZLASTNAME
+    " 2>/dev/null
+    ;;
+
+  info)
+    # Get full details for a contact
+    sqlite3 -separator ' | ' "$DB" "
+      SELECT 'NAME' AS type, r.ZFIRSTNAME || ' ' || COALESCE(r.ZLASTNAME,'') AS value
+      FROM ZABCDRECORD r
+      WHERE LOWER(COALESCE(r.ZFIRSTNAME,'') || ' ' || COALESCE(r.ZLASTNAME,'')) LIKE '%$(echo "$query" | tr '[:upper:]' '[:lower:]')%'
+      UNION ALL
+      SELECT 'ORG', r.ZORGANIZATION
+      FROM ZABCDRECORD r
+      WHERE LOWER(COALESCE(r.ZFIRSTNAME,'') || ' ' || COALESCE(r.ZLASTNAME,'')) LIKE '%$(echo "$query" | tr '[:upper:]' '[:lower:]')%'
+      AND r.ZORGANIZATION IS NOT NULL
+      UNION ALL
+      SELECT 'PHONE', p.ZFULLNUMBER
+      FROM ZABCDRECORD r
+      JOIN ZABCDPHONENUMBER p ON p.ZOWNER = r.Z_PK
+      WHERE LOWER(COALESCE(r.ZFIRSTNAME,'') || ' ' || COALESCE(r.ZLASTNAME,'')) LIKE '%$(echo "$query" | tr '[:upper:]' '[:lower:]')%'
+      UNION ALL
+      SELECT 'EMAIL', e.ZADDRESS
+      FROM ZABCDRECORD r
+      JOIN ZABCDEMAILADDRESS e ON e.ZOWNER = r.Z_PK
+      WHERE LOWER(COALESCE(r.ZFIRSTNAME,'') || ' ' || COALESCE(r.ZLASTNAME,'')) LIKE '%$(echo "$query" | tr '[:upper:]' '[:lower:]')%'
+    " 2>/dev/null
+    ;;
+
+  resolve-chats)
+    # Resolve recent iMessage chats to contact names
+    imsg chats --limit 30 2>/dev/null | while IFS= read -r line; do
+      # Extract phone number from chat line
+      num=$(echo "$line" | grep -oE '\+1[0-9]{10}' | head -1)
+      if [ -n "$num" ]; then
+        digits="${num: -10}"
+        name=$(sqlite3 "$DB" "
+          SELECT COALESCE(r.ZFIRSTNAME,'') || ' ' || COALESCE(r.ZLASTNAME,'')
+          FROM ZABCDRECORD r
+          JOIN ZABCDPHONENUMBER p ON p.ZOWNER = r.Z_PK
+          WHERE REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(p.ZFULLNUMBER,' ',''),'-',''),'(',''),')',''),'+','') LIKE '%${digits}%'
+          LIMIT 1
+        " 2>/dev/null || true)
+        if [ -n "$name" ] && [ "$name" != " " ]; then
+          echo "$line -> $name"
+        else
+          echo "$line -> (unknown)"
+        fi
+      else
+        # Non-phone chat (email, group, shortcode)
+        echo "$line"
+      fi
+    done || true
+    ;;
+
+  help|*)
+    echo "contacts-lookup -- Query Apple Contacts"
+    echo ""
+    echo "Usage:"
+    echo "  contacts-lookup phone <number>    Find contact by phone number"
+    echo "  contacts-lookup email <address>   Find contact by email"
+    echo "  contacts-lookup name <query>      Search by name"
+    echo "  contacts-lookup info <name>       Get full contact details"
+    echo "  contacts-lookup resolve-chats     Resolve iMessage chats to names"
+    echo ""
+    echo "Database: $DB ($MAX contacts)"
+    ;;
+esac

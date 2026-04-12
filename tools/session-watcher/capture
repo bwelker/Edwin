@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""
+Session Capture Runner -- Orchestrates watcher + summarizer.
+
+Checks the watcher. If capture is needed, runs the summarizer.
+Designed to be called by the scheduler or a LaunchAgent.
+
+Usage:
+  capture                  # Check and capture if needed
+  capture --force          # Force a capture regardless of thresholds
+  capture --force-summary  # Force a full summary (not just state)
+"""
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+TOOLS_DIR = Path(__file__).parent
+WATCHER = TOOLS_DIR / "watcher"
+SUMMARIZER = TOOLS_DIR / "summarizer"
+
+# Session directory: auto-detect from EDWIN_SESSIONS_DIR env var,
+# or fall back to the Claude Code project sessions for this project.
+_project_dir = Path(__file__).resolve().parent.parent.parent
+SESSIONS_DIR = Path(
+    os.environ.get(
+        "EDWIN_SESSIONS_DIR",
+        str(Path.home() / ".claude" / "projects" / f"-{str(_project_dir).replace('/', '-').lstrip('-')}"),
+    )
+)
+
+
+def main():
+    force = "--force" in sys.argv
+    force_summary = "--force-summary" in sys.argv
+
+    # Step 1: Check watcher
+    if force or force_summary:
+        # Get active session file directly
+        result = subprocess.run(
+            [str(WATCHER), "--status"],
+            capture_output=True, text=True
+        )
+        # Parse session file from status output
+        for line in result.stdout.split("\n"):
+            if line.startswith("Session:"):
+                session_id = line.split(":")[1].strip()
+                session_file = SESSIONS_DIR / f"{session_id}.jsonl"
+                if session_file.exists():
+                    break
+        else:
+            print("No active session found.")
+            return
+
+        trigger = "forced"
+        mode = "summary" if force_summary else "state"
+    else:
+        result = subprocess.run(
+            [str(WATCHER), "--update-state"],
+            capture_output=True, text=True
+        )
+
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            print(f"Watcher error: {result.stdout}", file=sys.stderr)
+            return
+
+        if data.get("action") != "capture":
+            print(f"No capture needed: {data.get('reason', 'unknown')}")
+            return
+
+        session_file = Path(data["session_file"])
+        trigger = data.get("trigger", "unknown")
+
+        # Token threshold -> state file (mid-session). Idle -> full summary.
+        mode = "state" if trigger == "tokens" else "summary"
+
+    # Step 2: Run summarizer
+    print(f"Capture triggered ({trigger}): {session_file.stem}")
+    print(f"Mode: {mode}")
+
+    result = subprocess.run(
+        [str(SUMMARIZER), str(session_file), "--mode", mode],
+        capture_output=True, text=True
+    )
+
+    print(result.stdout)
+    if result.stderr:
+        print(result.stderr, file=sys.stderr)
+
+    if result.returncode != 0:
+        print(f"Summarizer failed (exit {result.returncode})", file=sys.stderr)
+        sys.exit(1)
+
+    print("Capture complete.")
+
+
+if __name__ == "__main__":
+    main()

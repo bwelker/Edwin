@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""
+Bidirectional sync watcher for the briefing book.
+
+Compares file hashes between the Obsidian vault and docs/.
+If vault is newer (user edited in Obsidian), copies back to docs/ and logs.
+
+Usage:
+    obsidian-watcher --sync      # run once (cron mode)
+    obsidian-watcher --status    # show differences without syncing
+"""
+
+import argparse
+import hashlib
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+
+DOCS_DIR = Path(__file__).resolve().parent.parent / "docs"
+EDIT_LOG = Path(__file__).resolve().parent.parent.parent / "memory" / "briefing-book-edits.md"
+
+# Obsidian vault path -- configure via env var or ~/.edwin/obsidian-vault-path
+_vault_env = os.environ.get("OBSIDIAN_VAULT_PATH")
+if _vault_env:
+    VAULT_DIR = Path(_vault_env).expanduser()
+else:
+    _vault_config = Path.home() / ".edwin" / "obsidian-vault-path"
+    if _vault_config.exists():
+        VAULT_DIR = Path(_vault_config.read_text().strip()).expanduser()
+    else:
+        VAULT_DIR = None
+
+
+def file_hash(path: Path) -> str:
+    """SHA256 of file contents."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def scan_differences() -> list[dict]:
+    """Find files where vault is newer than docs/."""
+    if not VAULT_DIR:
+        return []
+
+    diffs = []
+
+    for vault_file in sorted(VAULT_DIR.rglob("*.md")):
+        try:
+            rel = vault_file.relative_to(VAULT_DIR)
+        except ValueError:
+            continue
+
+        docs_file = DOCS_DIR / rel
+
+        if not docs_file.exists():
+            diffs.append({
+                "rel": rel,
+                "vault": vault_file,
+                "docs": docs_file,
+                "type": "new_in_vault",
+            })
+        elif file_hash(vault_file) != file_hash(docs_file):
+            # Vault is different -- check mtime to see if vault is newer
+            if vault_file.stat().st_mtime > docs_file.stat().st_mtime:
+                diffs.append({
+                    "rel": rel,
+                    "vault": vault_file,
+                    "docs": docs_file,
+                    "type": "vault_newer",
+                })
+
+    return diffs
+
+
+def log_edit(rel: Path, edit_type: str) -> None:
+    """Append to the edit log."""
+    EDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    entry = f"- {now} | {edit_type} | `{rel}`\n"
+
+    if not EDIT_LOG.exists():
+        EDIT_LOG.write_text(f"# Briefing Book Edits\n\nEdits detected from Obsidian vault.\n\n{entry}")
+    else:
+        with open(EDIT_LOG, "a") as f:
+            f.write(entry)
+
+
+def sync(diffs: list[dict]) -> int:
+    """Copy vault changes back to docs/. Returns count of synced files."""
+    synced = 0
+
+    for diff in diffs:
+        diff["docs"].parent.mkdir(parents=True, exist_ok=True)
+
+        import shutil
+        shutil.copy2(diff["vault"], diff["docs"])
+        log_edit(diff["rel"], diff["type"])
+        print(f"  synced: {diff['rel']} ({diff['type']})")
+        synced += 1
+
+    return synced
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Briefing book bidirectional sync")
+    parser.add_argument("--sync", action="store_true", help="Sync vault changes back to docs/")
+    parser.add_argument("--status", action="store_true", help="Show differences without syncing")
+    args = parser.parse_args()
+
+    if not VAULT_DIR or not VAULT_DIR.exists():
+        print("ERROR: Obsidian vault not configured. Set OBSIDIAN_VAULT_PATH env var or run obsidian-publish --setup.", file=sys.stderr)
+        sys.exit(1)
+
+    diffs = scan_differences()
+
+    if args.status:
+        if not diffs:
+            print("No differences found.")
+        for diff in diffs:
+            print(f"  {diff['type']}: {diff['rel']}")
+    elif args.sync:
+        if not diffs:
+            print("No changes to sync.")
+        else:
+            synced = sync(diffs)
+            print(f"Synced {synced} file(s) from vault to docs/")
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""
+Session Summarizer -- Produces conversation state snapshots via Haiku.
+
+Called by the session watcher when a capture is needed (idle timeout or token
+threshold). Reads the active Claude Code JSONL session, extracts the recent
+conversation, and calls Haiku to produce a structured summary.
+
+Two output modes:
+  - "state": Writes memory/conversation-state.md (mid-session bookmark, ~20 lines)
+  - "summary": Writes memory/sessions/YYYY-MM-DD-HHMM-summary.md (end-of-session)
+
+Usage:
+  summarizer <session_file>                    # Auto-detect mode (state if active, summary if idle >2h)
+  summarizer <session_file> --mode state       # Force state file output
+  summarizer <session_file> --mode summary     # Force full summary output
+  summarizer <session_file> --dry-run          # Print what would be sent to Haiku
+"""
+
+import argparse
+import json
+import os
+import sys
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+EDWIN_DIR = Path(__file__).resolve().parent.parent.parent
+STATE_OUTPUT = EDWIN_DIR / "memory" / "conversation-state.md"
+SUMMARY_DIR = EDWIN_DIR / "memory" / "sessions"
+WATCHER_STATE = EDWIN_DIR / "memory" / ".session-watcher-state.json"
+
+# Load Anthropic API key
+CREDS_FILE = Path.home() / ".edwin/credentials/anthropic/env"
+API_KEY = None
+if CREDS_FILE.exists():
+    for line in CREDS_FILE.read_text().strip().split("\n"):
+        if line.startswith("ANTHROPIC_API_KEY="):
+            API_KEY = line.split("=", 1)[1]
+            break
+if not API_KEY:
+    API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+
+HAIKU_MODEL = "claude-haiku-4-5-20251001"
+API_URL = "https://api.anthropic.com/v1/messages"
+
+# How many recent messages to include in the summary context
+MAX_RECENT_MESSAGES = 60
+# Max chars of conversation to send (stay well under Haiku's context)
+MAX_TRANSCRIPT_CHARS = 80_000
+
+
+STATE_PROMPT = """You are Edwin's memory consolidation system. A Claude Code session is active and you need to capture its current state as a lightweight bookmark for continuity.
+
+Read the conversation transcript below and produce a conversation state file (~20 lines). This will be read at the start of the next session or after context compression to restore working context.
+
+Format:
+
+```
+# Conversation State
+Updated: {timestamp}
+
+## Current Topic
+[What we're actively working on right now]
+
+## Open Threads
+- [Thread 1]: [status]
+- [Thread 2]: [status]
+
+## Key Decisions This Session
+- [Decision]: [why]
+
+## Blocked / Waiting
+- [Item]: [blocker]
+
+## Next Action
+[What should happen next in this conversation]
+```
+
+Rules:
+- Be specific. File paths, function names, ticket numbers -- preserve verbatim.
+- ~20 lines max. This is a bookmark, not a full summary.
+- Focus on what future-Edwin needs to pick up where current-Edwin left off.
+- No editorializing. Just facts."""
+
+SUMMARY_PROMPT = """You are Edwin's memory consolidation system. A Claude Code session has gone idle and you need to capture everything important before context is lost.
+
+Read the conversation transcript below and produce a structured session summary.
+
+Format:
+
+```
+---
+date: {date}
+type: session-summary
+---
+
+# Session Summary -- {date}
+
+## Gist
+What happened, where we left off. Written as if briefing future-Edwin with zero context. Be specific about what's done vs in progress vs blocked.
+
+## Decisions
+- Decision: [what]
+  - Why: [reasoning]
+  - Impact: [consequence]
+
+## Tension Map
+Open loops with stakes. What breaks if dropped.
+- [Loop]: [stakes] | [status/blocker]
+
+## Commitments
+**Edwin owes user:**
+- [item]
+
+**User committed to others:**
+- [who, what, when]
+
+**Others owe user:**
+- [who, what, when, status]
+
+## User State
+User's energy/mode -- frustrated, exploring, urgent, relaxed, creative.
+
+## Key Identifiers
+File paths, URLs, ticket numbers, dollar amounts, dates -- preserve verbatim.
+
+## Blocked Items
+What can't progress and why.
+
+## Next
+Where the conversation would naturally pick up.
+```
+
+Rules:
+- Preserve identifiers verbatim. Never paraphrase a file path, phone number, or URL.
+- Don't editorialize. No "good progress made." Just facts.
+- Don't compress away reasoning. "We removed X" is useless without "because Y."
+- Don't drop items for being minor. You don't know what's minor. Capture everything.
+- If uncertain whether something matters, include it.
+- Scan for NOTE: entries. For each actionable one, note it in the summary as needing PM promotion."""
+
+
+def extract_transcript(session_file: str, max_messages: int = MAX_RECENT_MESSAGES) -> str:
+    """Extract recent conversation from Claude Code JSONL as readable text."""
+    messages = []
+
+    with open(session_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            entry_type = entry.get("type")
+            ts = entry.get("timestamp", "")
+            msg = entry.get("message", {})
+
+            if entry_type == "user" and "toolUseResult" not in entry:
+                # Real user message
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    texts = [
+                        c.get("text", "")
+                        for c in content
+                        if isinstance(c, dict) and c.get("type") == "text"
+                    ]
+                    text = "\n".join(texts)
+                elif isinstance(content, str):
+                    text = content
+                else:
+                    text = str(content)
+
+                if text.strip():
+                    messages.append(f"[{ts[:19]}] **User:** {text.strip()}")
+
+            elif entry_type == "assistant":
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    texts = []
+                    for block in content:
+                        if isinstance(block, dict):
+                            if block.get("type") == "text":
+                                texts.append(block.get("text", ""))
+                            elif block.get("type") == "tool_use":
+                                texts.append(f"[tool: {block.get('name', 'unknown')}]")
+                    text = "\n".join(texts)
+                elif isinstance(content, str):
+                    text = content
+                else:
+                    text = str(content)
+
+                if text.strip():
+                    # Truncate very long assistant messages
+                    if len(text) > 3000:
+                        text = text[:3000] + "\n[truncated for summarization]"
+                    messages.append(f"[{ts[:19]}] **Edwin:** {text.strip()}")
+
+    # Take the most recent N messages
+    recent = messages[-max_messages:]
+
+    transcript = "\n\n".join(recent)
+    # Trim to max chars
+    if len(transcript) > MAX_TRANSCRIPT_CHARS:
+        transcript = transcript[-MAX_TRANSCRIPT_CHARS:]
+
+    return transcript
+
+
+def call_haiku(system_prompt: str, transcript: str, dry_run: bool = False) -> str:
+    """Call Haiku to produce a summary."""
+    if not API_KEY:
+        print("Error: No ANTHROPIC_API_KEY found", file=sys.stderr)
+        sys.exit(1)
+
+    user_message = f"Here is the conversation transcript:\n\n{transcript}"
+
+    if dry_run:
+        print("=== SYSTEM PROMPT ===")
+        print(system_prompt)
+        print(f"\n=== TRANSCRIPT ({len(transcript)} chars, ~{len(transcript)//4} tokens) ===")
+        print(transcript[:2000])
+        if len(transcript) > 2000:
+            print(f"\n... [{len(transcript) - 2000} more chars] ...")
+        return ""
+
+    payload = json.dumps({
+        "model": HAIKU_MODEL,
+        "max_tokens": 2048,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_message}],
+    }).encode()
+
+    req = urllib.request.Request(
+        API_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": API_KEY,
+            "anthropic-version": "2023-06-01",
+        },
+        method="POST",
+    )
+
+    try:
+        resp = urllib.request.urlopen(req, timeout=60)
+        data = json.loads(resp.read())
+        content = data.get("content", [])
+        text_blocks = [b.get("text", "") for b in content if b.get("type") == "text"]
+        result = "\n".join(text_blocks)
+
+        # Strip markdown code fences if Haiku wrapped the output
+        if result.startswith("```"):
+            lines = result.split("\n")
+            # Remove first line (```markdown or ```) and last line (```)
+            if lines[-1].strip() == "```":
+                lines = lines[1:-1]
+            elif lines[0].strip().startswith("```"):
+                lines = lines[1:]
+            result = "\n".join(lines)
+
+        # Log usage
+        usage = data.get("usage", {})
+        input_tokens = usage.get("input_tokens", 0)
+        output_tokens = usage.get("output_tokens", 0)
+        print(f"Haiku usage: {input_tokens} input, {output_tokens} output tokens", file=sys.stderr)
+
+        return result
+    except Exception as e:
+        print(f"Error calling Haiku: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def update_watcher_state(session_file: str):
+    """Mark the session as captured in the watcher state file."""
+    state = {
+        "last_capture_ts": datetime.now(timezone.utc).isoformat(),
+        "last_capture_session": Path(session_file).stem,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    WATCHER_STATE.parent.mkdir(parents=True, exist_ok=True)
+    WATCHER_STATE.write_text(json.dumps(state, indent=2))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Session summarizer via Haiku")
+    parser.add_argument("session_file", help="Path to the JSONL session file")
+    parser.add_argument("--mode", choices=["state", "summary", "auto"], default="auto",
+                        help="Output mode (default: auto)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print what would be sent without calling Haiku")
+    args = parser.parse_args()
+
+    if not Path(args.session_file).exists():
+        print(f"Error: {args.session_file} not found", file=sys.stderr)
+        sys.exit(1)
+
+    # Auto-detect mode from watcher output if piped, otherwise default to state
+    mode = args.mode
+    if mode == "auto":
+        # Check if there's watcher JSON on stdin
+        mode = "state"  # Default to lightweight state file
+
+    # Extract transcript
+    transcript = extract_transcript(args.session_file)
+    if not transcript.strip():
+        print("No conversation content found.", file=sys.stderr)
+        sys.exit(1)
+
+    now = datetime.now()
+    date_str = now.strftime("%Y-%m-%dT%H:%M")
+
+    if mode == "state":
+        prompt = STATE_PROMPT.replace("{timestamp}", date_str)
+        result = call_haiku(prompt, transcript, args.dry_run)
+        if result and not args.dry_run:
+            STATE_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+            STATE_OUTPUT.write_text(result)
+            update_watcher_state(args.session_file)
+            print(f"State file written: {STATE_OUTPUT}")
+
+    elif mode == "summary":
+        prompt = SUMMARY_PROMPT.replace("{date}", date_str)
+        result = call_haiku(prompt, transcript, args.dry_run)
+        if result and not args.dry_run:
+            SUMMARY_DIR.mkdir(parents=True, exist_ok=True)
+            filename = now.strftime("%Y-%m-%d-%H%M") + "-summary.md"
+            output_path = SUMMARY_DIR / filename
+            output_path.write_text(result)
+            update_watcher_state(args.session_file)
+            print(f"Summary written: {output_path}")
+
+
+if __name__ == "__main__":
+    main()

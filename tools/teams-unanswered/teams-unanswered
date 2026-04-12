@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""
+Edwin Teams Unanswered Message Detector
+
+Scans Teams daily files to detect conversations where the last message
+is from someone other than the user -- meaning the user hasn't replied yet.
+
+Usage:
+    teams-unanswered scan              # Generate report
+    teams-unanswered scan --json       # Output JSON
+    teams-unanswered scan --days 3     # Look back N days (default 3)
+
+Reads from: ~/Edwin/data/o365/teams-daily/
+Writes to:  ~/Edwin/briefing-book/docs/1. Briefs/Teams Unanswered.md
+
+Configuration:
+    Set USER_NAMES in ~/.edwin/config.env (comma-separated) or EDWIN_USER_NAMES env var.
+    Set SKIP_TEAMS_CHATS in ~/.edwin/config.env (comma-separated) or EDWIN_SKIP_TEAMS_CHATS env var.
+    Set SKIP_TEAMS_SENDERS in ~/.edwin/config.env (comma-separated) or EDWIN_SKIP_TEAMS_SENDERS env var.
+"""
+
+import argparse
+import os
+import re
+import sys
+import json
+from datetime import datetime, date, timedelta
+from pathlib import Path
+from collections import defaultdict
+
+DATA_DIR = Path.home() / "Edwin" / "data" / "o365" / "teams-daily"
+OUTPUT_FILE = Path.home() / "Edwin" / "briefing-book" / "docs" / "1. \U0001f4cb Briefs" / "Teams Unanswered.md"
+
+
+def _load_config_value(env_key: str, config_key: str, default: str = "") -> str:
+    """Load a config value from env var or ~/.edwin/config.env."""
+    val = os.environ.get(env_key)
+    if val:
+        return val
+    config_file = Path.home() / ".edwin" / "config.env"
+    if config_file.exists():
+        for line in config_file.read_text().splitlines():
+            if line.startswith(f"{config_key}="):
+                return line.split("=", 1)[1].strip()
+    return default
+
+
+def _get_user_names() -> set[str]:
+    """Get the user's display names from config."""
+    raw = _load_config_value("EDWIN_USER_NAMES", "USER_NAMES")
+    if raw:
+        return {n.strip() for n in raw.split(",") if n.strip()}
+    return set()
+
+
+def _get_skip_chats() -> set[str]:
+    """Get chats to skip from config."""
+    raw = _load_config_value("EDWIN_SKIP_TEAMS_CHATS", "SKIP_TEAMS_CHATS")
+    if raw:
+        return {c.strip() for c in raw.split(",") if c.strip()}
+    return set()
+
+
+def _get_skip_senders() -> set[str]:
+    """Get senders to skip from config."""
+    raw = _load_config_value("EDWIN_SKIP_TEAMS_SENDERS", "SKIP_TEAMS_SENDERS")
+    if raw:
+        return {s.strip() for s in raw.split(",") if s.strip()}
+    return set()
+
+
+def parse_messages_from_file(filepath: Path) -> list[dict]:
+    """Parse a teams-daily file and extract message metadata."""
+    messages = []
+    try:
+        content = filepath.read_text()
+    except Exception:
+        return messages
+
+    # Split on --- separators
+    blocks = content.split("---")
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+
+        msg = {}
+        for line in block.split("\n"):
+            if ":" in line:
+                key, _, value = line.partition(":")
+                key = key.strip()
+                value = value.strip()
+                if key == "from":
+                    msg["from"] = value
+                elif key == "date":
+                    msg["date"] = value
+                elif key == "chat":
+                    msg["chat"] = value
+
+        if msg.get("from") and msg.get("date"):
+            messages.append(msg)
+
+    return messages
+
+
+def scan_unanswered(lookback_days: int = 3) -> list[dict]:
+    """Scan all chats for unanswered messages."""
+    if not DATA_DIR.exists():
+        return []
+
+    user_names = _get_user_names()
+    skip_chats = _get_skip_chats()
+    skip_senders = _get_skip_senders()
+
+    today = date.today()
+    check_dates = [(today - timedelta(days=i)).isoformat() for i in range(lookback_days)]
+
+    # Structure: chat_name -> list of messages (across all dates, sorted by time)
+    chat_messages = defaultdict(list)
+
+    for chat_dir in sorted(DATA_DIR.iterdir()):
+        if not chat_dir.is_dir():
+            continue
+
+        chat_name = chat_dir.name
+        if chat_name in skip_chats:
+            continue
+
+        for date_str in check_dates:
+            daily_file = chat_dir / f"{date_str}.md"
+            if daily_file.exists():
+                msgs = parse_messages_from_file(daily_file)
+                for m in msgs:
+                    m["chat_name"] = chat_name
+                chat_messages[chat_name].extend(msgs)
+
+    # For each chat, sort by date and check if the last message is NOT from the user
+    unanswered = []
+    for chat_name, messages in chat_messages.items():
+        if not messages:
+            continue
+
+        # Sort by date
+        messages.sort(key=lambda m: m.get("date", ""))
+
+        last_msg = messages[-1]
+        if last_msg["from"] not in user_names and last_msg["from"] not in skip_senders:
+            # Count how many messages from the other person since user's last message
+            pending_count = 0
+            for m in reversed(messages):
+                if m["from"] in user_names:
+                    break
+                pending_count += 1
+
+            # Parse the last message date
+            last_date = last_msg.get("date", "")[:10]
+            try:
+                age_days = (today - datetime.strptime(last_date, "%Y-%m-%d").date()).days
+            except ValueError:
+                age_days = -1
+
+            unanswered.append({
+                "chat": chat_name,
+                "last_from": last_msg["from"],
+                "last_date": last_date,
+                "age_days": age_days,
+                "pending_count": pending_count,
+                "total_messages": len(messages),
+                "chat_type": last_msg.get("chat", "unknown"),
+            })
+
+    # Sort by age (oldest unanswered first)
+    unanswered.sort(key=lambda u: u["age_days"], reverse=True)
+    return unanswered
+
+
+def generate_report(unanswered: list[dict]) -> str:
+    """Generate a markdown report."""
+    today = date.today().isoformat()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    lines = [
+        f"# Teams Unanswered Messages -- {today}",
+        "",
+        f"**Generated:** {now} ET",
+        f"**Lookback:** 3 days",
+        f"**Unanswered threads:** {len(unanswered)}",
+        "",
+    ]
+
+    if not unanswered:
+        lines.append("All clear -- no unanswered messages detected.")
+        return "\n".join(lines)
+
+    # Critical: >2 days old
+    critical = [u for u in unanswered if u["age_days"] >= 2]
+    if critical:
+        lines.append("## Needs Attention (2+ days)")
+        lines.append("")
+        lines.append("| Chat | From | Last Message | Age | Pending |")
+        lines.append("|------|------|-------------|-----|---------|")
+        for u in critical:
+            lines.append(
+                f"| {u['chat']} | {u['last_from']} | {u['last_date']} "
+                f"| {u['age_days']}d | {u['pending_count']} msg |"
+            )
+        lines.append("")
+
+    # All unanswered
+    lines.append("## All Unanswered")
+    lines.append("")
+    lines.append("| Chat | From | Last Message | Age | Pending | Type |")
+    lines.append("|------|------|-------------|-----|---------|------|")
+    for u in unanswered:
+        lines.append(
+            f"| {u['chat']} | {u['last_from']} | {u['last_date']} "
+            f"| {u['age_days']}d | {u['pending_count']} msg | {u['chat_type']} |"
+        )
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Edwin Teams Unanswered Detector")
+    parser.add_argument("command", choices=["scan", "status"])
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--days", type=int, default=3, help="Lookback days (default 3)")
+    args = parser.parse_args()
+
+    unanswered = scan_unanswered(args.days)
+
+    if args.command == "status":
+        print(f"Unanswered threads: {len(unanswered)}")
+        critical = [u for u in unanswered if u["age_days"] >= 2]
+        if critical:
+            print(f"Critical (2+ days): {len(critical)}")
+        return
+
+    if args.json:
+        print(json.dumps(unanswered, indent=2))
+        return
+
+    report = generate_report(unanswered)
+    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT_FILE.write_text(report)
+    print(f"Report written to {OUTPUT_FILE}")
+    print(f"Unanswered: {len(unanswered)}, Critical (2+ days): {len([u for u in unanswered if u['age_days'] >= 2])}")
+
+
+if __name__ == "__main__":
+    main()
