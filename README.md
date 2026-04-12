@@ -195,6 +195,8 @@ Edwin/
 └── docker-compose.yml     # Qdrant + Neo4j infrastructure
 ```
 
+See [How Edwin Works](docs/how-edwin-works.md) for a complete guide to using Edwin day to day.
+
 ## How it works
 
 1. **Connectors** pull your digital life into `data/` as structured Markdown
