@@ -1,12 +1,23 @@
 # Personal data
 data/
 memory/
-briefing-book/docs/*/
 
-# Keep the briefing book structure and reference docs
-!briefing-book/docs/0. 🚀 Getting Started/
-!briefing-book/docs/11. 🤖 Operations/
-!briefing-book/docs/11. 🤖 Operations/connectors/
+# Briefing book: ignore personal content, keep structure and demos
+briefing-book/docs/1. 📋 Briefs/*
+!briefing-book/docs/1. 📋 Briefs/DEMO*
+briefing-book/docs/2. 📅 Calendar/*
+!briefing-book/docs/2. 📅 Calendar/DEMO*
+briefing-book/docs/3. 🎯 Action Tracker/*
+!briefing-book/docs/3. 🎯 Action Tracker/DEMO*
+briefing-book/docs/4. ✉️ Drafts/*
+briefing-book/docs/5. 🌙 Overnight/*
+!briefing-book/docs/5. 🌙 Overnight/DEMO*
+briefing-book/docs/6. 🔬 Research/*
+briefing-book/docs/7. 🏗️ Projects/*
+briefing-book/docs/8. 📦 Products/*
+briefing-book/docs/9. 👥 People/*
+!briefing-book/docs/9. 👥 People/DEMO*
+briefing-book/docs/10. 📋 Daytime Log/*
 
 # Environment and credentials
 .env
