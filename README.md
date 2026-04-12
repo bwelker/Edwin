@@ -12,7 +12,7 @@ Built on [Claude Code](https://claude.ai/claude-code) by Anthropic. Runs locally
 
 ## Why Edwin is different
 
-Most AI agent frameworks are built by engineers thinking about tool orchestration. Edwin was built by a CTO thinking about cognitive architecture.
+Most AI agent frameworks start with tools. Edwin starts with how your brain works.
 
 - **Memory modeled on human cognition.** Five systems, same as your brain: working memory (active context), episodic memory (what happened), semantic memory (what you know), prospective memory (what you need to do), and procedural memory (how to do things).
 - **The Briefing Book.** Your personal intelligence file, organized by cognitive domain -- briefs, calendar, actions, drafts, research, projects, people. Information goes where your brain expects to find it.
@@ -38,6 +38,16 @@ That's it. `setup.sh` installs the infrastructure (Qdrant, Neo4j, Ollama). `clau
 - **Docker** (for Qdrant and Neo4j)
 - **Ollama** (for local embeddings)
 - **Python 3.10+**
+
+## The Core Problem: An Assistant That Knows What You Know
+
+A human chief of staff is useful because they're in the room. They hear the same conversations, read the same emails, sit in the same meetings. They don't need to be told what happened -- they already know. That's what makes their judgment valuable: shared context.
+
+Most AI assistants fail here. They only know what you explicitly tell them. Every conversation starts from zero. You become the bottleneck -- manually feeding context into a system that should already have it.
+
+Edwin solves this by ingesting every electronic communication channel you have. Email, calendar, iMessage, Teams, meeting transcripts, browser history, notes, ambient conversations. If you received it, saw it, or heard it -- Edwin has it too. All of it flows into structured memory (vector store for semantic search, knowledge graph for relationships, prospective memory for commitments) where it's searchable, associable, and retrievable on demand.
+
+The result: when you ask Edwin to prep you for a meeting, draft a reply, or find that thing someone said last week -- it already has the context. You don't have to explain the backstory. Edwin was there.
 
 ## Ambient Intelligence
 
