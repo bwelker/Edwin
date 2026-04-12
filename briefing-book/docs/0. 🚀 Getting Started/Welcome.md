@@ -107,8 +107,18 @@ Some things I always ask about first:
 
 These defaults come from your setup conversation. You can adjust them anytime -- just tell me to move something between levels.
 
-## One More Thing
+## I Get Smarter Over Time
 
-I get better over time. Right now my memory is thin -- connectors just started syncing and I'm building context from scratch. Give it a few days. As email, calendar, meetings, and messages flow in, I'll develop a richer understanding of your work, your people, and your priorities.
+Right now my memory is thin -- connectors just started syncing and I'm building context from scratch. But every hour, the indexer processes new files into searchable vectors. Within a day or two, the briefing book will be a rich, searchable view of your work life.
+
+Here's what compounds:
+
+**Connector data** -- Email, calendar, meetings, messages, browser history, notes. The more connectors you enable, the more I can see. Each sync cycle adds to the pool.
+
+**Session memory** -- Every Claude Code conversation gets indexed into the vector store. When you ask me to research something, debug a problem, or make a decision -- that entire exchange becomes searchable context. Next time a related topic comes up, I can draw on what we discussed before. You don't have to re-explain context. I was there.
+
+**Knowledge graph** -- As data flows in, entities (people, projects, companies) get linked in a graph. I start to understand not just what happened, but who was involved, what they committed to, and how things connect.
+
+The practical effect: conversations get shorter and more useful over time. I need less prompting, I anticipate better, and I can answer questions that require cross-referencing multiple sources.
 
 If something feels off or I'm missing context, tell me. I learn from corrections, and I remember them.

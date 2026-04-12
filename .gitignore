@@ -3,8 +3,10 @@ data/
 memory/
 briefing-book/docs/*/
 
-# Keep the briefing book structure
+# Keep the briefing book structure and reference docs
 !briefing-book/docs/0. 🚀 Getting Started/
+!briefing-book/docs/11. 🤖 Operations/
+!briefing-book/docs/11. 🤖 Operations/connectors/
 
 # Environment and credentials
 .env
