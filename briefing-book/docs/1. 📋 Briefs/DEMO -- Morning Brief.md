@@ -1,10 +1,10 @@
-*This is a demo file showing what Edwin produces. Delete it anytime -- just remove the file or ask Edwin to "delete all demo files."*
-
 ---
 date: 2026-03-15
 type: morning-brief
-edition: weekday
+edition: weekend
 ---
+
+*This is a demo file showing what Edwin produces. Delete it anytime -- just remove the file or ask Edwin to "delete all demo files."*
 
 # Morning Brief -- Sunday, March 15, 2026
 
@@ -57,9 +57,19 @@ Dry run for Thursday's board meeting. Dana wants to align on the pipeline covera
 
 ## INTEL
 
-**Regulatory:** FFIEC released updated guidance Friday on third-party risk management for fintech vendors. Comment period is 45 days. This directly affects how your bank prospects evaluate and onboard Ridgeline. Worth having Raj review the vendor assessment section -- it could actually be a selling point if your compliance posture is tight.
+**Industry & AI:** FFIEC released updated guidance Friday on third-party risk management for fintech vendors. Comment period is 45 days. This directly affects how your bank prospects evaluate and onboard Ridgeline. Worth having Raj review the vendor assessment section -- it could actually be a selling point if your compliance posture is tight. Separately, Fortify GRC announced a partnership with Cornerstone Core Banking on March 10 -- they're going after the integrated-platform angle. Doesn't change Pinecrest (they run Fiserv), but could affect Lakeshore Community Bank where Cornerstone is the core platform. Flag for Devon.
 
-**Competitive:** Fortify GRC announced a partnership with Cornerstone Core Banking on March 10. They're going after the integrated-platform angle. This doesn't change the Pinecrest calculus (Pinecrest runs Fiserv), but it could affect Lakeshore Community Bank where Cornerstone is the core platform. Flag for Devon.
+**Markets & Money:** Broad markets flat into the weekend. Community bank stocks slightly up on the FFIEC guidance news -- the Street reads new compliance burden as tailwind for automation vendors like Ridgeline.
+
+**Social:** Nothing actionable in the feed today.
+
+## DELIVERABLE REVIEW
+
+| Deliverable | Due | Status |
+|-------------|-----|--------|
+| Pinecrest customized ROI analysis | Wednesday, March 18 | In progress -- overnight session drafted a 4-page outline with FFIEC call report data and benchmark numbers from Bramblewood/Silverstone. Key finding: 68% projected reduction in exam-prep cycle time, ~$185K annual savings. Needs your review and sign-off before sending to Sandra Okafor. Draft is in Briefing Book > Drafts. |
+
+No other deliverables in the queue this week.
 
 ## ACTION ITEMS
 

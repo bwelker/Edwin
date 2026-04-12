@@ -1,5 +1,3 @@
-*This is a demo file showing what Edwin produces. Delete it anytime -- just remove the file or ask Edwin to "delete all demo files."*
-
 ---
 date: 2026-03-15
 type: overnight-log
@@ -7,6 +5,8 @@ session: nightwatch
 started: 2026-03-15T00:15:00-04:00
 ended: 2026-03-15T05:48:00-04:00
 ---
+
+*This is a demo file showing what Edwin produces. Delete it anytime -- just remove the file or ask Edwin to "delete all demo files."*
 
 # Overnight Log -- March 15, 2026
 

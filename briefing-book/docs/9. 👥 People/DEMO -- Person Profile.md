@@ -1,11 +1,11 @@
-*This is a demo file showing what Edwin produces. Delete it anytime -- just remove the file or ask Edwin to "delete all demo files."*
-
 ---
 date: 2026-03-15
 type: person-profile
 name: Sandra Okafor
 org: Pinecrest National Bank
 ---
+
+*This is a demo file showing what Edwin produces. Delete it anytime -- just remove the file or ask Edwin to "delete all demo files."*
 
 # Sandra Okafor
 

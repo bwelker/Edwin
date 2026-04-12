@@ -1,10 +1,10 @@
-*This is a demo file showing what Edwin produces. Delete it anytime -- just remove the file or ask Edwin to "delete all demo files."*
-
 ---
 date: 2026-03-15
 type: weekly-dispatch
 week: 2026-W11
 ---
+
+*This is a demo file showing what Edwin produces. Delete it anytime -- just remove the file or ask Edwin to "delete all demo files."*
 
 # Weekly Dispatch -- W11 (March 9-15, 2026)
 

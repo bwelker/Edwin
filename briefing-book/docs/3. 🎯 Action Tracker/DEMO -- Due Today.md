@@ -1,10 +1,10 @@
-*This is a demo file showing what Edwin produces. Delete it anytime -- just remove the file or ask Edwin to "delete all demo files."*
-
 ---
 date: 2026-03-15
 type: action-tracker
 filter: due-today
 ---
+
+*This is a demo file showing what Edwin produces. Delete it anytime -- just remove the file or ask Edwin to "delete all demo files."*
 
 # Action Items -- Due Today
 
