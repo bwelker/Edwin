@@ -208,7 +208,7 @@ Apache 2.0 -- see [LICENSE](LICENSE).
 
 I'm a CTO at a startup. I needed an executive assistant but didn't have time to hire and train one. So I built one -- and used the process to keep myself deep in AI while running an engineering team.
 
-I use Edwin every day. It prepares my morning briefs, drafts my emails, tracks my commitments, runs research overnight while I sleep, and builds my weekly deliverables -- slide decks, status reports, analysis docs -- autonomously, without being asked. It manages information across multiple residences, multiple communication platforms, and more context than I could ever hold in my head. The result is a lower cognitive load, more time to be present with people, and the ability to focus on the work that actually requires my brain.
+I use Edwin every day. It prepares my morning briefs, drafts my emails, tracks my commitments, runs research overnight while I sleep, and builds my weekly deliverables -- slide decks, status reports, analysis docs -- autonomously, without being asked. It manages information across multiple residences, multiple communication platforms, and more context than I could ever hold in my head. The result is a lower cognitive load, more time to be present with people, and the freedom to focus on work that matters.
 
 The architecture comes from cognitive science. The code comes from solving real problems every day and never being satisfied with "close enough."
 
