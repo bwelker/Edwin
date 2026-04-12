@@ -10,10 +10,10 @@ Built on [Claude Code](https://claude.ai/claude-code) by Anthropic. Runs locally
 
 Most AI agent frameworks are built by engineers thinking about tool orchestration. Edwin was built by a CTO thinking about cognitive architecture.
 
-- **Memory modeled on human cognition.** Working memory (active context), episodic memory (what happened), semantic memory (what you know), prospective memory (what you need to do). Four systems, same as your brain.
+- **Memory modeled on human cognition.** Five systems, same as your brain: working memory (active context), episodic memory (what happened), semantic memory (what you know), prospective memory (what you need to do), and procedural memory (how to do things).
 - **The Briefing Book.** Your personal intelligence file, organized by cognitive domain -- briefs, calendar, actions, drafts, research, projects, people. Information goes where your brain expects to find it.
 - **15 data connectors.** Email, calendar, iMessage, meeting transcripts, browser history, notes, photos, and more. Edwin sees what you see.
-- **Autonomous skills.** Morning briefs, overnight research, weekly summaries. Set them once, they run like habits.
+- **Procedural memory via SKILL.md.** Edwin's skills are plain markdown files -- portable, readable, editable. Each SKILL.md teaches Edwin how to perform a recurring task: morning briefs, overnight research, weekly summaries. This is procedural memory -- the same way your brain automates routines so you don't have to think about them. Any LLM that can read text can execute a skill. No proprietary format, no vendor lock-in.
 - **Semantic search across your entire life.** Qdrant vector store with contextual retrieval. Ask Edwin anything and it finds the answer across all your data.
 
 ## Quickstart
