@@ -68,10 +68,15 @@ fi
 echo ""
 
 # 6. CLAUDE.md
-read -p "Delete CLAUDE.md? (removes personalization -- wizard will regenerate on next run) [y/N]: " choice
+read -p "Reset CLAUDE.md to setup wizard? (removes personalization -- wizard runs on next 'claude') [y/N]: " choice
 if [[ "$choice" =~ ^[Yy]$ ]]; then
-    rm -f "$EDWIN_HOME/CLAUDE.md"
-    echo -e "${GREEN}  ✓ CLAUDE.md deleted. Wizard will regenerate on next 'claude' session.${NC}"
+    cd "$EDWIN_HOME" && git checkout CLAUDE.md 2>/dev/null
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}  ✓ CLAUDE.md restored to setup wizard from git.${NC}"
+    else
+        rm -f "$EDWIN_HOME/CLAUDE.md"
+        echo -e "${YELLOW}  ✓ CLAUDE.md deleted (could not restore from git -- wizard will need to be manually placed).${NC}"
+    fi
 else
     echo "  CLAUDE.md preserved."
 fi
