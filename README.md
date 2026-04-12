@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/edwin-tophat.png" alt="Edwin" width="120" />
+  <img src="assets/Edwin-icon_whitebg.png" alt="Edwin" width="120" />
 </p>
 
 # Edwin
