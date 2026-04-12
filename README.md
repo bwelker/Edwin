@@ -83,6 +83,33 @@ Edwin does the same thing digitally. The Briefing Book is a structured folder sy
 
 The briefing book fills itself over time. You don't organize it -- Edwin does. When you ask "prep me for my 2 PM meeting," Edwin pulls from People (who's in the room), Projects (what you're working on with them), Action Tracker (what you owe them), and Calendar (the agenda) to build a brief. That's the workflow: Edwin assembles the intelligence, you walk in prepared.
 
+## Channels
+
+Edwin isn't useful if you have to open your laptop to talk to it. Channels are how Edwin reaches you -- and how it stays aware of its own work.
+
+Channels serve two purposes:
+
+**1. Edwin talks to you.** Your morning brief arrives as a Telegram message before you're out of bed. A commitment you made in a meeting gets flagged while you're driving. An overnight research task finishes and the summary hits your phone at 6 AM. Edwin is proactive -- it doesn't wait for you to ask. Channels are what make that possible.
+
+**2. Edwin talks to itself.** When a scheduled connector finishes syncing, or a skill completes its work, or something needs attention -- that event flows through an internal channel back to the orchestrator. Without this, the main Edwin session would be blind to everything happening in the background. The events channel is Edwin's nervous system.
+
+### Setup
+
+Edwin ships with Telegram as the default communication channel. Telegram's BotFather makes it simple: create a bot, get a token, give it to Edwin during setup. You get a private 1:1 chat with your AI chief of staff on your phone, your tablet, your desktop -- wherever Telegram runs.
+
+The setup wizard handles configuration. You'll need:
+- A Telegram account
+- 2 minutes with BotFather to create your bot
+- The bot token (the wizard will ask for it)
+
+### Advanced: iMessage
+
+For macOS users who want Edwin to communicate via iMessage instead of Telegram, a BlueBubbles-based iMessage channel is available as an advanced configuration. This requires a dedicated macOS instance (physical or VM) running the BlueBubbles server. Setup guide coming in a future release.
+
+### Building your own channel
+
+The channel interface is simple: receive messages, send messages, route events. If you use Slack, WhatsApp, Signal, or something else as your primary messaging platform -- build a channel connector and contribute it back. The events-channel MCP server in the repo shows the pattern.
+
 ## The Cognitive Model
 
 Edwin's architecture maps directly to how human cognition works:
