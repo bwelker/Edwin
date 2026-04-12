@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""PM Recurring Instantiation -- create next-period items from recurring templates.
+
+Runs weekly (Sunday 4 AM). For each active template:
+  1. Check if an open/in_progress item already exists for the upcoming period
+  2. If not, create one with the correct due date
+  3. Log what was created
+
+Usage:
+  pm-recurring instantiate     -- create next week's items
+  pm-recurring list             -- show all active templates
+  pm-recurring add              -- add a template (interactive, not used by cron)
+  pm-recurring seed             -- seed example templates to demonstrate the format
+"""
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import uuid
+from datetime import datetime, timedelta
+from pathlib import Path
+
+DB_PATH = Path(os.environ.get("PM_DB_PATH", Path.home() / "Edwin" / "data" / "pm" / "prospective.db"))
+
+
+def get_db():
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def next_due_date(rrule: str, reference_date: datetime = None) -> str:
+    """Calculate the next due date from an RRULE-like spec.
+
+    Simplified RRULE support:
+      FREQ=WEEKLY;BYDAY=MO        -> next Monday
+      FREQ=WEEKLY;BYDAY=FR        -> next Friday
+      FREQ=WEEKLY;BYDAY=SU        -> next Sunday
+      FREQ=MONTHLY;BYMONTHDAY=1   -> 1st of next month
+      FREQ=MONTHLY;BYMONTHDAY=15  -> 15th of next month
+      FREQ=DAILY                  -> tomorrow
+    """
+    ref = reference_date or datetime.now()
+    parts = {}
+    for segment in rrule.split(";"):
+        if "=" in segment:
+            k, v = segment.split("=", 1)
+            parts[k.strip()] = v.strip()
+
+    freq = parts.get("FREQ", "WEEKLY")
+
+    if freq == "DAILY":
+        return (ref + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    if freq == "WEEKLY":
+        day_map = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
+        target_day = day_map.get(parts.get("BYDAY", "MO"), 0)
+        current_day = ref.weekday()
+        days_ahead = target_day - current_day
+        if days_ahead <= 0:
+            days_ahead += 7
+        return (ref + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+
+    if freq == "MONTHLY":
+        target_day = int(parts.get("BYMONTHDAY", "1"))
+        # Next month if we're past the target day
+        year, month = ref.year, ref.month
+        if ref.day >= target_day:
+            month += 1
+            if month > 12:
+                month = 1
+                year += 1
+        return f"{year:04d}-{month:02d}-{target_day:02d}"
+
+    return (ref + timedelta(days=7)).strftime("%Y-%m-%d")
+
+
+def has_open_instance(conn, template_id: str, due_date: str) -> bool:
+    """Check if an open item already exists for this template and due date."""
+    row = conn.execute(
+        """SELECT count(*) as cnt FROM items
+           WHERE template_id = ?
+           AND due_date = ?
+           AND status IN ('open', 'in_progress', 'waiting', 'scheduled')""",
+        (template_id, due_date),
+    ).fetchone()
+    return row["cnt"] > 0
+
+
+def instantiate(args):
+    """Create next-period items from all active recurring templates."""
+    conn = get_db()
+    templates = conn.execute(
+        "SELECT * FROM recurring_templates WHERE active = 1"
+    ).fetchall()
+
+    if not templates:
+        print("No active recurring templates found.")
+        return
+
+    created = 0
+    skipped = 0
+    now = datetime.now()
+
+    for t in templates:
+        due = next_due_date(t["recurrence_rule"], now)
+
+        # Also check with lead_days offset
+        lead = t["lead_days"] or 0
+
+        if has_open_instance(conn, t["id"], due):
+            print(f"  SKIP: {t['description'][:60]} (already has instance for {due})")
+            skipped += 1
+            continue
+
+        item_id = f"pm-{uuid.uuid4().hex[:6]}"
+        now_str = now.strftime("%Y-%m-%dT%H:%M:%S")
+        conn.execute(
+            """INSERT INTO items (id, type, owner, counterparty, description, context,
+               due_date, status, priority, created_at, updated_at, template_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)""",
+            (
+                item_id,
+                t["type"],
+                t["owner"],
+                t["counterparty"],
+                t["description"],
+                t["context"],
+                due,
+                t["priority"],
+                now_str,
+                now_str,
+                t["id"],
+            ),
+        )
+        print(f"  CREATE: {item_id} | {t['description'][:60]} | due={due}")
+        created += 1
+
+    conn.commit()
+    conn.close()
+    print(f"\nDone: {created} created, {skipped} skipped, {len(templates)} templates checked.")
+
+
+def list_templates(args):
+    """List all recurring templates."""
+    conn = get_db()
+    templates = conn.execute("SELECT * FROM recurring_templates ORDER BY active DESC, owner").fetchall()
+    conn.close()
+
+    if not templates:
+        print("No recurring templates found.")
+        return
+
+    for t in templates:
+        status = "ACTIVE" if t["active"] else "PAUSED"
+        print(
+            f"[{t['id']}] {status} | {t['owner']} | {t['recurrence_rule']} | "
+            f"{t['description'][:70]}"
+        )
+
+
+def seed_templates(args):
+    """Seed example recurring templates to demonstrate the format.
+
+    These are generic examples. Replace with your own recurring work patterns.
+    """
+    conn = get_db()
+
+    templates = [
+        {
+            "id": "rt-weekly-review",
+            "type": "task",
+            "owner": "edwin",
+            "counterparty": None,
+            "description": "PM weekly review -- check all due-this-week items, flag stale items, update statuses",
+            "context": "Ensure nothing falls through cracks. Reschedule or escalate as needed.",
+            "priority": "medium",
+            "recurrence_rule": "FREQ=WEEKLY;BYDAY=SU",
+            "lead_days": 0,
+        },
+        {
+            "id": "rt-indexer-coverage",
+            "type": "intention",
+            "owner": "edwin",
+            "counterparty": None,
+            "description": "Weekly indexer coverage check -- verify context percentages and fix gaps",
+            "context": "Track connector indexing coverage. Target 100%.",
+            "priority": "low",
+            "recurrence_rule": "FREQ=WEEKLY;BYDAY=SU",
+            "lead_days": 0,
+        },
+    ]
+
+    created = 0
+    skipped = 0
+    now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+    for t in templates:
+        existing = conn.execute(
+            "SELECT id FROM recurring_templates WHERE id = ?", (t["id"],)
+        ).fetchone()
+        if existing:
+            print(f"  SKIP: {t['id']} (already exists)")
+            skipped += 1
+            continue
+
+        conn.execute(
+            """INSERT INTO recurring_templates
+               (id, type, owner, counterparty, description, context, priority,
+                recurrence_rule, lead_days, active, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+            (
+                t["id"],
+                t["type"],
+                t["owner"],
+                t["counterparty"],
+                t["description"],
+                t["context"],
+                t["priority"],
+                t["recurrence_rule"],
+                t["lead_days"],
+                now_str,
+                now_str,
+            ),
+        )
+        print(f"  SEED: {t['id']} | {t['description'][:60]}")
+        created += 1
+
+    conn.commit()
+    conn.close()
+    print(f"\nSeeded: {created} created, {skipped} skipped.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="PM Recurring Instantiation")
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("instantiate", help="Create next-period items")
+    sub.add_parser("list", help="List all templates")
+    sub.add_parser("seed", help="Seed example templates")
+
+    args = parser.parse_args()
+
+    if args.command == "instantiate":
+        instantiate(args)
+    elif args.command == "list":
+        list_templates(args)
+    elif args.command == "seed":
+        seed_templates(args)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

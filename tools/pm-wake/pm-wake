@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""
+Edwin PM Wake Condition Check
+
+Scans deferred PM items and checks if their wake conditions are met.
+Wake conditions are currently date-based: if the due date has arrived
+or passed, the item is reactivated (status set to 'open', type changed
+from 'deferred' to 'intention').
+
+Usage:
+    pm-wake check     # Dry run -- show what would be reactivated
+    pm-wake run       # Reactivate items whose conditions are met
+
+Runs daily at 6 AM via Plombery.
+"""
+
+import argparse
+import os
+import sqlite3
+import sys
+from datetime import date
+from pathlib import Path
+
+DB_PATH = Path(os.environ.get("PM_DB_PATH", Path.home() / "Edwin" / "data" / "pm" / "prospective.db"))
+
+
+def get_deferred_items() -> list[dict]:
+    """Get all open deferred items."""
+    if not DB_PATH.exists():
+        print(f"PM database not found: {DB_PATH}", file=sys.stderr)
+        return []
+
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id, description, type, status, owner, counterparty,
+               due_date, priority, context, created_at, updated_at
+        FROM items
+        WHERE status = 'open' AND type = 'deferred'
+        ORDER BY due_date ASC
+    """)
+
+    items = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return items
+
+
+def check_wake_conditions(items: list[dict]) -> list[dict]:
+    """Check which items should be reactivated."""
+    today = date.today().isoformat()
+    wake_items = []
+
+    for item in items:
+        due = item.get("due_date", "")
+        if not due:
+            continue
+
+        # Date-based wake: if due date has arrived or passed
+        if due <= today:
+            item["wake_reason"] = f"Due date reached: {due} (today: {today})"
+            wake_items.append(item)
+
+        # Future: could check context field for more complex conditions
+        # e.g., "wake when: user responds" -> check PM for related items
+        # e.g., "wake when: PR merged" -> check VCS data
+
+    return wake_items
+
+
+def reactivate_item(item_id: str) -> bool:
+    """Reactivate a deferred item -- set status to open, type to intention."""
+    conn = sqlite3.connect(str(DB_PATH))
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("""
+            UPDATE items
+            SET status = 'open',
+                type = 'intention',
+                updated_at = datetime('now')
+            WHERE id = ?
+        """, (item_id,))
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        print(f"Error reactivating {item_id}: {e}", file=sys.stderr)
+        return False
+    finally:
+        conn.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Edwin PM Wake Condition Check")
+    parser.add_argument("command", choices=["check", "run"])
+    args = parser.parse_args()
+
+    items = get_deferred_items()
+
+    if not items:
+        print("No deferred items found.")
+        return
+
+    print(f"Found {len(items)} deferred items.")
+    wake_items = check_wake_conditions(items)
+
+    if not wake_items:
+        print("No items ready to wake.")
+        return
+
+    print(f"\n{len(wake_items)} items ready to wake:")
+    for item in wake_items:
+        short_id = item["id"][:12]
+        print(f"  [{short_id}] {item['description'][:60]}")
+        print(f"    Reason: {item['wake_reason']}")
+
+    if args.command == "check":
+        print("\nDry run -- no changes made. Use 'run' to reactivate.")
+        return
+
+    if args.command == "run":
+        reactivated = 0
+        for item in wake_items:
+            if reactivate_item(item["id"]):
+                reactivated += 1
+                print(f"  Reactivated: [{item['id'][:12]}] {item['description'][:60]}")
+            else:
+                print(f"  FAILED: [{item['id'][:12]}] {item['description'][:60]}")
+
+        print(f"\nReactivated {reactivated}/{len(wake_items)} items.")
+
+
+if __name__ == "__main__":
+    main()

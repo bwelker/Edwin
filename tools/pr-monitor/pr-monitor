@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""
+Edwin PR Monitor -- Scan Bitbucket PR data and generate aging report.
+
+Usage:
+    pr-monitor scan          # Scan all repos, generate report
+    pr-monitor scan --json   # Output JSON instead of markdown
+    pr-monitor status        # Quick summary of open PRs
+
+Reads from: ~/Edwin/data/atlassian/bitbucket/*/pulls/PR-*.md
+Writes to:  ~/Edwin/briefing-book/docs/3. Operations/Bitbucket PR Status.md
+"""
+
+import argparse
+import os
+import re
+import sys
+import json
+from datetime import datetime, date
+from pathlib import Path
+
+EDWIN_HOME = Path(os.environ.get("EDWIN_HOME", Path.home() / "Edwin"))
+DATA_DIR = EDWIN_HOME / "data" / "atlassian" / "bitbucket"
+OUTPUT_FILE = EDWIN_HOME / "briefing-book" / "docs" / "3. Operations" / "Bitbucket PR Status.md"
+
+
+def parse_pr_file(filepath: Path) -> dict | None:
+    """Parse a PR markdown file and extract metadata."""
+    try:
+        content = filepath.read_text()
+    except Exception:
+        return None
+
+    meta = {}
+    in_frontmatter = False
+    for line in content.split("\n"):
+        if line.strip() == "---":
+            if in_frontmatter:
+                break
+            in_frontmatter = True
+            continue
+        if in_frontmatter and ":" in line:
+            key, _, value = line.partition(":")
+            meta[key.strip()] = value.strip()
+
+    if not meta.get("state"):
+        return None
+
+    # Extract title from first heading
+    title_match = re.search(r"^# (.+)$", content, re.MULTILINE)
+    title = title_match.group(1) if title_match else f"PR #{meta.get('pr_id', '?')}"
+
+    return {
+        "repo": meta.get("repo", filepath.parent.parent.name),
+        "pr_id": meta.get("pr_id", "?"),
+        "state": meta.get("state", "UNKNOWN"),
+        "author": meta.get("author", "Unknown"),
+        "created": meta.get("created", ""),
+        "updated": meta.get("updated", ""),
+        "title": title,
+        "file": str(filepath),
+    }
+
+
+def scan_all_prs() -> list[dict]:
+    """Scan all repos for PR files."""
+    prs = []
+    if not DATA_DIR.exists():
+        return prs
+
+    for repo_dir in sorted(DATA_DIR.iterdir()):
+        pulls_dir = repo_dir / "pulls"
+        if not pulls_dir.exists():
+            continue
+        for pr_file in sorted(pulls_dir.glob("PR-*.md")):
+            pr = parse_pr_file(pr_file)
+            if pr:
+                prs.append(pr)
+
+    return prs
+
+
+def compute_age(created_str: str) -> int:
+    """Compute age in days from a date string."""
+    try:
+        # Handle both "YYYY-MM-DD" and "YYYY-MM-DD HH:MM" formats
+        created_date = datetime.strptime(created_str[:10], "%Y-%m-%d").date()
+        return (date.today() - created_date).days
+    except (ValueError, IndexError):
+        return -1
+
+
+def generate_report(prs: list[dict]) -> str:
+    """Generate a markdown report of open PRs."""
+    open_prs = [p for p in prs if p["state"] == "OPEN"]
+    open_prs.sort(key=lambda p: compute_age(p["created"]), reverse=True)
+
+    total = len(prs)
+    open_count = len(open_prs)
+    merged = len([p for p in prs if p["state"] == "MERGED"])
+    declined = len([p for p in prs if p["state"] == "DECLINED"])
+
+    aging = [p for p in open_prs if compute_age(p["created"]) > 7]
+    critical = [p for p in open_prs if compute_age(p["created"]) > 30]
+
+    today = date.today().isoformat()
+
+    lines = [
+        f"# Bitbucket PR Status -- {today}",
+        "",
+        f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "",
+        "## Summary",
+        "",
+        f"- **Total PRs tracked:** {total}",
+        f"- **Open:** {open_count}",
+        f"- **Merged:** {merged}",
+        f"- **Declined/Superseded:** {declined}",
+        f"- **Aging (>7 days):** {len(aging)}",
+        f"- **Critical (>30 days):** {len(critical)}",
+        "",
+    ]
+
+    if critical:
+        lines.append("## Critical PRs (>30 days)")
+        lines.append("")
+        lines.append("| Repo | PR | Author | Age | Title |")
+        lines.append("|------|-----|--------|-----|-------|")
+        for p in critical:
+            age = compute_age(p["created"])
+            lines.append(f"| {p['repo']} | #{p['pr_id']} | {p['author']} | {age}d | {p['title'][:60]} |")
+        lines.append("")
+
+    if open_prs:
+        lines.append("## All Open PRs")
+        lines.append("")
+        lines.append("| Repo | PR | Author | Created | Age | Last Updated | Title |")
+        lines.append("|------|-----|--------|---------|-----|-------------|-------|")
+        for p in open_prs:
+            age = compute_age(p["created"])
+            flag = " **!!**" if age > 30 else " *" if age > 7 else ""
+            lines.append(
+                f"| {p['repo']} | #{p['pr_id']} | {p['author']} "
+                f"| {p['created'][:10]} | {age}d{flag} | {p['updated'][:10]} "
+                f"| {p['title'][:60]} |"
+            )
+        lines.append("")
+
+    # Group by author
+    if open_prs:
+        authors = {}
+        for p in open_prs:
+            authors.setdefault(p["author"], []).append(p)
+
+        lines.append("## By Author")
+        lines.append("")
+        for author, author_prs in sorted(authors.items()):
+            lines.append(f"**{author}** ({len(author_prs)} open)")
+            for p in author_prs:
+                age = compute_age(p["created"])
+                lines.append(f"- {p['repo']} #{p['pr_id']} -- {age}d -- {p['title'][:60]}")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Edwin PR Monitor")
+    parser.add_argument("command", choices=["scan", "status"])
+    parser.add_argument("--json", action="store_true", help="Output JSON")
+    args = parser.parse_args()
+
+    prs = scan_all_prs()
+
+    if args.command == "status":
+        open_prs = [p for p in prs if p["state"] == "OPEN"]
+        aging = [p for p in open_prs if compute_age(p["created"]) > 7]
+        print(f"Open: {len(open_prs)}, Aging (>7d): {len(aging)}, Total tracked: {len(prs)}")
+        return
+
+    if args.command == "scan":
+        if args.json:
+            open_prs = [p for p in prs if p["state"] == "OPEN"]
+            for p in open_prs:
+                p["age_days"] = compute_age(p["created"])
+            print(json.dumps(open_prs, indent=2))
+            return
+
+        report = generate_report(prs)
+
+        # Write to briefing book
+        OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        OUTPUT_FILE.write_text(report)
+        print(f"Report written to {OUTPUT_FILE}")
+        print(f"Open: {len([p for p in prs if p['state'] == 'OPEN'])}, "
+              f"Total: {len(prs)}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+"""Edwin Deep Research Agent -- iterative checkpointed research.
+
+Usage:
+    deep-research "query" [--depth shallow|medium|deep] [--sources internal|web|both]
+    deep-research --resume TASK_ID
+    deep-research --list
+    deep-research --status TASK_ID
+"""
+
+import argparse
+import json
+import os
+import sys
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+PROJECT_DIR = Path(os.environ.get("EDWIN_HOME", Path.home() / "Edwin"))
+RESEARCH_DIR = PROJECT_DIR / "data" / "research"
+
+# Depth configurations: (max_iterations, max_tokens_estimate, max_cost)
+DEPTH_CONFIG = {
+    "shallow": {"max_iterations": 2, "max_tokens": 200_000, "max_cost": 1.50},
+    "medium": {"max_iterations": 4, "max_tokens": 500_000, "max_cost": 4.00},
+    "deep": {"max_iterations": 8, "max_tokens": 1_000_000, "max_cost": 10.00},
+}
+
+
+def generate_task_id():
+    """Generate a short task ID."""
+    return f"research-{uuid.uuid4().hex[:8]}"
+
+
+def get_task_dir(task_id: str) -> Path:
+    """Get the directory for a research task."""
+    return RESEARCH_DIR / task_id
+
+
+def list_tasks():
+    """List all research tasks."""
+    if not RESEARCH_DIR.exists():
+        print("No research tasks found.")
+        return
+
+    tasks = []
+    for d in sorted(RESEARCH_DIR.iterdir()):
+        if not d.is_dir():
+            continue
+        scope_file = d / "scope.md"
+        report_file = d / "report.md"
+        status = "complete" if report_file.exists() else "in_progress"
+        query = "unknown"
+        if scope_file.exists():
+            for line in scope_file.read_text().splitlines():
+                if line.startswith("query:"):
+                    query = line.split(":", 1)[1].strip().strip('"')
+                    break
+        iterations = len(list(d.glob("iteration-*.md")))
+        tasks.append({
+            "task_id": d.name,
+            "status": status,
+            "query": query[:80],
+            "iterations": iterations,
+        })
+
+    if not tasks:
+        print("No research tasks found.")
+        return
+
+    for t in tasks:
+        print(f"  [{t['status']}] {t['task_id']} | {t['iterations']} iterations | {t['query']}")
+
+
+def get_status(task_id: str):
+    """Get status of a research task."""
+    task_dir = get_task_dir(task_id)
+    if not task_dir.exists():
+        print(f"Task {task_id} not found.")
+        return
+
+    scope_file = task_dir / "scope.md"
+    report_file = task_dir / "report.md"
+    iterations = sorted(task_dir.glob("iteration-*.md"))
+
+    print(f"Task: {task_id}")
+    print(f"Directory: {task_dir}")
+    print(f"Scope: {'yes' if scope_file.exists() else 'no'}")
+    print(f"Iterations: {len(iterations)}")
+    print(f"Report: {'yes' if report_file.exists() else 'no'}")
+    print(f"Status: {'complete' if report_file.exists() else 'in_progress'}")
+
+    if iterations:
+        last = iterations[-1]
+        print(f"Last iteration: {last.name}")
+        # Parse YAML frontmatter for coverage
+        content = last.read_text()
+        for line in content.splitlines():
+            if line.startswith("cumulative_coverage:"):
+                print(f"Coverage: {line.split(':',1)[1].strip()}")
+            if line.startswith("novelty_score:"):
+                print(f"Last novelty: {line.split(':',1)[1].strip()}")
+
+
+def write_scope(task_dir: Path, query: str, depth: str, sources: str):
+    """Write the scope checkpoint."""
+    now = datetime.now().astimezone().isoformat()
+    config = DEPTH_CONFIG[depth]
+
+    content = f"""---
+task_id: {task_dir.name}
+query: "{query}"
+depth: {depth}
+sources: {sources}
+max_iterations: {config['max_iterations']}
+max_cost: ${config['max_cost']:.2f}
+created: {now}
+status: scoped
+---
+
+# Research Scope: {query}
+
+**Depth:** {depth} (max {config['max_iterations']} iterations)
+**Sources:** {sources}
+**Budget:** ${config['max_cost']:.2f}
+
+## Research Questions
+
+To be decomposed by the research agent at execution time.
+
+## Search Strategy
+
+1. Internal first (Qdrant semantic search, Neo4j entity lookup)
+2. Web search for gaps (if sources allows)
+3. Cross-validate claims across internal and external
+
+## Stop Conditions
+
+- Iteration count >= {config['max_iterations']}
+- Novelty < 0.15 for 2 consecutive iterations
+- Coverage >= 0.80
+- Average confidence >= 0.70
+"""
+    scope_file = task_dir / "scope.md"
+    scope_file.write_text(content)
+    return scope_file
+
+
+def write_iteration(task_dir: Path, iteration: int, findings: dict):
+    """Write an iteration checkpoint."""
+    now = datetime.now().astimezone().isoformat()
+
+    content = f"""---
+task_id: {task_dir.name}
+iteration: {iteration}
+timestamp: {now}
+questions_targeted: {json.dumps(findings.get('questions', []))}
+novelty_score: {findings.get('novelty', 0.0):.2f}
+coverage_delta: {findings.get('coverage_delta', 0.0):+.2f}
+cumulative_coverage: {findings.get('cumulative_coverage', 0.0):.2f}
+sources_count: {findings.get('sources_count', 0)}
+---
+
+# Iteration {iteration} Findings
+
+{findings.get('content', 'No findings.')}
+
+## Gaps Remaining
+
+{findings.get('gaps', 'None identified.')}
+"""
+    iteration_file = task_dir / f"iteration-{iteration:02d}.md"
+    iteration_file.write_text(content)
+    return iteration_file
+
+
+def write_sources(task_dir: Path, sources: list):
+    """Write the source registry."""
+    content = f"""---
+task_id: {task_dir.name}
+total_sources: {len(sources)}
+---
+
+# Source Registry
+
+"""
+    for i, src in enumerate(sources, 1):
+        content += f"""## src-{i:03d}
+- Type: {src.get('type', 'unknown')}
+- URL/Path: {src.get('url', src.get('path', 'unknown'))}
+- Title: {src.get('title', 'Untitled')}
+- Retrieved: {src.get('retrieved', 'unknown')}
+- Relevance: {src.get('relevance', 'N/A')}
+- Authority: {src.get('authority', 'N/A')}
+
+"""
+    sources_file = task_dir / "sources.md"
+    sources_file.write_text(content)
+    return sources_file
+
+
+def write_report(task_dir: Path, query: str, content: str, metadata: dict):
+    """Write the final research report."""
+    now = datetime.now().astimezone().isoformat()
+
+    report = f"""---
+task_id: {task_dir.name}
+query: "{query}"
+completed: {now}
+iterations: {metadata.get('iterations', 0)}
+coverage: {metadata.get('coverage', 0.0):.2f}
+sources_internal: {metadata.get('sources_internal', 0)}
+sources_web: {metadata.get('sources_web', 0)}
+cost_estimate: ${metadata.get('cost_estimate', 0.0):.2f}
+---
+
+# Research Report: {query}
+
+{content}
+"""
+    report_file = task_dir / "report.md"
+    report_file.write_text(report)
+    return report_file
+
+
+def check_stop_conditions(task_dir: Path, config: dict) -> tuple:
+    """Check if research should stop. Returns (should_stop, reason)."""
+    iterations = sorted(task_dir.glob("iteration-*.md"))
+
+    # 1. Budget ceiling
+    if len(iterations) >= config["max_iterations"]:
+        return True, f"Reached max iterations ({config['max_iterations']})"
+
+    if len(iterations) < 2:
+        return False, ""
+
+    # Parse last two iterations
+    novelty_scores = []
+    coverage = 0.0
+    for it_file in iterations[-2:]:
+        for line in it_file.read_text().splitlines():
+            if line.startswith("novelty_score:"):
+                try:
+                    novelty_scores.append(float(line.split(":")[1].strip()))
+                except ValueError:
+                    pass
+            if line.startswith("cumulative_coverage:"):
+                try:
+                    coverage = float(line.split(":")[1].strip())
+                except ValueError:
+                    pass
+
+    # 2. Diminishing returns
+    if len(novelty_scores) >= 2 and all(n < 0.15 for n in novelty_scores[-2:]):
+        return True, f"Diminishing returns (novelty {novelty_scores[-2:]:.2f})"
+
+    # 3. Coverage threshold
+    if coverage >= 0.80:
+        return True, f"Coverage threshold met ({coverage:.2f})"
+
+    return False, ""
+
+
+def init_task(query: str, depth: str, sources: str) -> Path:
+    """Initialize a new research task."""
+    task_id = generate_task_id()
+    task_dir = get_task_dir(task_id)
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    scope_file = write_scope(task_dir, query, depth, sources)
+    print(f"Research task initialized: {task_id}")
+    print(f"Directory: {task_dir}")
+    print(f"Scope: {scope_file}")
+    print(f"Depth: {depth} (max {DEPTH_CONFIG[depth]['max_iterations']} iterations)")
+    print(f"Sources: {sources}")
+    print(f"Budget: ${DEPTH_CONFIG[depth]['max_cost']:.2f}")
+    print()
+    print("Task is ready for execution by a Claude subagent.")
+    print(f"Spawn command: deep-research --resume {task_id}")
+    return task_dir
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Edwin Deep Research Agent",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    deep-research "What stop conditions do deep research agents use?"
+    deep-research "Competitive landscape for patient safety BLE tech" --depth deep --sources both
+    deep-research --resume research-a1b2c3d4
+    deep-research --list
+    deep-research --status research-a1b2c3d4
+        """
+    )
+    parser.add_argument("query", nargs="?", help="Research query")
+    parser.add_argument("--depth", choices=["shallow", "medium", "deep"], default="medium")
+    parser.add_argument("--sources", choices=["internal", "web", "both"], default="both")
+    parser.add_argument("--resume", metavar="TASK_ID", help="Resume an existing task")
+    parser.add_argument("--list", action="store_true", help="List all research tasks")
+    parser.add_argument("--status", metavar="TASK_ID", help="Get task status")
+    parser.add_argument("--json", action="store_true", help="Output in JSON format")
+
+    args = parser.parse_args()
+
+    if args.list:
+        list_tasks()
+        return
+
+    if args.status:
+        get_status(args.status)
+        return
+
+    if args.resume:
+        task_dir = get_task_dir(args.resume)
+        if not task_dir.exists():
+            print(f"Error: Task {args.resume} not found at {task_dir}")
+            sys.exit(1)
+        print(f"Resuming task: {args.resume}")
+        get_status(args.resume)
+        return
+
+    if not args.query:
+        parser.print_help()
+        sys.exit(1)
+
+    init_task(args.query, args.depth, args.sources)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,22 @@
+[
+  {
+    "query": "Edwin memory indexer architecture",
+    "expected_sources": ["sessions"],
+    "expected_keywords": ["indexer", "qdrant"]
+  },
+  {
+    "query": "weekly schedule meetings",
+    "expected_sources": ["o365"],
+    "expected_keywords": []
+  },
+  {
+    "query": "Linear migration from Jira",
+    "expected_sources": [],
+    "expected_keywords": ["linear", "jira"]
+  },
+  {
+    "query": "meeting transcript discussion",
+    "expected_sources": [],
+    "expected_keywords": ["meeting"]
+  }
+]

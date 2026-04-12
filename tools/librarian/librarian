@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+"""Edwin Librarian -- health monitoring + quality assurance.
+
+NOT an indexer. The indexer lives at tools/indexer/indexer.
+The Librarian monitors system health, connector freshness,
+search quality, and proposes curation of important decisions.
+
+Usage:
+    librarian health           # Check Qdrant, Neo4j, Ollama, Docker
+    librarian freshness        # Check connector sync freshness
+    librarian quality          # Run spot-check queries against Qdrant
+    librarian curate           # Scan recent session summaries for decisions
+    librarian full             # Run all of the above
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.request
+from datetime import datetime, timedelta
+from pathlib import Path
+
+EDWIN_HOME = Path(os.environ.get("EDWIN_HOME", Path.home() / "Edwin"))
+DATA_DIR = EDWIN_HOME / "data"
+LOG_DIR = EDWIN_HOME / "logs" / "librarian"
+MEMORY_DIR = EDWIN_HOME / "memory" / "librarian"
+SPOT_CHECKS_FILE = Path(__file__).parent / "spot-checks.json"
+
+QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
+NEO4J_URL = os.environ.get("NEO4J_URL", "http://localhost:7474")
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+
+COLLECTION_NAME = os.environ.get("QDRANT_COLLECTION", "edwin-memory")
+
+# Expected sync cadences per connector (in hours)
+# Adjust these to match your scheduler configuration
+EXPECTED_CADENCE = {
+    "o365": 1,
+    "google": 2,
+    "limitless": 1,
+    "fireflies": 24,
+    "imessage": 2,
+    "screentime": 24,
+    "calls": 24,
+    "browser": 2,
+    "atlassian": 8,
+    "notes": 2,
+    "photos": 24,
+    "documents": 24,
+    "sessions": 2,
+}
+
+
+def log(msg, level="INFO"):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] [{level}] {msg}")
+
+
+def check_http(name, url, timeout=5):
+    """Check if an HTTP service is responding."""
+    try:
+        req = urllib.request.Request(url, method="GET")
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        return {"service": name, "status": "ok", "code": resp.status}
+    except Exception as e:
+        return {"service": name, "status": "down", "error": str(e)}
+
+
+def check_docker():
+    """Check if expected Docker containers are running."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        running = set(result.stdout.strip().split("\n")) if result.stdout.strip() else set()
+        expected = {"qdrant", "neo4j-graphiti"}
+        missing = expected - running
+        return {
+            "running": sorted(running & expected),
+            "missing": sorted(missing),
+            "status": "ok" if not missing else "degraded",
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def cmd_health(args):
+    """Check health of all shared services."""
+    results = []
+
+    # HTTP health checks
+    results.append(check_http("qdrant", f"{QDRANT_URL}/collections"))
+    results.append(check_http("neo4j", NEO4J_URL))
+    results.append(check_http("ollama", f"{OLLAMA_URL}/api/tags"))
+
+    # Docker containers
+    docker = check_docker()
+    results.append({"service": "docker", **docker})
+
+    # Qdrant collection stats
+    try:
+        req = urllib.request.Request(
+            f"{QDRANT_URL}/collections/{COLLECTION_NAME}", method="GET"
+        )
+        resp = urllib.request.urlopen(req, timeout=5)
+        data = json.loads(resp.read())
+        vectors = data.get("result", {}).get("points_count", "unknown")
+        results.append({"service": COLLECTION_NAME, "status": "ok", "vectors": vectors})
+    except Exception as e:
+        results.append({"service": COLLECTION_NAME, "status": "error", "error": str(e)})
+
+    # Report
+    all_ok = all(r.get("status") == "ok" for r in results)
+    for r in results:
+        icon = "OK" if r.get("status") == "ok" else "FAIL"
+        extra = ""
+        if "vectors" in r:
+            extra = f" ({r['vectors']} vectors)"
+        if "error" in r:
+            extra = f" ({r['error']})"
+        if "missing" in r and r["missing"]:
+            extra = f" (missing: {', '.join(r['missing'])})"
+        log(f"[{icon}] {r['service']}{extra}")
+
+    return 0 if all_ok else 1
+
+
+def cmd_freshness(args):
+    """Check connector sync freshness."""
+    issues = []
+
+    for connector, max_hours in EXPECTED_CADENCE.items():
+        connector_dir = DATA_DIR / connector
+        if not connector_dir.exists():
+            log(f"[SKIP] {connector} -- no data directory", "WARN")
+            continue
+
+        # Find most recent file by modification time
+        latest_mtime = 0
+        for f in connector_dir.rglob("*.md"):
+            mtime = f.stat().st_mtime
+            if mtime > latest_mtime:
+                latest_mtime = mtime
+
+        if latest_mtime == 0:
+            log(f"[WARN] {connector} -- no markdown files found", "WARN")
+            issues.append(connector)
+            continue
+
+        last_sync = datetime.fromtimestamp(latest_mtime)
+        age_hours = (datetime.now() - last_sync).total_seconds() / 3600
+        threshold = max_hours * 2  # Flag at 2x expected cadence
+
+        if age_hours > threshold:
+            log(
+                f"[STALE] {connector} -- last data {age_hours:.1f}h ago (expected every {max_hours}h)",
+                "WARN",
+            )
+            issues.append(connector)
+        else:
+            log(f"[OK] {connector} -- last data {age_hours:.1f}h ago")
+
+    if issues:
+        log(f"\n{len(issues)} stale connector(s): {', '.join(issues)}", "WARN")
+        return 1
+    else:
+        log("\nAll connectors fresh.")
+        return 0
+
+
+def cmd_quality(args):
+    """Run spot-check queries against Qdrant."""
+    if not SPOT_CHECKS_FILE.exists():
+        log(
+            "No spot-checks.json found. Create it after the initial index completes.",
+            "WARN",
+        )
+        log(f"Expected at: {SPOT_CHECKS_FILE}")
+        return 0
+
+    with open(SPOT_CHECKS_FILE) as f:
+        checks = json.load(f)
+
+    passed = 0
+    failed = 0
+
+    for check in checks:
+        query = check["query"]
+        expected_sources = check.get("expected_sources", [])
+        expected_keywords = check.get("expected_keywords", [])
+
+        # Generate embedding via Ollama (with retry for 500 errors)
+        embedding = None
+        for attempt in range(3):
+            try:
+                embed_data = json.dumps(
+                    {"model": "qwen3-embedding:8b", "input": query}
+                ).encode()
+                req = urllib.request.Request(
+                    f"{OLLAMA_URL}/api/embed",
+                    data=embed_data,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                resp = urllib.request.urlopen(req, timeout=30)
+                raw = resp.read().decode()
+                raw = raw.replace("NaN", "0.0").replace("Infinity", "0.0")
+                embedding = json.loads(raw)["embeddings"][0]
+                # Truncate to 2048 dims (match indexer)
+                embedding = embedding[:2048]
+                break
+            except Exception as e:
+                if attempt < 2:
+                    time.sleep(2 ** (attempt + 1))
+                else:
+                    log(f"[FAIL] {query} -- embedding failed: {e}", "ERROR")
+                    failed += 1
+        if embedding is None:
+            continue
+
+        # Search Qdrant
+        try:
+            search_data = json.dumps(
+                {
+                    "vector": {"name": "text-dense", "vector": embedding},
+                    "limit": 5,
+                    "with_payload": True,
+                }
+            ).encode()
+            req = urllib.request.Request(
+                f"{QDRANT_URL}/collections/{COLLECTION_NAME}/points/search",
+                data=search_data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            resp = urllib.request.urlopen(req, timeout=10)
+            results = json.loads(resp.read()).get("result", [])
+        except Exception as e:
+            log(f"[FAIL] {query} -- search failed: {e}", "ERROR")
+            failed += 1
+            continue
+
+        # Check expectations
+        ok = True
+        result_sources = [
+            r.get("payload", {}).get("source", "") for r in results
+        ]
+        result_text = " ".join(
+            r.get("payload", {}).get("text", "") for r in results
+        ).lower()
+
+        for src in expected_sources:
+            if not any(src in s for s in result_sources):
+                log(f"  Missing expected source: {src}", "WARN")
+                ok = False
+
+        for kw in expected_keywords:
+            if kw.lower() not in result_text:
+                log(f"  Missing expected keyword: {kw}", "WARN")
+                ok = False
+
+        if ok:
+            log(f"[PASS] {query}")
+            passed += 1
+        else:
+            log(f"[FAIL] {query}", "WARN")
+            failed += 1
+
+    log(f"\nSpot checks: {passed} passed, {failed} failed")
+    return 0 if failed == 0 else 1
+
+
+def cmd_curate(args):
+    """Scan recent session summaries for significant decisions."""
+    sessions_dir = EDWIN_HOME / "memory" / "sessions"
+    if not sessions_dir.exists():
+        log("No session summaries directory found.", "WARN")
+        return 0
+
+    # Find summaries from the last 7 days
+    cutoff = datetime.now() - timedelta(days=7)
+    recent = []
+    for f in sorted(sessions_dir.glob("*-summary.md"), reverse=True):
+        if f.stat().st_mtime >= cutoff.timestamp():
+            recent.append(f)
+
+    if not recent:
+        log("No session summaries in the last 7 days.")
+        return 0
+
+    log(f"Found {len(recent)} session summaries from the last 7 days.")
+
+    # Extract decisions and tension map items
+    decisions = []
+    tensions = []
+
+    for f in recent:
+        content = f.read_text()
+        in_decisions = False
+        in_tensions = False
+
+        for line in content.split("\n"):
+            stripped = line.strip()
+
+            if stripped.startswith("## Decisions"):
+                in_decisions = True
+                in_tensions = False
+                continue
+            elif stripped.startswith("## Tension Map"):
+                in_tensions = True
+                in_decisions = False
+                continue
+            elif stripped.startswith("## "):
+                in_decisions = False
+                in_tensions = False
+                continue
+
+            if in_decisions and stripped.startswith("- Decision:"):
+                decisions.append({"file": f.name, "text": stripped})
+            if in_tensions and stripped.startswith("- "):
+                tensions.append({"file": f.name, "text": stripped})
+
+    # Write curation proposal
+    today = datetime.now().strftime("%Y-%m-%d")
+    MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    output = MEMORY_DIR / f"curation-{today}.md"
+
+    lines = [f"# Curation Proposal -- {today}\n"]
+    lines.append(f"Scanned {len(recent)} session summaries from the last 7 days.\n")
+
+    if decisions:
+        lines.append("## Decisions to Consider Promoting\n")
+        for d in decisions:
+            lines.append(f"- [{d['file']}] {d['text']}")
+        lines.append("")
+
+    if tensions:
+        lines.append("## Open Tensions\n")
+        for t in tensions:
+            lines.append(f"- [{t['file']}] {t['text']}")
+        lines.append("")
+
+    if not decisions and not tensions:
+        lines.append("No decisions or tensions found in recent summaries.\n")
+
+    output.write_text("\n".join(lines))
+    log(f"Curation proposal written to {output}")
+    log(f"  {len(decisions)} decisions, {len(tensions)} open tensions")
+
+    return 0
+
+
+def cmd_full(args):
+    """Run all checks."""
+    log("=" * 60)
+    log("LIBRARIAN FULL RUN")
+    log("=" * 60)
+
+    exit_code = 0
+
+    log("\n--- HEALTH ---")
+    if cmd_health(args):
+        exit_code = 1
+
+    log("\n--- FRESHNESS ---")
+    if cmd_freshness(args):
+        exit_code = 1
+
+    log("\n--- QUALITY ---")
+    if cmd_quality(args):
+        exit_code = 1
+
+    log("\n--- CURATION ---")
+    cmd_curate(args)
+
+    log("\n" + "=" * 60)
+    if exit_code == 0:
+        log("ALL CHECKS PASSED")
+    else:
+        log("SOME CHECKS FAILED -- review above", "WARN")
+    log("=" * 60)
+
+    # Write log file
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    # Log is already written to stdout -- scheduler captures it
+
+    return exit_code
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Edwin Librarian -- health monitoring + quality assurance"
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("health", help="Check service health")
+    sub.add_parser("freshness", help="Check connector freshness")
+    sub.add_parser("quality", help="Run spot-check queries")
+    sub.add_parser("curate", help="Scan session summaries for decisions")
+    sub.add_parser("full", help="Run all checks")
+
+    args = parser.parse_args()
+
+    handlers = {
+        "health": cmd_health,
+        "freshness": cmd_freshness,
+        "quality": cmd_quality,
+        "curate": cmd_curate,
+        "full": cmd_full,
+    }
+
+    sys.exit(handlers[args.command](args))
+
+
+if __name__ == "__main__":
+    main()
