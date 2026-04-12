@@ -29,7 +29,12 @@ cd Edwin
 claude
 ```
 
-That's it. `setup.sh` installs the infrastructure (Qdrant, Neo4j, Ollama). `claude` starts the onboarding wizard -- a guided conversation where Edwin learns who you are and configures itself for your life. Takes about 15 minutes.
+That's it. `setup.sh` installs the infrastructure (Qdrant, Neo4j, Ollama) and optionally configures Telegram for mobile access. `claude` starts the onboarding wizard -- a guided conversation where Edwin learns who you are and configures itself for your life. Takes about 15 minutes.
+
+If you set up Telegram during setup, launch with the channel flag instead:
+```bash
+claude --channels plugin:telegram@claude-plugins-official
+```
 
 ### Requirements
 
@@ -97,10 +102,29 @@ Channels serve two purposes:
 
 Edwin ships with Telegram as the default communication channel. Telegram's BotFather makes it simple: create a bot, get a token, give it to Edwin during setup. You get a private 1:1 chat with your AI chief of staff on your phone, your tablet, your desktop -- wherever Telegram runs.
 
-The setup wizard handles configuration. You'll need:
-- A Telegram account
-- 2 minutes with BotFather to create your bot
-- The bot token (the wizard will ask for it)
+**Steps:**
+
+1. **Create your bot.** Open Telegram, search `@BotFather`, send `/newbot`, follow the prompts. Copy the bot token.
+2. **Run `./setup.sh`.** The Telegram section (step 6) will prompt for your token, validate it, and create the channel config at `~/.claude/channels/telegram/`.
+3. **Install the plugin** (first time only). In Claude Code, run:
+   ```
+   /install-plugin telegram@claude-plugins-official
+   ```
+   The repo includes `.claude/settings.json` which enables the plugin automatically, but the plugin binary must be installed once per machine.
+4. **Launch Edwin with the channel:**
+   ```bash
+   claude --channels plugin:telegram@claude-plugins-official
+   ```
+5. **Pair your phone.** Open Telegram and DM your bot. It will reply with a pairing code.
+6. **Approve the pairing.** In the Claude Code terminal:
+   ```
+   /telegram:access pair <CODE>
+   ```
+7. **Lock down access** (recommended). Once paired:
+   ```
+   /telegram:access policy allowlist
+   ```
+   This restricts the bot to only your approved Telegram account.
 
 ### Advanced: iMessage
 

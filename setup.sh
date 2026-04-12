@@ -48,7 +48,7 @@ find_free_port() {
 
 # ── 1. Check Docker ──────────────────────────────────────────────────────────
 
-echo -e "${YELLOW}[1/5]${NC} Checking Docker..."
+echo -e "${YELLOW}[1/6]${NC} Checking Docker..."
 
 if ! command -v docker &> /dev/null; then
     echo -e "${RED}Docker not found.${NC}"
@@ -67,7 +67,7 @@ echo -e "${GREEN}  Docker is running.${NC}"
 
 # ── 2. Start Qdrant + Neo4j ──────────────────────────────────────────────────
 
-echo -e "${YELLOW}[2/5]${NC} Starting Qdrant + Neo4j..."
+echo -e "${YELLOW}[2/6]${NC} Starting Qdrant + Neo4j..."
 
 cd "$EDWIN_HOME"
 
@@ -96,7 +96,7 @@ fi
 
 # ── 3. Check Ollama + pull embedding model ───────────────────────────────────
 
-echo -e "${YELLOW}[3/5]${NC} Checking Ollama..."
+echo -e "${YELLOW}[3/6]${NC} Checking Ollama..."
 
 if ! command -v ollama &> /dev/null; then
     echo -e "${RED}Ollama not found.${NC}"
@@ -146,20 +146,36 @@ echo -e "${GREEN}  Embedding model ready: ${EMBED_MODEL}${NC}"
 
 # ── 4. Python dependencies ───────────────────────────────────────────────────
 
-echo -e "${YELLOW}[4/5]${NC} Installing Python dependencies..."
+echo -e "${YELLOW}[4/6]${NC} Installing Python dependencies..."
+
+# Create a venv for Edwin's Python dependencies
+VENV_DIR="$EDWIN_HOME/.venv"
+if [ ! -d "$VENV_DIR" ]; then
+    echo "  Creating Python virtual environment..."
+    python3 -m venv "$VENV_DIR"
+fi
+VENV_PIP="$VENV_DIR/bin/pip"
 
 if [ -f "$EDWIN_HOME/requirements.txt" ]; then
-    pip3 install -q -r "$EDWIN_HOME/requirements.txt" 2>/dev/null || \
-    pip install -q -r "$EDWIN_HOME/requirements.txt" 2>/dev/null || \
+    "$VENV_PIP" install -q -r "$EDWIN_HOME/requirements.txt" 2>/dev/null || \
     echo -e "${YELLOW}  Warning: pip install failed. You may need to install dependencies manually.${NC}"
     echo -e "${GREEN}  Python dependencies installed.${NC}"
 else
     echo -e "${YELLOW}  No requirements.txt found -- skipping.${NC}"
 fi
 
+# MCP server dependencies (neo4j, pm both need the mcp package)
+for req_file in "$EDWIN_HOME"/mcp-servers/*/requirements.txt; do
+    [ -f "$req_file" ] || continue
+    echo "  Installing deps from ${req_file#$EDWIN_HOME/}..."
+    "$VENV_PIP" install -q -r "$req_file" 2>/dev/null || \
+    echo -e "${YELLOW}  Warning: pip install failed for $req_file${NC}"
+done
+echo -e "${GREEN}  MCP server dependencies installed.${NC}"
+
 # ── 5. Write .env defaults ───────────────────────────────────────────────────
 
-echo -e "${YELLOW}[5/5]${NC} Configuring environment..."
+echo -e "${YELLOW}[5/6]${NC} Configuring environment..."
 
 if [ ! -f "$EDWIN_HOME/.env" ]; then
     cat > "$EDWIN_HOME/.env" << ENVEOF
@@ -194,6 +210,149 @@ else
     echo -e "${GREEN}  .env already exists -- not overwriting.${NC}"
 fi
 
+# Ensure PM data directory exists
+mkdir -p "${EDWIN_HOME}/data/pm"
+
+# Use venv python for MCP servers
+PYTHON3_PATH="$VENV_DIR/bin/python3"
+
+# Generate .mcp.json for Claude Code MCP server discovery
+if [ ! -f "$EDWIN_HOME/.mcp.json" ]; then
+    cat > "$EDWIN_HOME/.mcp.json" << MCPEOF
+{
+  "mcpServers": {
+    "edwin-qdrant": {
+      "command": "node",
+      "args": ["${EDWIN_HOME}/mcp-servers/qdrant/index.js"],
+      "env": {
+        "QDRANT_URL": "http://localhost:${QDRANT_PORT}",
+        "OLLAMA_URL": "http://localhost:11434",
+        "EMBEDDING_MODEL": "${EMBED_MODEL}",
+        "COLLECTION": "edwin-memory",
+        "WORKSPACE_PATH": "${EDWIN_HOME}"
+      }
+    },
+    "edwin-neo4j": {
+      "command": "${PYTHON3_PATH}",
+      "args": ["${EDWIN_HOME}/mcp-servers/neo4j/server.py"],
+      "env": {
+        "NEO4J_URI": "bolt://localhost:${NEO4J_BOLT}",
+        "NEO4J_USER": "neo4j",
+        "NEO4J_PASSWORD": "changeme"
+      }
+    },
+    "edwin-pm": {
+      "command": "${PYTHON3_PATH}",
+      "args": ["${EDWIN_HOME}/mcp-servers/pm/server.py"],
+      "env": {
+        "PM_DB_PATH": "${EDWIN_HOME}/data/pm/prospective.db"
+      }
+    },
+    "events": {
+      "command": "bun",
+      "args": ["${EDWIN_HOME}/mcp-servers/events-channel/index.ts"],
+      "env": {
+        "EVENTS_PORT": "8790"
+      }
+    }
+  }
+}
+MCPEOF
+    echo -e "${GREEN}  .mcp.json created with MCP server config.${NC}"
+else
+    echo -e "${GREEN}  .mcp.json already exists -- not overwriting.${NC}"
+fi
+
+# ── 6. Telegram channel (optional) ──────────────────────────────────────────
+
+echo -e "${YELLOW}[6/6]${NC} Telegram mobile access..."
+
+TELEGRAM_BOT_USERNAME=""
+
+read -p "  Want to connect Telegram for mobile access? [Y/n]: " tg_choice
+tg_choice="${tg_choice:-Y}"
+
+if [[ "$tg_choice" =~ ^[Yy]$ ]]; then
+
+    CHANNEL_DIR="$HOME/.claude/channels/telegram"
+    ENV_FILE="$CHANNEL_DIR/.env"
+    ACCESS_FILE="$CHANNEL_DIR/access.json"
+    APPROVED_DIR="$CHANNEL_DIR/approved"
+
+    # JSON helper -- use jq if available, fall back to grep/sed
+    has_jq=false
+    command -v jq &>/dev/null && has_jq=true
+
+    echo ""
+    echo "  Open Telegram, search @BotFather, send /newbot, follow the prompts, copy the token."
+    echo ""
+
+    while true; do
+        read -p "  Paste your bot token: " tg_token
+        tg_token=$(echo "$tg_token" | xargs)  # trim whitespace
+
+        if [[ -z "$tg_token" ]]; then
+            echo -e "  ${RED}No token entered.${NC}"
+            continue
+        fi
+
+        # Validate via getMe
+        printf "  Validating..."
+        tg_response=$(curl -s "https://api.telegram.org/bot${tg_token}/getMe" 2>/dev/null || true)
+
+        if $has_jq; then
+            tg_ok=$(echo "$tg_response" | jq -r '.ok // empty')
+        else
+            tg_ok=$(echo "$tg_response" | grep -o '"ok"[[:space:]]*:[[:space:]]*true' | head -1)
+        fi
+
+        if [[ "$tg_ok" != "true" ]] && [[ -z "$tg_ok" || "$tg_ok" == "false" ]]; then
+            echo -e " ${RED}Invalid token. Try again.${NC}"
+            continue
+        fi
+
+        # Extract bot username
+        if $has_jq; then
+            TELEGRAM_BOT_USERNAME=$(echo "$tg_response" | jq -r '.result.username // empty')
+        else
+            TELEGRAM_BOT_USERNAME=$(echo "$tg_response" | grep -o '"username":"[^"]*"' | head -1 | sed 's/"username":"//;s/"$//')
+        fi
+
+        echo -e " ${GREEN}Valid!${NC} Bot: @${TELEGRAM_BOT_USERNAME}"
+        break
+    done
+
+    # Save config
+    mkdir -p "$CHANNEL_DIR" "$APPROVED_DIR"
+
+    printf "TELEGRAM_BOT_TOKEN=%s\n" "$tg_token" > "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+
+    cat > "$ACCESS_FILE" <<'ACCESSEOF'
+{
+  "dmPolicy": "pairing",
+  "allowFrom": [],
+  "groups": {},
+  "pending": {}
+}
+ACCESSEOF
+    chmod 600 "$ACCESS_FILE"
+
+    echo -e "  ${GREEN}Token saved.${NC}"
+    echo ""
+    echo "  To connect your phone:"
+    echo "    1. Install the plugin (first time only):"
+    echo "         claude /install-plugin telegram@claude-plugins-official"
+    echo "    2. Launch Edwin:  claude --channels plugin:telegram@claude-plugins-official"
+    echo "    3. Open Telegram and message @${TELEGRAM_BOT_USERNAME}"
+    echo "    4. You'll get a pairing code -- enter it in the terminal:"
+    echo "         /telegram:access pair <CODE>"
+    echo "    5. Lock down access:  /telegram:access policy allowlist"
+
+else
+    echo -e "${GREEN}  Skipped.${NC}"
+fi
+
 # ── Done ─────────────────────────────────────────────────────────────────────
 
 echo ""
@@ -203,10 +362,18 @@ echo "  Infrastructure:"
 echo "    Qdrant:  http://localhost:${QDRANT_PORT}"
 echo "    Neo4j:   http://localhost:${NEO4J_WEB} (bolt: ${NEO4J_BOLT})"
 echo "    Ollama:  http://localhost:11434 (model: ${EMBED_MODEL})"
+if [[ -n "$TELEGRAM_BOT_USERNAME" ]]; then
+echo "    Telegram: @${TELEGRAM_BOT_USERNAME}"
+fi
 echo ""
 echo "  Next step:"
 echo "    cd $EDWIN_HOME"
+if [[ -n "$TELEGRAM_BOT_USERNAME" ]]; then
+echo "    claude /install-plugin telegram@claude-plugins-official   # first time only"
+echo "    claude --channels plugin:telegram@claude-plugins-official"
+else
 echo "    claude"
+fi
 echo ""
 echo "  Edwin will guide you through the rest."
 echo ""

@@ -25,17 +25,28 @@ else
 fi
 echo ""
 
-# 2. .env
-read -p "Delete .env file? [y/N]: " choice
+# 2. Telegram config
+read -p "Wipe Telegram bot config? (token + pairing -- does NOT touch API keys) [y/N]: " choice
 if [[ "$choice" =~ ^[Yy]$ ]]; then
-    rm -f "$EDWIN_HOME/.env"
-    echo -e "${GREEN}  ✓ .env deleted.${NC}"
+    rm -rf "$HOME/.claude/channels/telegram"
+    echo -e "${GREEN}  ✓ Telegram config wiped. Re-run ./setup.sh to reconfigure.${NC}"
 else
-    echo "  .env preserved."
+    echo "  Telegram config preserved."
 fi
 echo ""
 
-# 3. Data
+# 3. .env + credentials
+read -p "Wipe .env, .mcp.json, and Python venv? (ALL API keys, OAuth tokens, port config) [y/N]: " choice
+if [[ "$choice" =~ ^[Yy]$ ]]; then
+    rm -f "$EDWIN_HOME/.env" "$EDWIN_HOME/.mcp.json"
+    rm -rf "$EDWIN_HOME/.venv"
+    echo -e "${GREEN}  ✓ .env, .mcp.json, and .venv deleted.${NC}"
+else
+    echo "  .env, .mcp.json, and .venv preserved."
+fi
+echo ""
+
+# 4. Data
 read -p "Wipe data/ directory? (ALL synced data -- emails, notes, calendar, etc.) [y/N]: " choice
 if [[ "$choice" =~ ^[Yy]$ ]]; then
     rm -rf "$EDWIN_HOME/data/"
@@ -46,7 +57,7 @@ else
 fi
 echo ""
 
-# 4. Memory
+# 5. Memory
 read -p "Wipe memory/ directory? (session summaries, conversation state, memory index) [y/N]: " choice
 if [[ "$choice" =~ ^[Yy]$ ]]; then
     rm -rf "$EDWIN_HOME/memory/"
@@ -57,7 +68,7 @@ else
 fi
 echo ""
 
-# 5. Briefing book content
+# 6. Briefing book content
 read -p "Wipe briefing book content? (keeps folder structure, removes files) [y/N]: " choice
 if [[ "$choice" =~ ^[Yy]$ ]]; then
     find "$EDWIN_HOME/briefing-book/docs" -type f -name "*.md" -delete 2>/dev/null
@@ -67,7 +78,7 @@ else
 fi
 echo ""
 
-# 6. CLAUDE.md
+# 7. CLAUDE.md
 read -p "Reset CLAUDE.md to setup wizard? (removes personalization -- wizard runs on next 'claude') [y/N]: " choice
 if [[ "$choice" =~ ^[Yy]$ ]]; then
     cd "$EDWIN_HOME" && git checkout CLAUDE.md 2>/dev/null
