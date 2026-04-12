@@ -8,67 +8,64 @@ edition: weekday
 
 # Morning Brief -- Sunday, March 15, 2026
 
-The most important thing on your plate today: the Northwell Health pilot review at 2 PM. Their VP of Clinical Operations is joining, and your team's usage numbers from the first 30 days are strong but not spectacular. Sarah's putting together the deck -- make sure she leads with outcomes, not features. Northwell cares about nurse time saved, not dashboard screenshots.
+The most important thing on your plate today: the Pinecrest National Bank final presentation at 2 PM. Their SVP of Risk & Compliance is the decision-maker, and you're competing against Fortify GRC for a $420K ARR deal. Raj has the demo environment polished -- make sure he leads with the automated exam-prep workflow, not the dashboard tour. Pinecrest cares about audit hours saved, not feature counts.
 
 ## YESTERDAY
 
-Saturday was supposed to be light, but it wasn't. You spent 90 minutes on a call with Marcus Cole about the Series C timeline after he pinged you about Sequoia's interest cooling. His read: they want to see Q1 numbers before committing to a term sheet, which pushes the raise to late April at earliest. That's not fatal but it tightens the runway conversation. You've got 14 months of cash at current burn -- comfortable, but Marcus wants to model what happens if you accelerate hiring for the enterprise push.
+Saturday was supposed to be off, but it wasn't. You spent an hour on the phone with Dana Kowalski after she forwarded the board deck comments from Neil Frazier. His feedback: pipeline coverage ratio is soft at 2.8x and he wants to see 3.5x before the next board meeting. That's a $2.4M gap in qualified pipeline. Not fatal -- you've got three enterprise deals in discovery that could fill it -- but it means the SDR team needs to accelerate prospecting this week.
 
-Priya messaged around 4 PM about the FHIR integration blocker. The HL7 team at Northwell is dragging on credential provisioning. She's been patient, but this is now 11 days past their promised date. You told her to escalate through their project manager, Dr. Kenji Yamamoto, rather than going around him.
-
-Family-wise, you and Dana took the kids to the farmers market in the morning. Lily has a science fair project due Thursday that she hasn't started -- Dana flagged it at dinner.
+Lena Park messaged around 3 PM about the Silverstone Credit Union renewal. Their VP of Compliance, Greg Tanaka, is pushing back on the 12% price increase. Lena's read: he's posturing, but he does have budget pressure from their board. She wants to offer a two-year lock at 8% instead. You told her to hold until you can review the account health data Monday.
 
 ## COMPLETED
 
-- Reviewed and approved the Q1 pipeline report Marcus sent over
-- Responded to Dr. Yamamoto's email re: Northwell credential timeline
-- Closed out the SOC 2 evidence request from the auditors (finally)
-- Pushed back on Jake's request to add two more engineers to the data team -- told him to show utilization numbers first
+- Reviewed and marked up Raj's Pinecrest demo script -- sent comments back Friday night
+- Responded to Greg Tanaka's email re: Silverstone renewal timeline
+- Closed out the Q4 commission dispute with finance (finally -- Jess Moran's check goes out Monday)
+- Pushed back on Dana's suggestion to hire a third SDR before Q2 pipeline numbers are in
 
 ## TODAY
 
-**9:00 AM -- Engineering Standup (15 min)**
-Weekly sync with the leads. Priya, Jake, and Tom. The FHIR blocker will come up. Let Priya own the update -- she's handling it. Main thing to listen for: Jake's team velocity has dropped two weeks running. Worth a quiet check-in after.
+**9:00 AM -- Sales Team Standup (15 min)**
+Weekly pipeline sync with the full team. Aisha, Devon, Tyler, Jess on AE side, plus Maya and Carlos from SDR. The Pinecrest prep will come up -- let Raj own the technical walkthrough status. Main thing to listen for: Devon's Harborview Savings deal has gone quiet for two weeks. Worth a direct ask.
 
-**10:30 AM -- 1:1 with Sarah Chen, Head of Customer Success (30 min)**
-She wants to discuss the Northwell QBR format. She's also been hinting about needing a second CSM hire. The data supports it -- her team's handling 34 accounts with two people. But timing is bad with the Series C uncertainty. Hear her out, don't commit yet.
+**10:30 AM -- 1:1 with Lena Park, VP Customer Success (30 min)**
+She wants to discuss the Silverstone renewal strategy and the Bramblewood onboarding timeline. She's also been hinting about needing a Customer Success Manager hire. Her team's carrying 28 accounts with two people. The data supports it, but timing is tricky with the ARR target pressure. Hear her out, don't commit yet.
 
-**2:00 PM -- Northwell Health Pilot Review (60 min)**
-The big one. Attendees: Dr. Kenji Yamamoto (VP Clinical Ops), Rachel Torres (their PM), Sarah Chen, you. First 30-day review of the clinical analytics pilot. Usage is at 67% of target (they wanted 80% nurse adoption by day 30). The qualitative feedback is strong though -- the nurses who use it love it. Strategy: acknowledge the adoption gap, show the trajectory, propose extending the pilot 30 days with a dedicated training push. Do NOT let this become a pricing conversation -- that's a separate meeting.
+**2:00 PM -- Pinecrest National Bank Final Presentation (60 min)**
+The big one. Attendees: Sandra Okafor (SVP Risk & Compliance), Nathan Cho (IT Director), Raj Patel (your Sales Engineer), you. This is the competitive bake-off against Fortify GRC. Your edge: automated regulatory change tracking and the exam-prep module that Fortify doesn't have. Sandra's been burned by a legacy GRC migration before -- she needs confidence in implementation. Do NOT let this become a discount conversation -- hold the line at $420K.
 
-**4:00 PM -- Board Prep with Marcus Cole, CFO (45 min)**
-Dry run for next week's board meeting. Marcus wants to align on the narrative around the Series C timing. Key tension: do you position the delay as strategic patience or market headwinds? Your instinct is the former, and you're right -- the board will see through anything else.
+**4:00 PM -- Board Prep with Dana Kowalski, CEO (45 min)**
+Dry run for Thursday's board meeting. Dana wants to align on the pipeline coverage narrative. Key tension: Neil Frazier is going to push on why CAC payback is at 19 months instead of the 15-month target. Your answer: enterprise deals have longer sales cycles but 40% higher LTV. The math works -- you just need to show it clearly.
 
 ## COMMITMENTS & OBLIGATIONS
 
 **You owe others:**
-- Northwell: Extended pilot proposal by EOD Wednesday (promised Dr. Yamamoto last week) -- **this matters**
-- Jake: Decision on data team expansion by March 20 -- can wait, but he's watching
-- Board: Updated financial model with Series C scenarios -- Marcus is building it, you need to review by Thursday
-- Sarah: Response on the CSM headcount request -- she asked Friday, you haven't replied
+- Pinecrest: Customized ROI analysis by EOD Wednesday (promised Sandra Okafor last week) -- **this matters**
+- Devon: Feedback on the Harborview proposal draft by March 18 -- he's waiting
+- Board: Updated pipeline forecast with deal-level detail -- Dana's building the deck, you need to validate by Thursday
+- Lena: Decision on the Silverstone renewal pricing strategy -- she asked Friday, you haven't replied
 
 **Others owe you:**
-- Priya: FHIR integration timeline update -- was due Friday, still pending
-- Dr. Yamamoto (Northwell): Credential provisioning -- 11 days overdue
-- Legal (outside counsel): Redline on the Northwell MSA -- 5 days overdue
-- Marcus: Series C scenario models -- promised by Tuesday
+- Raj Patel: Final Pinecrest demo environment check -- was due Friday, confirmed done Saturday morning
+- Sandra Okafor (Pinecrest): Security questionnaire responses -- 8 days overdue
+- Alderman & Cole LLP: Redline on the Pinecrest MSA -- 5 days overdue
+- Aisha Brennan: Bramblewood discovery call notes -- promised by Tuesday
 
 **Critical:**
-1. The Northwell pilot proposal. If this slips, the pilot extension conversation gets awkward.
-2. The board financial model. Meeting is Thursday. No model = no meeting.
+1. The Pinecrest ROI analysis. If this slips, the deal momentum stalls and Fortify gets breathing room.
+2. The board pipeline forecast. Meeting is Thursday. Neil will drill into every number.
 
 ## INTEL
 
-**Industry & AI:** CMS released draft guidance Friday on AI-assisted clinical decision support -- the comment period is 60 days. This directly affects your product classification. Worth having Tom's team read it this week. The key question: does Meridian's analytics layer count as "decision support" under the new framework? If yes, your regulatory burden just increased.
+**Regulatory:** FFIEC released updated guidance Friday on third-party risk management for fintech vendors. Comment period is 45 days. This directly affects how your bank prospects evaluate and onboard Ridgeline. Worth having Raj review the vendor assessment section -- it could actually be a selling point if your compliance posture is tight.
 
-**Markets:** Healthcare SaaS multiples ticked down 0.3x last week (now ~8.2x ARR for growth-stage). Not alarming, but the trend line for the quarter isn't great. Relevant for the Series C valuation conversation.
+**Competitive:** Fortify GRC announced a partnership with Cornerstone Core Banking on March 10. They're going after the integrated-platform angle. This doesn't change the Pinecrest calculus (Pinecrest runs Fiserv), but it could affect Lakeshore Community Bank where Cornerstone is the core platform. Flag for Devon.
 
 ## ACTION ITEMS
 
-1. **Prep for Northwell review** -- review Sarah's deck before 1 PM, make sure outcomes are front and center
-2. **Ping Priya** for the FHIR timeline update before standup so you have context
-3. **Read the CMS AI guidance draft** -- at least the summary section, 15 minutes
-4. **Reply to Sarah** on the CSM headcount ask (even if it's "let's discuss at our 1:1")
-5. **Review Marcus's board deck outline** he sent Friday evening -- flag any narrative issues before your 4 PM
-6. **Check in with Jake** after standup about team velocity -- informal, not a performance conversation
-7. **Remind Lily about science fair** -- Thursday deadline, she needs a nudge
+1. **Prep for Pinecrest presentation** -- do a final walkthrough of Raj's demo script before 1 PM, make sure the exam-prep workflow is front and center
+2. **Ping Devon** about the Harborview Savings deal silence -- two weeks with no prospect contact is a red flag
+3. **Read the FFIEC third-party risk guidance** -- at least the summary section, 15 minutes
+4. **Reply to Lena** on the Silverstone renewal pricing (even if it's "let's discuss at our 1:1")
+5. **Review Dana's board deck outline** she sent Friday evening -- flag any pipeline coverage issues before your 4 PM
+6. **Check in with Maya** after standup about SDR outbound volume -- Neil's pipeline coverage concern starts here

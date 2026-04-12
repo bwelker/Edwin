@@ -3,58 +3,59 @@
 ---
 date: 2026-03-15
 type: person-profile
-name: Dr. Kenji Yamamoto
-org: Northwell Health
+name: Sandra Okafor
+org: Pinecrest National Bank
 ---
 
-# Dr. Kenji Yamamoto
+# Sandra Okafor
 
-**Title:** Vice President, Clinical Operations
-**Organization:** Northwell Health
-**Location:** New Hyde Park, NY
-**Email:** kyamamoto@northwell.edu
-**LinkedIn:** linkedin.com/in/kenjiyamamoto
+**Title:** Senior Vice President, Risk & Compliance
+**Organization:** Pinecrest National Bank
+**Location:** Wilmington, DE
+**Email:** sokafor@pinecrestnb.com
+**LinkedIn:** linkedin.com/in/sandraokafor
 
 ## Role & Influence
 
-Reports to Dr. Patricia Moss, CMO of Northwell Health. Kenji oversees clinical operations across 14 hospital sites. He's the decision-maker for clinical technology pilots and has budget authority up to $1M -- anything above requires Dr. Moss's sign-off. The full Meridian deployment ($840K) falls within his authority, but he'll want Dr. Moss's blessing regardless because it touches nursing workflow system-wide.
+Reports to Richard Ellsworth, EVP and Chief Risk Officer at Pinecrest National Bank. Sandra oversees all regulatory compliance, BSA/AML, and risk management operations across 14 branches. She's the decision-maker for compliance technology and has budget authority up to $500K -- anything above requires Richard's sign-off plus board approval. The Ridgeline deal ($420K ARR) falls within her authority, but she'll want Richard's blessing because it touches every branch's compliance workflow.
 
-He's been at Northwell for 7 years. Before that, he was Director of Clinical Informatics at Mount Sinai for 4 years. Published researcher -- 12 papers on clinical workflow optimization and nurse burnout. This matters because he evaluates tools through an academic lens: show him data, not demos.
+She's been at Pinecrest for 9 years. Before that, she was Director of Regulatory Affairs at Greystone Federal Credit Union for 5 years. Has her CRCM (Certified Regulatory Compliance Manager) and speaks regularly at banking compliance conferences. This matters because she evaluates tools through a practitioner's lens: show her how it works in the field, not in a slide deck.
 
 ## Communication Style
 
-- **Prefers:** Structured emails with data. Bullet points over paragraphs. He reads attachments.
-- **Dislikes:** Sales language. He shut down a vendor call in January when they used the phrase "game-changing." Direct quote from Rachel Torres: "Kenji has a very low tolerance for hyperbole."
-- **Response time:** Usually 24-48 hours on email. Faster on urgent items if you flag them in the subject line.
-- **Meeting style:** Asks precise questions. Doesn't fill silence -- if he's quiet, he's thinking, not disengaged. Let the silence sit.
+- **Prefers:** Concise emails with data attached. She reads supporting documents before meetings. Send materials 48 hours in advance, not the night before.
+- **Dislikes:** Vendor hyperbole. She ended a ComplianceHub demo in January when their rep claimed "zero audit findings guaranteed." Direct quote from Nathan Cho: "Sandra has no patience for promises that can't be contractually backed."
+- **Response time:** Usually 24-48 hours on email. Faster on items she's prioritized -- she flagged the Ridgeline evaluation as a Q1 priority, so she's been responsive (except the security questionnaire, which is stuck in InfoSec).
+- **Meeting style:** Asks pointed questions and expects specific answers. Comfortable with silence. If she's not talking, she's evaluating -- don't fill the gap with nervous chatter. She respects people who say "I don't know, I'll get back to you" over people who guess.
 
 ## Relationship History
 
 | Date | Interaction | Notes |
 |------|------------|-------|
-| 2025-11-12 | Intro call | Connected through Dr. Lisa Park at NYU. 30-minute call, he was skeptical but agreed to a demo. |
-| 2025-12-03 | Product demo | Sarah ran the demo. Kenji asked 14 questions in 45 minutes. Focused on data accuracy and HIPAA compliance. Impressed by the accuracy numbers. |
-| 2025-12-19 | Pilot proposal | Sent formal pilot proposal. He countered with stricter success criteria (80% adoption vs. our proposed 70%). We accepted. |
-| 2026-01-15 | Contract signed | 60-day pilot, three nursing units, no cost. His condition: 30-day review with go/no-go authority. |
-| 2026-02-13 | Pilot launch | Smooth deployment. Kenji attended the kickoff and introduced the Meridian team to the nursing leads. Good sign. |
-| 2026-03-08 | Email update | "Encouraged by early feedback." Asked for clear adoption remediation plan. Tone: constructive, not adversarial. |
+| 2025-10-08 | Intro call | Connected through a referral from Victor Stahl at Bramblewood Financial Group. 20-minute call, she was direct: "Tell me what you do that Fortify doesn't." |
+| 2025-11-14 | Platform demo | Raj ran the demo. Sandra asked 11 questions in 40 minutes. Focused on exam-prep automation and Fiserv integration. Skeptical but engaged. |
+| 2025-12-05 | RFP issued | Pinecrest issued a formal RFP to Ridgeline and Fortify GRC. Detailed requirements, 42 questions. Sandra wrote the compliance automation section herself. |
+| 2026-01-22 | RFP response submitted | You submitted a 38-page response. Sandra acknowledged receipt same day -- unusual for her, which signals priority. |
+| 2026-02-20 | Technical deep-dive | Nathan Cho led a 90-minute technical review with Raj. Focused on Fiserv connector, data encryption, and API architecture. Nathan was satisfied. |
+| 2026-03-08 | Email update | "The team that demonstrates they can cut exam-prep from 6 weeks to under 2 wins. Period." Clear signal on evaluation criteria. |
 
-## What Matters to Him
+## What Matters to Her
 
-1. **Nurse burnout reduction.** This is personal -- his published research is on this topic. If Meridian can demonstrably reduce documentation burden, it aligns with his professional mission, not just his operational goals.
-2. **Data rigor.** He will ask for methodology. Don't hand-wave on how time savings are calculated.
-3. **Not getting burned.** He championed a clinical AI tool in 2024 that underperformed and required a painful rollback. Rachel mentioned this off-hand. He's cautious because he's been burned, not because he's a skeptic.
-4. **Internal credibility.** Every recommendation he makes to Dr. Moss reflects on him. Give him the ammunition to look good.
+1. **Exam-prep efficiency.** She's running a 6-week exam-prep cycle with 3 FTEs dedicated to it. That's $185K/year in direct staff cost plus the opportunity cost of having senior compliance analysts doing manual evidence gathering. Cutting this to under 2 weeks is her stated goal and her primary evaluation criterion.
+2. **Implementation confidence.** Pinecrest attempted a GRC platform migration in 2023 with a competitor (not Fortify) that went badly -- 6 months over timeline, data migration issues, and a partial rollback. Sandra sponsored that project. She's cautious because she's been burned, not because she's risk-averse.
+3. **Regulatory defensibility.** Every tool she selects needs to hold up under examiner scrutiny. She had an MRA in 2023 for BSA/AML monitoring gaps. Her compliance posture is under a spotlight, which makes this purchase both urgent and high-stakes for her personally.
+4. **Internal credibility.** She's advocating for Ridgeline internally against a faction that prefers Fortify as the "safe" choice. She needs data and proof points to win that argument. Give her the ammunition to look right.
 
 ## Political Context
 
-Kenji has a peer rival: David Liu, VP of Digital Health at Northwell, who oversees their internal analytics team. David's team built a competing (inferior) internal tool that Northwell partially deployed last year. If Meridian succeeds, it implicitly validates the buy-over-build argument -- which is a win for Kenji and a loss for David.
+Sandra has a peer dynamic with James Whitaker, VP of Technology at Pinecrest, who reports to a different EVP. James's team has a relationship with Fortify GRC from a previous evaluation. He didn't lead the current RFP but has been vocal in leadership meetings about Fortify's "track record." Nathan Cho (IT Director) reports to James but is genuinely evaluating both vendors on merit -- his technical deep-dive with Raj went well.
 
-This means: Kenji is motivated for Meridian to succeed, but he can't appear to be favoring an outside vendor over an internal team. Everything needs to be justified by data, not relationship.
+This means: Sandra is motivated for Ridgeline to win on the merits, but she can't appear to be ignoring Fortify's strengths. Everything needs to be justified by demo performance and data, not relationship. If the presentation is strong, Sandra has the ammunition. If it's mediocre, James's "safe choice" argument gains ground.
 
 ## Approach Notes
 
-- Lead with outcomes data, always. He respects rigor.
-- Never oversell. Understate and overdeliver. If adoption is 67%, say 67% -- don't round up to "almost 70%."
-- Acknowledge the FHIR credential delay without making it adversarial. He knows it's on his side. A gentle "we're ready when you are" is sufficient.
-- If you need to escalate something, go through Rachel first. She's his trusted filter.
+- Lead with the exam-prep scenario. It's her stated criterion and Ridgeline's strongest differentiator.
+- Never oversell. If the Fiserv connector has a limitation, say so. She'll find out during implementation anyway, and transparency now builds trust.
+- Reference the 2023 failed migration without naming it directly. "We know implementation risk is top of mind" signals you've done your homework without making her relive a painful episode.
+- If you need to escalate the security questionnaire, go through Nathan first. He's her trusted technical filter and he's already bought in on the architecture.
+- Match her communication style: specific, data-driven, no filler. If she asks a question, answer it in under 30 seconds or admit you need to follow up.

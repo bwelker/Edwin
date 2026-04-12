@@ -10,11 +10,11 @@ filter: overdue
 
 | # | Item | Owner | Due | Days Late | Severity |
 |---|------|-------|-----|-----------|----------|
-| 1 | FHIR credential provisioning | Northwell (Dr. Yamamoto) | March 4 | **11 days** | High |
-| 2 | Redline on Northwell MSA | Outside counsel (Whitfield LLP) | March 10 | **5 days** | High |
-| 3 | Data team utilization report | Jake Morrison | March 12 | 3 days | Medium |
-| 4 | Q1 pipeline forecast update | Sarah Chen | March 13 | 2 days | Medium |
-| 5 | Update disaster recovery runbook | Tom Nguyen | March 7 | 8 days | Low |
+| 1 | Security questionnaire responses | Pinecrest (Sandra Okafor) | March 7 | **8 days** | High |
+| 2 | Redline on Pinecrest MSA | Alderman & Cole LLP | March 10 | **5 days** | High |
+| 3 | Harborview discovery call notes | Devon Marsh | March 13 | 2 days | Medium |
+| 4 | Q1 closed-won analysis | Tyler Briggs | March 14 | 1 day | Medium |
+| 5 | CRM data cleanup for board reporting | Carlos Reeves | March 8 | 7 days | Low |
 
 ---
 
@@ -22,16 +22,16 @@ filter: overdue
 
 ### High Severity
 
-**FHIR credentials (Northwell):** This is blocking the integration that the pilot depends on. Priya has been patient, but 11 days is unacceptable. You told her to escalate through Dr. Yamamoto's PM, Rachel Torres. If nothing moves by Wednesday, you should raise it directly with Dr. Yamamoto during the pilot review follow-up. The risk: if the integration isn't live by March 25, the pilot extension argument weakens significantly.
+**Security questionnaire (Pinecrest):** Sandra acknowledged receipt on March 3 but blamed their InfoSec team's review backlog. This is blocking the MSA process -- Nathan Cho won't sign off without a completed security review. You can't push too hard before the presentation today, but if it's not back by Wednesday, raise it directly with Sandra in a follow-up email. Frame it as: "We want to keep the timeline tight so your team can make a decision by March 28."
 
-**MSA redline (Whitfield LLP):** Your outside counsel has had the Northwell MSA for 12 days. The redline was promised March 10. This is now holding up the commercial conversation. Worth a direct call to Lisa Whitfield -- email follow-ups haven't worked. You're paying them $450/hour; response time should match.
+**MSA redline (Alderman & Cole LLP):** Your outside counsel has had the Pinecrest MSA for 12 days. The redline was promised March 10. This is holding up the commercial conversation that follows a successful presentation. Worth a direct call to Rebecca Alderman -- email follow-ups haven't worked. You're paying them $500/hour; response time should match.
 
 ### Medium Severity
 
-**Data team utilization (Jake):** You asked Jake for this before making the headcount decision. He said "end of week" on March 10. It's now Sunday. Not urgent, but the longer this takes, the more it looks like the numbers don't support his ask. Follow up Monday.
+**Harborview discovery notes (Devon):** You asked Devon for the call notes from his last Harborview conversation. He said "end of week" on March 11. It's now Sunday. Combined with two weeks of no prospect activity, this is part of a pattern. Follow up Monday -- but the real conversation is about the deal itself, not the notes.
 
-**Q1 pipeline forecast (Sarah):** Two days late but Sarah's been buried in Northwell prep. She knows it's due. Give her until Tuesday without a nudge.
+**Q1 closed-won analysis (Tyler):** One day late. Tyler's putting together the win/loss analysis for the quarter. Useful for board prep but not blocking. Give him until Monday without a nudge.
 
 ### Low Severity
 
-**DR runbook (Tom):** Eight days late but this is a compliance checkbox, not a fire. Tom's been prioritizing the SOC 2 remediation, which matters more. Remind him when SOC 2 clears.
+**CRM data cleanup (Carlos):** Seven days late but this is a hygiene task, not a fire. Carlos has been focused on outbound prospecting, which matters more. Remind him after the board meeting when pipeline data accuracy becomes less time-sensitive.

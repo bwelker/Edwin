@@ -10,11 +10,11 @@ week: 2026-W11
 
 ## Wins
 
-**SOC 2 audit evidence submitted.** Tom's team ground through the final evidence packet and got it to the auditors Saturday. This has been hanging over the team for three weeks. The auditors have 10 business days to respond with findings. Expect the report by March 28.
+**Bramblewood Financial Group signed.** $285K ARR, 3-year term. Aisha closed it Wednesday after a 7-month sales cycle. Implementation kicks off April 1. This was a grind -- Bramblewood evaluated three vendors and Aisha outlasted all of them. Net new logo, strong reference potential.
 
-**Northwell pilot trending up.** Adoption hit 67% by week 4, up from 41% in week 1. The trajectory is good even if the absolute number is below target. More importantly, NPS among active users is 47 -- that's exceptional for a clinical tool in the first month. The nurses who use it are advocates.
+**Pinecrest demo earned the final presentation.** Sandra Okafor (SVP Risk & Compliance) watched the full platform demo Thursday and invited you to the final bake-off against Fortify GRC. That's Sunday at 2 PM. Raj's demo environment is tight. This is a $420K ARR deal and your biggest pipeline opportunity this quarter.
 
-**Baptist Health renewal signal.** Sarah got a verbal from their VP of IT that they intend to renew. No paper yet, but the body language is right. $320K ARR, renews April 15. Sarah's scheduling the formal renewal call for next week.
+**Silverstone Credit Union NRR signal.** Despite the renewal pricing pushback, Greg Tanaka told Lena he wants to expand to their commercial lending compliance module. If the renewal lands at the 8% uplift plus the expansion, total Silverstone ARR goes from $165K to $210K. Lena's working the numbers.
 
 ## Commitments Scorecard
 
@@ -22,76 +22,79 @@ week: 2026-W11
 
 | Commitment | To Whom | Due | Status |
 |------------|---------|-----|--------|
-| Northwell extended pilot proposal | Dr. Yamamoto | March 18 | On track |
-| Data team headcount decision | Jake Morrison | March 20 | Pending utilization data |
-| Board deck review | Marcus Cole | March 18 | Not started |
-| CSM headcount response | Sarah Chen | -- | Overdue (asked March 12) |
-| Q2 OKR draft | Leadership team | March 25 | Not started |
+| Pinecrest customized ROI analysis | Sandra Okafor | March 18 | On track |
+| Harborview proposal feedback | Devon Marsh | March 18 | Not started |
+| Board pipeline forecast | Dana Kowalski | March 18 | Not started |
+| Silverstone renewal pricing decision | Lena Park | -- | Overdue (asked March 12) |
+| Q2 territory plan | Sales team | March 25 | Not started |
 
 **Others' commitments to you:**
 
 | Commitment | From Whom | Due | Status |
 |------------|-----------|-----|--------|
-| FHIR credentials | Northwell (Dr. Yamamoto) | March 4 | **11 days overdue** |
-| MSA redline | Whitfield LLP | March 10 | **5 days overdue** |
-| Data team utilization report | Jake Morrison | March 12 | **3 days overdue** |
-| Series C scenario models | Marcus Cole | March 17 | On track |
-| Q1 pipeline forecast | Sarah Chen | March 13 | 2 days late, excusable |
+| Security questionnaire | Pinecrest (Sandra Okafor) | March 7 | **8 days overdue** |
+| MSA redline | Alderman & Cole LLP | March 10 | **5 days overdue** |
+| Bramblewood discovery notes | Aisha Brennan | March 13 | **2 days overdue** |
+| Harborview champion intro | Devon Marsh | March 17 | On track |
+| Q1 closed-won analysis | Tyler Briggs | March 14 | 1 day late |
 
 ## Still Open
 
-- **Series C timing:** Sequoia wants Q1 numbers before committing. This pushes the raise to late April. Not a crisis at 14 months runway, but it constrains hiring decisions. Marcus is modeling scenarios.
-- **FHIR integration:** 11 days blocked on Northwell's credential provisioning. Priya has escalated. If this doesn't move by March 20, it starts affecting the pilot extension argument.
-- **Jake's headcount ask:** Two open reqs on the data team. Jake wants them filled, but his utilization report is three days late. Hard to approve headcount when the case isn't documented.
-- **DR runbook update:** 8 days overdue from Tom. Low priority but it's a compliance item that'll bite if it keeps sliding.
+- **Pipeline coverage gap:** Board wants 3.5x, you're at 2.8x. That's ~$2.4M in qualified pipeline you need to generate. Three enterprise deals in early discovery (Lakeshore Community Bank, Crestview Bancorp, Coastal Savings) could close the gap if they qualify.
+- **Pinecrest competitive bake-off:** Final presentation Sunday. Fortify GRC is the competitor. Your edge is the exam-prep module and automated regulatory change tracking. Fortify's edge is their Cornerstone integration (irrelevant here -- Pinecrest runs Fiserv).
+- **Silverstone renewal:** Greg Tanaka pushing back on 12% increase. Lena recommends 8% with 2-year lock. Decision needed before his budget cycle closes March 25.
+- **Devon's Harborview deal:** Two weeks of silence from the prospect. $310K ARR opportunity that's either stalled or dead. Devon hasn't flagged it, which is concerning.
 
 ## Team Signals
 
-**Priya Sharma** is handling the Northwell FHIR blocker with patience and professionalism. She's escalated appropriately without burning the relationship. Worth noting in her next review cycle.
+**Aisha Brennan** is on a streak. Bramblewood close this week plus the Lakeshore discovery call booked for next Tuesday. She's your most consistent AE -- 112% of quota through Q1. The Bramblewood deal was complex (three stakeholders, competing vendor, 7-month cycle) and she managed it with minimal support.
 
-**Jake Morrison** has been quieter than usual in standups. His team's velocity dropped two consecutive sprints (42 to 31 story points). He hasn't flagged a reason. The open reqs might be pulling senior engineers into interviews, but he should be surfacing that. Worth a direct conversation Monday.
+**Devon Marsh** has gone quiet on Harborview. His last activity in the CRM was March 1 -- a follow-up email to their compliance director. No response logged, no call attempts. Devon's Q1 is at 64% of quota. Two weeks of no-contact on a $310K deal is either a missed signal or avoidance. Direct conversation needed Monday.
 
-**Sarah Chen** is stretched. Two CSMs managing 34 accounts is unsustainable. She's asking for help for the first time, which means she's past the point of managing it alone. The headcount decision is a timing problem (Series C uncertainty), not a merit problem.
+**Tyler Briggs** is solid but not stretching. Hitting quota (98% Q1) but entirely on mid-market deals. He hasn't brought an enterprise prospect into the pipeline in two months. The territory has the logos -- he's just not hunting them. Worth a coaching conversation about moving upmarket.
 
-**Tom Nguyen** delivered on SOC 2 under pressure but has three other items slipping. He's triaging correctly -- SOC 2 mattered most -- but the backlog is growing. Check in after the audit response comes back.
+**Maya Sandoval (SDR)** is producing. 47 meetings booked this quarter, 34 qualified. Conversion rate is 72%, which is excellent. Carlos is at 28 meetings, 15 qualified (54% conversion). The gap is widening. Maya might be ready for an AE promotion in Q3.
 
 ## Key Decisions This Week
 
-1. **Told Jake to show utilization data before approving headcount.** The right call -- he needs to build the case, not just assert the need. But don't let this become a slow no. If the data supports it, move fast.
+1. **Accepted the Pinecrest bake-off format.** They wanted both vendors to present the same scenario -- regulatory exam prep for an OCC review. This actually favors us because the exam-prep module is our differentiator. Fortify will try to fake it with manual workflows.
 
-2. **Agreed with Marcus to position the Series C delay as strategic patience.** The board will respect "we're choosing to wait for strong Q1 numbers" more than "the market shifted." This only works if Q1 numbers are actually strong -- they need to be.
+2. **Held the line on Bramblewood pricing.** Aisha wanted to discount 10% to close faster. You said no. She closed at full price three days later. The right call -- never discount to close a deal that's already in motion.
 
-3. **Accepted Kenji's 80% adoption threshold for the pilot.** This was in December, but it's the decision driving this week's stress. 80% was aggressive. In hindsight, 75% would have been smarter. What's done is done -- now execute.
+3. **Deferred the third SDR hire.** Dana suggested it, but the pipeline coverage problem is a qualification problem, not a volume problem. Carlos needs coaching, not a colleague. Revisit in Q2 if outbound conversion doesn't improve.
 
 ## Red Flags
 
-**The Whitfield LLP non-responsiveness is a pattern.** This is the third time in six months they've missed a deadline. You're paying premium rates for below-average turnaround. Worth evaluating alternatives after the Northwell MSA closes. Flag for Marcus to review the legal spend in Q2 planning.
+**The Alderman & Cole non-responsiveness is a pattern.** Third time in six months they've missed a deadline. You're paying $500/hour for below-average turnaround. Worth evaluating alternatives after the Pinecrest MSA closes. Flag for Dana in Q2 planning.
 
-**Jake's silence is louder than his words.** Two sprints of declining velocity with no explanation volunteered means either he doesn't know why or he doesn't want to say. Neither is great. Don't let this drift past Monday.
+**Devon's silence on Harborview is louder than his pipeline report.** Two weeks of no prospect contact with no explanation volunteered. Either the deal is dead and he hasn't updated the forecast, or he's avoiding a difficult conversation with the prospect. Neither is acceptable at this stage of the quarter. Don't let this drift past Monday.
 
 ## Next Week Preview
 
 | Day | Key Events |
 |-----|------------|
-| Monday | Engineering sprint planning, follow up with Jake, call Lisa Whitfield |
-| Tuesday | Review Marcus's Series C models, Baptist Health renewal check-in |
-| Wednesday | **Northwell pilot proposal due**, 1:1 with Priya, SOC 2 remediation check |
-| Thursday | **Board meeting (10 AM, 2 hrs)**, Jake headcount decision |
-| Friday | Sprint 12 mid-check, weekly dispatch |
+| Monday | Sales standup, follow up with Devon on Harborview, call Alderman & Cole |
+| Tuesday | Review pipeline forecast for board, Lakeshore discovery call (Aisha), Silverstone renewal strategy |
+| Wednesday | **Pinecrest ROI analysis due**, 1:1 with Raj, Devon coaching conversation |
+| Thursday | **Board meeting (10 AM, 2 hrs)**, Silverstone pricing decision |
+| Friday | Q2 territory planning kickoff, weekly dispatch |
 
-**The week's center of gravity is Thursday's board meeting.** Everything upstream feeds into it. Block focused time Tuesday and Wednesday for prep.
+**The week's center of gravity is Thursday's board meeting.** Everything upstream feeds into it. Block focused time Tuesday and Wednesday for pipeline work and board prep.
 
 ## By the Numbers
 
 | Metric | Value |
 |--------|-------|
-| PM items open | 23 |
+| PM items open | 19 |
 | PM items overdue | 5 |
-| PM items completed this week | 7 |
-| Meetings this week | 14 |
-| Meetings next week | 16 |
-| ARR | $4.2M |
-| Pipeline | $2.1M |
-| Runway | 14 months |
-| Engineering velocity (avg) | 31 pts/sprint (down from 42) |
-| Northwell adoption | 67% (target: 80%) |
+| PM items completed this week | 8 |
+| Meetings this week | 12 |
+| Meetings next week | 15 |
+| ARR | $5.2M |
+| ARR target (EOY) | $8.0M |
+| Pipeline (qualified) | $3.1M |
+| Pipeline coverage ratio | 2.8x (target: 3.5x) |
+| Net revenue retention | 112% |
+| CAC payback | 19 months (target: 15) |
+| Deals closed this week | 1 (Bramblewood, $285K) |
+| Deals lost this week | 0 |

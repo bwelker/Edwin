@@ -9,87 +9,88 @@ type: daily-agenda
 
 | Time | Meeting | Duration | Prep Status |
 |------|---------|----------|-------------|
-| 9:00 AM | Engineering Standup | 15 min | Ready |
-| 10:30 AM | 1:1 Sarah Chen | 30 min | Notes below |
+| 9:00 AM | Sales Team Standup | 15 min | Ready |
+| 10:30 AM | 1:1 Lena Park | 30 min | Notes below |
 | 12:00 PM | Lunch block | 60 min | Protected |
-| 2:00 PM | Northwell Pilot Review | 60 min | **Prep needed** |
-| 4:00 PM | Board Prep w/ Marcus | 45 min | Notes below |
+| 2:00 PM | Pinecrest Final Presentation | 60 min | **Prep needed** |
+| 4:00 PM | Board Prep w/ Dana | 45 min | Notes below |
 
 ---
 
-## 9:00 AM -- Engineering Standup
+## 9:00 AM -- Sales Team Standup
 
 **Where:** Zoom (recurring link)
-**Who:** Priya Sharma (Backend Lead), Jake Morrison (Data Lead), Tom Nguyen (Platform Lead)
+**Who:** Aisha Brennan (AE), Devon Marsh (AE), Tyler Briggs (AE), Jess Moran (AE), Maya Sandoval (SDR), Carlos Reeves (SDR), Raj Patel (SE)
 
-**Context:** Weekly leads sync. Typically 15 minutes, but the FHIR blocker might push it longer.
+**Context:** Weekly pipeline sync. The Pinecrest prep will dominate, but don't let it crowd out pipeline hygiene.
 
 **What to listen for:**
-- Priya's update on Northwell FHIR credential provisioning -- 11 days past Northwell's promised date. She's escalating through Dr. Yamamoto.
-- Jake's team velocity -- dropped from 42 to 31 story points over the last two sprints. He hasn't flagged a reason. Could be the two open reqs pulling people into interviews.
-- Tom's SOC 2 remediation items -- three findings from the audit need engineering fixes by March 28.
+- Devon's update on Harborview Savings -- two weeks of silence from their compliance director. He hasn't flagged why. Ask directly.
+- Maya's outbound numbers -- she's on pace for a record quarter. Worth acknowledging publicly.
+- Tyler's pipeline -- he's been skating on mid-market deals. Listen for whether he's added any enterprise prospects.
+- Carlos's conversion rate -- 54% vs Maya's 72%. He may need coaching, not more activity.
 
-**Your role:** Listen mode. Let leads own their updates. Only intervene if someone's blocked and not asking for help.
+**Your role:** Listen mode. Let the team own their updates. Only intervene if someone's pipeline is stuck and they're not asking for help.
 
 ---
 
-## 10:30 AM -- 1:1 with Sarah Chen
+## 10:30 AM -- 1:1 with Lena Park
 
 **Where:** Your office
-**Who:** Sarah Chen, Head of Customer Success
+**Who:** Lena Park, VP Customer Success
 
-**Context:** Sarah's been running hard. Her team (two CSMs) manages 34 accounts, up from 26 in Q4. She's going to ask for headcount.
+**Context:** Lena's running hard. Her team (two CSMs) manages 28 accounts, up from 22 in Q4. She's going to raise the CSM headcount ask again.
 
 **Background:**
-- Customer health scores are stable (avg 7.2/10) despite the load increase
-- Churn is flat at 3.1% monthly, which is good
-- Sarah personally handles the top 8 accounts including Northwell
-- She mentioned in a Teams message last Tuesday that she's "stretched thin" -- first time she's used that language
+- Customer health scores are stable (avg 7.4/10) despite the load increase
+- Net revenue retention is at 112%, strongest it's been since Series A
+- Lena personally manages the top 6 accounts including Silverstone and Bramblewood
+- She mentioned in a Slack message Tuesday that she's "running out of bandwidth" -- first time she's used that language
 
 **Talking points:**
-1. Northwell QBR format -- let her drive this, she knows the account best
-2. CSM headcount -- if she raises it, acknowledge the data supports it. Don't commit. Say: "Let me look at this in the context of the Q2 budget with Marcus. I hear you."
-3. Ask about the Baptist Health renewal (due April 15) -- last check-in she was "cautiously optimistic" but didn't elaborate
+1. Silverstone renewal strategy -- her recommendation is 8% with a 2-year lock instead of 12% annual. She knows the account best, but you need to understand the floor.
+2. CSM headcount -- if she raises it, acknowledge the data supports it. Don't commit. Say: "Let me look at this in the context of Q2 budget with Dana. I hear you."
+3. Bramblewood onboarding timeline -- Aisha closed the deal Wednesday, implementation starts April 1. Lena needs to staff the onboarding. Ask if the current team can absorb it.
 
-**Watch for:** Sarah is loyal and doesn't complain easily. If she's asking for help, she needs it. The question is timing, not merit.
+**Watch for:** Lena is loyal and doesn't complain easily. If she's asking for help, she needs it. The question is timing, not merit.
 
 ---
 
-## 2:00 PM -- Northwell Health Pilot Review
+## 2:00 PM -- Pinecrest National Bank Final Presentation
 
 **Where:** Zoom
-**Who:** Dr. Kenji Yamamoto (VP Clinical Ops, Northwell), Rachel Torres (PM, Northwell), Sarah Chen, you
+**Who:** Sandra Okafor (SVP Risk & Compliance, Pinecrest), Nathan Cho (IT Director, Pinecrest), Raj Patel (SE), you
 
 **This is the important one.** See the full meeting prep doc for deep context.
 
 **Quick summary:**
-- 30-day pilot review of clinical analytics platform
-- Adoption: 67% vs. 80% target -- gap is real but trajectory is upward
-- Qualitative feedback: strong. Nurses report 12 min/shift saved on average
-- Goal: secure a 30-day extension with dedicated training support
-- Do NOT discuss pricing -- that's a separate conversation with their procurement team
+- Competitive bake-off against Fortify GRC for $420K ARR deal
+- Presentation scenario: regulatory exam prep for a simulated OCC review
+- Your edge: automated regulatory change tracking + exam-prep module (Fortify doesn't have it)
+- Sandra's been burned by a bad GRC migration before -- she needs confidence in implementation
+- Do NOT discount -- hold the line at $420K ARR
 
-**Your role:** Executive presence. Let Sarah present the data. You handle the strategic narrative and the extension ask.
+**Your role:** Executive presence. Let Raj run the demo. You handle the strategic narrative and the closing conversation.
 
 ---
 
-## 4:00 PM -- Board Prep with Marcus Cole
+## 4:00 PM -- Board Prep with Dana Kowalski
 
-**Where:** Marcus's office
-**Who:** Marcus Cole, CFO
+**Where:** Dana's office
+**Who:** Dana Kowalski, CEO
 
 **Context:** Board meeting is Thursday, March 19. This is the dry run.
 
-**Board deck outline (from Marcus's Friday email):**
-1. Q1 financial summary (Marcus owns)
-2. Product update + Northwell pilot (you own)
-3. Series C update and timeline (joint)
-4. Hiring plan and burn rate scenarios (Marcus owns)
-5. Q2 priorities and risks (you own)
+**Board deck outline (from Dana's Friday email):**
+1. Q1 financial summary (Dana owns)
+2. Sales update + pipeline review (you own)
+3. Product roadmap and competitive landscape (joint with VP Eng)
+4. ARR bridge to $8M target (you own)
+5. Q2 priorities and risks (Dana owns)
 
 **Key tensions to resolve:**
-- **Series C narrative:** Sequoia's interest cooling isn't a crisis, but the board will ask. Position: "We're choosing to wait for Q1 numbers rather than raise on projections." This is true and sounds stronger than "they want to wait."
-- **Burn rate:** Current: $680K/month. Runway: 14 months. If you accelerate the enterprise hiring plan, runway drops to 11 months. The board will want to see both scenarios.
-- **Northwell:** If today's pilot review goes well, this becomes a centerpiece of the product update. If it doesn't, adjust the narrative to pipeline breadth rather than depth.
+- **Pipeline coverage narrative:** Neil Frazier is going to push on 2.8x vs. the 3.5x target. Position: "Three enterprise discovery deals entered the pipeline in March that aren't yet reflected in the qualified number. Coverage reaches 3.3x if two of three qualify, which we expect by April."
+- **CAC payback:** Currently 19 months vs. 15-month target. The answer: enterprise deals have 6-9 month cycles but 40% higher LTV and near-zero churn. The payback period is longer but the unit economics are better.
+- **Pinecrest:** If today's presentation goes well, this becomes a centerpiece of the pipeline story. If it doesn't, shift the narrative to portfolio breadth and the Bramblewood close.
 
-**Prep:** Review Marcus's scenario models before this meeting. He sent them Friday at 6 PM -- you haven't opened them yet.
+**Prep:** Review Dana's board deck outline before this meeting. She sent it Friday at 6 PM -- you haven't opened it yet.

@@ -3,10 +3,10 @@
 ---
 date: 2026-03-15
 type: meeting-prep
-meeting: Northwell Health Pilot Review
+meeting: Pinecrest National Bank Final Presentation
 ---
 
-# Meeting Prep -- Northwell Health 30-Day Pilot Review
+# Meeting Prep -- Pinecrest National Bank Final Presentation
 
 **When:** Sunday, March 15, 2026 at 2:00 PM ET
 **Where:** Zoom (link in calendar invite)
@@ -16,71 +16,80 @@ meeting: Northwell Health Pilot Review
 
 | Name | Role | What they care about |
 |------|------|---------------------|
-| **Dr. Kenji Yamamoto** | VP Clinical Operations, Northwell | Nursing efficiency, patient outcomes, budget justification to C-suite |
-| **Rachel Torres** | Project Manager, Northwell | Timeline, deliverables, risk to her project plan |
-| **Sarah Chen** | Head of CS, Meridian | Account health, expansion potential, renewal |
-| **Alex Chen** | CTO, Meridian (you) | Strategic relationship, technical credibility, pilot-to-contract conversion |
+| **Sandra Okafor** | SVP Risk & Compliance, Pinecrest | Audit efficiency, examiner readiness, implementation risk |
+| **Nathan Cho** | IT Director, Pinecrest | Integration with Fiserv core, security posture, deployment timeline |
+| **Raj Patel** | Sales Engineer, Ridgeline | Demo execution, technical credibility |
+| **Marcus Torres** | VP Sales, Ridgeline (you) | Strategic relationship, competitive positioning, deal close |
 
 ## Context
 
-Meridian deployed its clinical analytics platform to three Northwell nursing units on February 13. This is the contractually required 30-day review. The pilot agreement includes a go/no-go decision at 30 and 60 days.
+Ridgeline is in a competitive bake-off against Fortify GRC for Pinecrest's compliance automation platform. Both vendors were asked to present the same scenario: regulatory exam prep for a simulated OCC examination. The evaluation committee makes a recommendation to their EVP by March 28.
 
-**The deal math:** Pilot is $0 (free). Full deployment would be ~$840K ARR across 12 units. Northwell is your largest pipeline opportunity and would be a flagship reference customer. The board is watching this one.
+**The deal math:** $420K ARR, 3-year term preferred. Pinecrest has 14 branches and $3.2B in assets. If they deploy Ridgeline, they're a top-5 account and a flagship reference in the community banking segment. The board is watching this one because it validates the enterprise motion.
 
-## Performance Data (from Sarah's deck)
+## Competitive Landscape
 
-| Metric | Target | Actual | Gap |
-|--------|--------|--------|-----|
-| Nurse adoption rate | 80% | 67% | -13 pts |
-| Avg. daily active users | 45 | 38 | -7 |
-| Time saved per shift (self-reported) | 10 min | 12 min | +2 min |
-| Data accuracy score | 95% | 97.3% | +2.3 pts |
-| System uptime | 99.5% | 99.91% | +0.41 pts |
-| NPS (pilot users) | 30 | 47 | +17 pts |
+| Factor | Ridgeline | Fortify GRC |
+|--------|-----------|-------------|
+| Exam-prep module | Native, automated | Manual workflows |
+| Regulatory change tracking | Real-time, automated | Weekly batch updates |
+| Fiserv integration | Certified connector | Custom build required |
+| Implementation timeline | 8-10 weeks | 12-16 weeks |
+| Price (est.) | $420K ARR | ~$350K ARR (discounted to compete) |
+| Reference customers | 6 banks >$1B assets | 15+ banks but legacy reputation |
 
-**The story:** Adoption is below target, but the nurses who use it love it and it's saving more time than projected. The gap is an onboarding problem, not a product problem. Three of the 12 nurses on Unit 7B never completed training due to schedule conflicts during the rollout week.
+**Your edge:** The exam-prep module is a genuine differentiator. Fortify will try to demo it with manual workarounds. Sandra has lived through a manual exam-prep process -- she'll see through it. The Fiserv certified connector also matters because Nathan's team doesn't want a custom integration project.
 
-## What Northwell Has Said Recently
+**Their edge:** Fortify is cheaper and better known. They've been in the GRC space for 12 years. Some board members at Pinecrest may have a "nobody gets fired for buying Fortify" instinct.
 
-**Dr. Yamamoto (email, March 8):** "Encouraged by the early feedback from the floor nurses. The adoption numbers are a concern -- we need to see a clear path to 80% before we can recommend expansion to the CMO."
+## What Pinecrest Has Said Recently
 
-**Rachel Torres (Teams message to Sarah, March 12):** "Kenji is going to push on the adoption gap. He's not negative, but he needs ammunition for the internal conversation. Can you come with a remediation plan?"
+**Sandra Okafor (email, March 8):** "We're looking for a platform that reduces our exam-prep cycle from 6 weeks to under 2. The team that demonstrates they can do that wins. Period."
 
-**Dr. Yamamoto (email, March 3):** Still hasn't delivered FHIR credentials. Priya has followed up three times. He acknowledged the delay but blamed their IT security review process.
+**Nathan Cho (call with Raj, March 11):** "My main concern is integration. We've been burned by vendors who promise seamless and deliver six months of professional services. I need to see the Fiserv connector work, not hear about it."
+
+**Sandra Okafor (email to you, March 3):** Acknowledged receipt of the security questionnaire but hasn't returned it. 8 days overdue. She blamed their InfoSec team's review backlog.
 
 ## Strategy
 
-### Opening (you, 2 minutes)
-Thank them for the partnership. Acknowledge the adoption gap directly -- don't wait for them to raise it. "We see the same number you do. Here's what we're doing about it."
+### Opening (you, 3 minutes)
+Set the frame: "You told us the bar is cutting exam-prep from 6 weeks to under 2. That's what we're here to show you today -- not a product tour, but your actual use case, running on our platform." Reference Sandra's own words back to her. Show you listened.
 
-### Data Review (Sarah, 10 minutes)
-Lead with outcomes: 12 min/shift saved, 97.3% accuracy, NPS of 47. These are strong numbers. Then address adoption: show the trajectory (week 1: 41%, week 2: 55%, week 3: 63%, week 4: 67%). The line is going up. The three untrained nurses on 7B are a known, fixable gap.
+### Demo (Raj, 25 minutes)
+Simulated OCC exam-prep scenario using Pinecrest's actual regulatory profile (Raj built the environment with their public FFIEC data). Key moments:
+1. Automated regulatory change scan -- show how new OCC guidance gets flagged and mapped to Pinecrest's controls in real time
+2. Exam-prep dashboard -- one-click view of readiness by regulation area with gap analysis
+3. Evidence collection -- automated pull from Fiserv core system (show the certified connector working live)
+4. Examiner packet generation -- assembled in minutes, not weeks
 
-### Remediation Plan (Sarah, 5 minutes)
-Propose:
-- Dedicated on-site training day for the 8 nurses who haven't completed full onboarding
-- Weekly office hours (virtual) for the first month of the extension
-- Unit champion program -- identify 2-3 power users to peer-mentor
+### Implementation Plan (Raj, 10 minutes)
+Walk through the 8-10 week deployment plan. Emphasis on:
+- Fiserv certified connector eliminates custom integration work
+- Dedicated implementation manager (not generic PS team)
+- Parallel run with existing process for first exam cycle
+- Nathan's team involvement: 4 hours/week for 10 weeks, not a full-time resource
 
-### The Ask (you, 5 minutes)
-Propose extending the pilot 30 days with the enhanced training support at no additional cost. Frame it as: "We want to earn the full deployment, and we're confident 30 more days with dedicated training support gets us there."
+### Strategic Conversation (you, 15 minutes)
+- Reference Bramblewood Financial Group implementation (similar size, similar core platform, 9-week deployment)
+- Address the "Fortify is safer" objection preemptively: "You've been doing exam prep manually for 20 years. Choosing a platform that automates it the same manual way isn't modernization."
+- Close with: "We're confident enough to put a performance guarantee in the contract. If exam-prep cycle time doesn't drop below 3 weeks within 6 months, you can exit."
 
 ### What NOT to do
-- **Don't discuss pricing.** If they bring it up, say: "We'd love to have that conversation once we've nailed the adoption targets. Let's keep today focused on the pilot."
-- **Don't apologize for the adoption gap.** Acknowledge it, show the plan, move forward.
-- **Don't over-promise on the FHIR integration timeline.** The credentials are on Northwell's side. If Dr. Yamamoto raises it, gently redirect: "We're ready to go the moment your team provisions access."
+- **Don't discount.** If Sandra asks about pricing flexibility, say: "We're happy to discuss terms once you've seen what the platform delivers. Let's keep today focused on the scenario."
+- **Don't trash Fortify directly.** Let the demo do the talking. If they bring up Fortify's capabilities, respond with specifics about what Ridgeline does, not what Fortify doesn't.
+- **Don't over-promise on the security questionnaire.** If Nathan brings up the pending questionnaire, say: "We sent our responses on March 3. Happy to walk through any specific concerns today."
 
 ## Risk Scenarios
 
-**If Dr. Yamamoto says no to the extension:** Unlikely based on his email tone, but if so -- ask what would change his mind. Get specific criteria. Don't negotiate in the moment.
+**If Sandra pushes for a discount:** "Our pricing reflects the value of a purpose-built exam-prep module and real-time regulatory tracking. We're not a GRC tool with compliance bolted on. Happy to talk about term structure or payment timing, but the ARR reflects the product."
 
-**If pricing comes up anyway:** "We're preparing a proposal that reflects the value we've demonstrated. Happy to schedule a dedicated session with your procurement team next week."
+**If Nathan challenges the Fiserv integration:** Have Raj pull up the live connector and run a data pull on the spot. This is why Raj built the demo environment with real Fiserv test data. Show, don't tell.
 
-**If the FHIR delay becomes contentious:** Have Priya's escalation timeline ready. Show that your team has been responsive -- three follow-ups, all documented. The ball is on their court and the data proves it.
+**If they ask why Ridgeline over Fortify:** "Fortify has been doing GRC for 12 years and they're good at it. But compliance automation for community banks is a different problem than enterprise GRC. We built Ridgeline specifically for institutions your size, with your regulatory profile, running your core systems. That's why the Fiserv connector exists out of the box and the exam-prep module is native, not a workaround."
 
 ## Background Documents
 
-- Sarah's pilot deck: #northwell Slack channel, posted March 14
-- Northwell pilot agreement: Legal/Contracts/northwell-pilot-agreement-v2.pdf
-- Dr. Yamamoto's Feb 8 email re: pilot success criteria
-- Priya's FHIR integration status tracker: Engineering/FHIR/northwell-status.md
+- Raj's demo script and environment: Shared in #pinecrest Slack channel, posted March 14
+- Pinecrest RFP response: Sales/Proposals/pinecrest-rfp-response-v3.pdf
+- Sandra Okafor's March 8 email re: evaluation criteria
+- Competitive analysis: Sales/Intel/fortify-grc-comparison-2026-q1.md

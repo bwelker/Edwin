@@ -12,46 +12,46 @@ filter: this-week
 
 | Item | Owner | Notes |
 |------|-------|-------|
-| Follow up with Jake on utilization report | Alex | 3 days overdue -- needs it before headcount decision |
-| Ping Lisa Whitfield re: MSA redline | Alex | 5 days overdue, try a phone call this time |
-| Engineering sprint planning | Priya | Sprint 12 kickoff, FHIR integration is top priority |
+| Follow up with Devon on Harborview deal status | Marcus | 2 weeks of prospect silence -- need a straight answer |
+| Call Rebecca Alderman re: MSA redline | Marcus | 5 days overdue, try a phone call this time |
+| Sales team sprint planning | Marcus | Pipeline review, territory assignments, Q2 prep kickoff |
 
 ## Tuesday, March 17
 
 | Item | Owner | Notes |
 |------|-------|-------|
-| Review Marcus's Series C scenario models | Alex | He's sending final versions Monday evening |
-| Baptist Health renewal check-in | Sarah Chen | Renewal due April 15 -- need a status read |
-| CMS guidance internal briefing | Tom Nguyen | Tom to present summary to engineering leads |
+| Review pipeline forecast for board deck | Marcus | Dana needs validated numbers by Wednesday AM |
+| Lakeshore Community Bank discovery call | Aisha Brennan | New enterprise prospect, $3.8B assets, Cornerstone core |
+| Silverstone renewal strategy decision | Marcus | Lena's recommendation: 8% / 2-year lock. Decide before Greg's budget cycle closes. |
 
 ## Wednesday, March 18
 
 | Item | Owner | Notes |
 |------|-------|-------|
-| Northwell extended pilot proposal -- due EOD | Alex | Promised to Dr. Yamamoto -- this is hard deadline |
-| 1:1 with Priya | Alex | FHIR escalation check-in, sprint health |
-| SOC 2 remediation checkpoint | Tom Nguyen | Three findings need engineering fixes by March 28 |
+| Pinecrest customized ROI analysis -- due EOD | Marcus | Promised to Sandra Okafor -- this is a hard deadline |
+| 1:1 with Raj Patel | Marcus | Pinecrest debrief, Lakeshore demo prep |
+| Devon coaching conversation | Marcus | Harborview deal, Q1 quota performance (64%), activity levels |
 
 ## Thursday, March 19
 
 | Item | Owner | Notes |
 |------|-------|-------|
-| **Board meeting** | Alex + Marcus | 10 AM, 2 hours. Deck must be final by Wednesday night |
-| Board deck final review | Alex | Last pass Wednesday evening |
-| Jake headcount decision | Alex | Promised by March 20, deliver a day early if possible |
+| **Board meeting** | Marcus + Dana | 10 AM, 2 hours. Deck must be final by Wednesday night |
+| Board deck final review | Marcus | Last pass Wednesday evening |
+| Silverstone renewal pricing -- communicate to Greg Tanaka | Lena Park | Decision made Tuesday, Lena delivers the offer |
 
 ## Friday, March 20
 
 | Item | Owner | Notes |
 |------|-------|-------|
-| Jake headcount decision -- hard deadline | Alex | If not delivered Thursday, must land Friday |
+| Q2 territory plan draft | Marcus | First pass for team review next week |
 | Weekly dispatch | Edwin | End-of-week retrospective |
-| Sprint 12 mid-sprint check | Priya | Velocity tracking after two slow sprints |
+| Bramblewood implementation kickoff prep | Lena Park | April 1 start, onboarding plan needs to be ready |
 
 ---
 
 ## Week Summary
 
-**16 items tracked.** 5 are carryover from last week (overdue). The board meeting Thursday is the week's center of gravity -- everything upstream (Series C models, Northwell proposal, SOC 2 progress) feeds into it.
+**15 items tracked.** 5 are carryover from last week (overdue). The board meeting Thursday is the week's center of gravity -- the pipeline coverage narrative, CAC payback defense, and Pinecrest deal momentum all converge there.
 
-**Biggest risk this week:** The Northwell pilot proposal (Wednesday) and the board deck (Thursday) are back-to-back. If either slips, the other suffers. Block time Tuesday and Wednesday afternoon for focused work.
+**Biggest risk this week:** The Pinecrest ROI analysis (Wednesday) and the board deck (Thursday) are back-to-back. If either slips, the other suffers. Block time Tuesday and Wednesday afternoon for focused work.

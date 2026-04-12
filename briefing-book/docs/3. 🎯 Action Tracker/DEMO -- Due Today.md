@@ -10,27 +10,27 @@ filter: due-today
 
 | # | Item | Owner | Source | Status |
 |---|------|-------|--------|--------|
-| 1 | Review Sarah's Northwell pilot deck | Alex | Self-assigned, March 13 | **Not started** |
-| 2 | Reply to Sarah on CSM headcount request | Alex | Email from Sarah, March 12 | **Not started** |
-| 3 | Read CMS AI guidance draft (summary section) | Alex | Edwin morning brief | Not started |
-| 4 | Send updated SOC 2 evidence packet to auditors | Tom Nguyen | Audit standup, March 11 | In progress |
-| 5 | Confirm Northwell pilot review agenda with Rachel Torres | Sarah Chen | Email thread, March 13 | Done |
+| 1 | Final walkthrough of Raj's Pinecrest demo script | Marcus | Self-assigned, March 13 | **Not started** |
+| 2 | Reply to Lena on Silverstone renewal pricing strategy | Marcus | Slack from Lena, March 12 | **Not started** |
+| 3 | Read FFIEC third-party risk management guidance (summary) | Marcus | Edwin morning brief | Not started |
+| 4 | Send Bramblewood signed order form to finance | Aisha Brennan | Deal close, March 12 | In progress |
+| 5 | Confirm Pinecrest presentation agenda with Nathan Cho | Raj Patel | Email thread, March 13 | Done |
 
 ---
 
 ## Details
 
-### 1. Review Sarah's Northwell pilot deck
-Sarah shared the deck in the #northwell Slack channel Friday at 4:30 PM. It's 18 slides. Your feedback needs to land before 1 PM so she can adjust before the 2 PM review. Focus areas: make sure slide 3 leads with outcomes (nurse time saved), not feature screenshots.
+### 1. Final walkthrough of Raj's Pinecrest demo script
+Raj posted the final demo script in the #pinecrest Slack channel Friday at 4:30 PM. The demo is 25 minutes. Your feedback needs to land before 1 PM so he can adjust before the 2 PM presentation. Focus areas: make sure the exam-prep workflow leads the demo, not the general dashboard tour. Sandra explicitly said exam-prep cycle time is the deciding factor.
 
-### 2. Reply to Sarah on CSM headcount request
-She sent a formal request Friday with utilization data. Even a "received, let's discuss Monday" buys goodwill. She's been waiting 3 days.
+### 2. Reply to Lena on Silverstone renewal pricing strategy
+She sent a detailed analysis Friday with account health data and her 8% / 2-year lock recommendation. Even a "received, let's discuss at our 1:1" buys goodwill. She's been waiting 3 days and the renewal deadline is approaching.
 
-### 3. Read CMS AI guidance draft
-Published Friday. The 8-page summary is what matters -- full document is 142 pages. Key question: does Meridian's analytics classify as "clinical decision support" under the new framework? Tom's team should do a full read, but you need the gist before the board meeting.
+### 3. Read FFIEC third-party risk management guidance
+Published Friday. The 6-page summary is what matters -- full document is 98 pages. Key question: does the updated guidance create a selling point for Ridgeline's vendor risk module? If your platform helps banks comply with the new third-party risk framework, that's a new talking point for every deal in the pipeline.
 
-### 4. SOC 2 evidence packet (Tom)
-Tom flagged Friday that he's 80% done. Three remaining items: access control logs, encryption-at-rest documentation, and incident response procedure updates. Due to auditors by EOD today.
+### 4. Bramblewood signed order form (Aisha)
+Aisha closed Bramblewood Wednesday but finance needs the executed order form to book the $285K ARR. She told Raj she's waiting on Bramblewood's legal team to countersign. Should land today or Monday.
 
-### 5. Confirm Northwell agenda (Sarah) -- DONE
-Sarah confirmed with Rachel Torres Friday evening. Agenda: 10 min data review, 20 min discussion, 15 min next steps, 15 min open.
+### 5. Confirm Pinecrest agenda (Raj) -- DONE
+Raj confirmed with Nathan Cho Friday evening. Agenda: 3 min opening, 25 min demo, 10 min implementation overview, 15 min strategic discussion, 7 min Q&A.
