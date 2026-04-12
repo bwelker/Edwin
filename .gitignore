@@ -1,0 +1,42 @@
+# Personal data
+data/
+memory/
+briefing-book/docs/*/
+
+# Keep the briefing book structure
+!briefing-book/docs/0. 🚀 Getting Started/
+
+# Environment and credentials
+.env
+.env.*
+credentials/
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Node
+node_modules/
+package-lock.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Plombery state
+*.db
+.data/
+
+# Session state
+.handler-state.json
+.*-state.json

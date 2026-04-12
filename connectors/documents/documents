@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+"""
+Edwin Documents Connector — multi-root file indexer
+
+Scans Desktop, Documents, Pictures, and iCloud Drive for indexable files.
+Extracts text to data/documents/ as Markdown.
+
+Modes:
+  sync <source>   — extract text from documents to data/documents/
+  status          — show last sync stats
+
+Sources: index, all
+
+Supported formats: PDF, DOCX, XLSX, PPTX, MD, TXT, CSV, RTF, PAGES, KEY
+
+Features:
+  - Content-addressed move detection (tracks by hash, not just path)
+  - Stale pruning (deleted/moved files get cleaned up)
+  - Incremental updates (only re-processes changed files)
+  - Multi-root scanning (Desktop, Documents, Pictures, iCloud Drive)
+"""
+
+import os
+import sys
+import json
+import argparse
+import fcntl
+import tempfile
+import hashlib
+import subprocess
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+# -- Config --------------------------------------------------------------------
+
+EDWIN_HOME      = Path(os.environ.get("EDWIN_HOME", Path(__file__).resolve().parent.parent.parent))
+
+SCAN_ROOTS = [
+    Path.home() / "Documents",
+    Path.home() / "Desktop",
+    Path.home() / "Pictures",
+    Path.home() / "Library" / "Mobile Documents" / "com~apple~CloudDocs",
+]
+
+DATA_DIR        = EDWIN_HOME / "data" / "documents"
+STATE_FILE      = DATA_DIR / ".sync-state.json"
+LOCK_FILE       = DATA_DIR / ".sync.lock"
+
+# File extensions to index
+INDEXABLE_EXTENSIONS = {
+    ".pdf", ".docx", ".xlsx", ".pptx",
+    ".md", ".txt", ".csv", ".rtf",
+    ".pages", ".key",
+}
+
+# Directories to skip
+SKIP_DIRS = {
+    ".git", "node_modules", "venv", "__pycache__", ".venv",
+    ".idea", ".vscode", "build", "dist", ".DS_Store",
+    "Edwin",  # Skip old Edwin project (already indexed by connectors)
+    "backups",  # Skip Edwin backup dir in iCloud
+    "Containers",  # Skip app containers in iCloud
+    "CloudDocs",  # Skip nested Mobile Documents refs
+    "Photos Library.photoslibrary",  # Spotlight caches + internal DB, not user content
+    ".photoslibrary",  # Any other photo library bundles
+}
+
+# Files to skip
+SKIP_FILES = {".DS_Store", "Thumbs.db", ".gitkeep"}
+
+# Max file size (50MB)
+MAX_FILE_SIZE = 50 * 1024 * 1024
+
+
+# -- Lockfile ------------------------------------------------------------------
+
+class SyncLock:
+    def __init__(self):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self._f = None
+
+    def __enter__(self):
+        self._f = open(LOCK_FILE, "w")
+        try:
+            fcntl.flock(self._f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Another sync is already running — exiting.", file=sys.stderr)
+            sys.exit(0)
+        self._f.write(str(os.getpid()))
+        self._f.flush()
+        return self
+
+    def __exit__(self, *_):
+        if self._f:
+            fcntl.flock(self._f, fcntl.LOCK_UN)
+            self._f.close()
+
+
+# -- State / helpers -----------------------------------------------------------
+
+def _load_state():
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except json.JSONDecodeError:
+            pass
+    return {}
+
+
+def _save_state(state):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write(STATE_FILE, json.dumps(state, indent=2))
+
+
+def _atomic_write(path: Path, content: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _id_hash(item_id: str) -> str:
+    return hashlib.sha1(item_id.encode()).hexdigest()[:16]
+
+
+def _file_hash(path: Path) -> str:
+    """Hash file content for change detection."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()[:32]
+
+
+def _sanitize_path(rel_path: str) -> str:
+    """Convert a relative path to a safe directory+filename."""
+    parts = Path(rel_path).parts
+    safe = [re.sub(r'[^\w\-. ]', '-', p) for p in parts]
+    return str(Path(*safe)) if safe else "unknown"
+
+
+# -- Text extraction -----------------------------------------------------------
+
+def _extract_pdf(path: Path) -> str:
+    """Extract text from PDF using pdfplumber."""
+    try:
+        import pdfplumber
+        text_parts = []
+        with pdfplumber.open(path) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text_parts.append(page_text)
+        return "\n\n".join(text_parts)
+    except Exception as e:
+        return f"[Error extracting PDF: {e}]"
+
+
+def _extract_docx(path: Path) -> str:
+    """Extract text from DOCX."""
+    try:
+        import docx
+        doc = docx.Document(path)
+        return "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
+    except Exception as e:
+        return f"[Error extracting DOCX: {e}]"
+
+
+def _extract_xlsx(path: Path) -> str:
+    """Extract text from XLSX (sheet names + cell values)."""
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        parts = []
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            rows = []
+            for row in ws.iter_rows(values_only=True):
+                cells = [str(c) if c is not None else "" for c in row]
+                if any(cells):
+                    rows.append(" | ".join(cells))
+            if rows:
+                parts.append(f"## {sheet_name}\n\n" + "\n".join(rows))
+        wb.close()
+        return "\n\n".join(parts)
+    except Exception as e:
+        return f"[Error extracting XLSX: {e}]"
+
+
+def _extract_pptx(path: Path) -> str:
+    """Extract text from PPTX using python-pptx if available, else textutil."""
+    try:
+        from pptx import Presentation
+        prs = Presentation(path)
+        parts = []
+        for i, slide in enumerate(prs.slides, 1):
+            texts = []
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    for para in shape.text_frame.paragraphs:
+                        if para.text.strip():
+                            texts.append(para.text)
+            if texts:
+                parts.append(f"## Slide {i}\n\n" + "\n".join(texts))
+        return "\n\n".join(parts)
+    except ImportError:
+        return _extract_textutil(path)
+    except Exception as e:
+        return f"[Error extracting PPTX: {e}]"
+
+
+def _extract_textutil(path: Path) -> str:
+    """Extract text using macOS textutil (handles RTF, PAGES, KEY, DOCX)."""
+    try:
+        result = subprocess.run(
+            ["textutil", "-convert", "txt", "-stdout", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _extract_plaintext(path: Path) -> str:
+    """Read plaintext files (MD, TXT, CSV)."""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _extract_text(path: Path) -> str:
+    """Route to the right extractor based on file extension."""
+    ext = path.suffix.lower()
+    if ext == ".pdf":
+        return _extract_pdf(path)
+    elif ext == ".docx":
+        return _extract_docx(path)
+    elif ext == ".xlsx":
+        return _extract_xlsx(path)
+    elif ext == ".pptx":
+        return _extract_pptx(path)
+    elif ext in (".md", ".txt", ".csv"):
+        return _extract_plaintext(path)
+    elif ext in (".rtf", ".pages", ".key"):
+        return _extract_textutil(path)
+    return ""
+
+
+# -- Sync ----------------------------------------------------------------------
+
+def _find_indexable_files(root: Path):
+    """Walk a directory tree and yield indexable files."""
+    if not root.exists():
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Skip excluded directories
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+
+        for filename in filenames:
+            if filename in SKIP_FILES or filename.startswith("."):
+                continue
+            path = Path(dirpath) / filename
+            if path.suffix.lower() not in INDEXABLE_EXTENSIONS:
+                continue
+            try:
+                if path.stat().st_size > MAX_FILE_SIZE:
+                    continue
+            except OSError:
+                continue  # iCloud placeholder or broken symlink
+            # Skip iCloud placeholder files
+            if path.suffix == ".icloud" or ".icloud" in str(path):
+                continue
+            yield path
+
+
+def _root_label(path: Path) -> str:
+    """Return a stable label for which scan root a file belongs to."""
+    home = Path.home()
+    icloud = home / "Library" / "Mobile Documents" / "com~apple~CloudDocs"
+    if str(path).startswith(str(icloud)):
+        return "iCloud"
+    for name in ("Desktop", "Documents", "Pictures"):
+        root = home / name
+        if str(path).startswith(str(root)):
+            return name
+    return "Other"
+
+
+def _canonical_key(path: Path) -> str:
+    """Build a stable key: RootLabel/relative/path."""
+    home = Path.home()
+    icloud = home / "Library" / "Mobile Documents" / "com~apple~CloudDocs"
+    for root, label in [(icloud, "iCloud"),
+                        (home / "Desktop", "Desktop"),
+                        (home / "Documents", "Documents"),
+                        (home / "Pictures", "Pictures")]:
+        if str(path).startswith(str(root)):
+            return f"{label}/{path.relative_to(root)}"
+    return f"Other/{path.name}"
+
+
+def _output_path_for_key(key: str) -> Path:
+    """Convert a canonical key to an output markdown path."""
+    safe = _sanitize_path(key)
+    if safe.endswith(".md"):
+        return DATA_DIR / safe
+    return DATA_DIR / (safe + ".md")
+
+
+def sync_index(state: dict, verbose: bool = False, **kwargs):
+    """Index documents from all scan roots."""
+    idx_state = state.get("index", {})
+    # path_hashes: {canonical_key: content_hash}
+    path_hashes = idx_state.get("fileHashes", {})
+    # hash_to_key: {content_hash: canonical_key} — for move detection
+    hash_to_key = {h: k for k, h in path_hashes.items()}
+
+    # Scan all roots
+    files = []
+    for root in SCAN_ROOTS:
+        if root.exists():
+            print(f"  Scanning {root}...", file=sys.stderr)
+            root_files = list(_find_indexable_files(root))
+            files.extend(root_files)
+            print(f"    {len(root_files)} indexable files", file=sys.stderr)
+    print(f"  Total: {len(files)} indexable files across {len(SCAN_ROOTS)} roots",
+          file=sys.stderr)
+
+    written = 0
+    skipped = 0
+    moved = 0
+    errors = 0
+    seen_keys = set()
+
+    for path in files:
+        key = _canonical_key(path)
+        seen_keys.add(key)
+
+        try:
+            current_hash = _file_hash(path)
+        except OSError:
+            continue  # file disappeared (iCloud eviction, etc.)
+
+        # Skip if unchanged at same path
+        if path_hashes.get(key) == current_hash:
+            skipped += 1
+            continue
+
+        # Move detection: same content hash at a different path
+        old_key = hash_to_key.get(current_hash)
+        if old_key and old_key != key and old_key not in seen_keys:
+            # Delete old output file
+            old_out = _output_path_for_key(old_key)
+            if old_out.exists():
+                old_out.unlink()
+                if verbose:
+                    print(f"    Moved: {old_key} → {key}", file=sys.stderr)
+            # Clean up old state
+            path_hashes.pop(old_key, None)
+            moved += 1
+
+        # Extract text
+        text = _extract_text(path)
+        if not text or len(text.strip()) < 10:
+            if verbose:
+                print(f"    Skip (no text): {key}", file=sys.stderr)
+            continue
+
+        # Build markdown
+        try:
+            fstat = path.stat()
+        except OSError:
+            continue
+        mod_dt = datetime.fromtimestamp(fstat.st_mtime, tz=timezone.utc)
+        size_kb = fstat.st_size / 1024
+        root_label = _root_label(path)
+        idhash = _id_hash(f"documents-{key}")
+
+        lines = [
+            "---",
+            "source: documents",
+            f"idhash: {idhash}",
+            f"root: {root_label}",
+            f"path: {key}",
+            f"type: {path.suffix.lower().lstrip('.')}",
+            f"size_kb: {size_kb:.0f}",
+            f"modified: {mod_dt.strftime('%Y-%m-%d %H:%M')}",
+            "---",
+            "",
+            f"# {path.name}",
+            f"*{path.name} ({path.suffix.lower()}, {size_kb:.0f} KB, modified {mod_dt.strftime('%Y-%m-%d')})*",
+            f"*Location: {root_label}/{path.parent.name}*",
+            "",
+            text,
+            "",
+        ]
+
+        content = "\n".join(lines)
+        out_path = _output_path_for_key(key)
+        try:
+            _atomic_write(out_path, content)
+            path_hashes[key] = current_hash
+            hash_to_key[current_hash] = key
+            written += 1
+            if verbose:
+                print(f"    Indexed: {key}", file=sys.stderr)
+        except Exception as e:
+            errors += 1
+            if verbose:
+                print(f"    Error: {key}: {e}", file=sys.stderr)
+
+    # Stale pruning: remove entries for files no longer on disk
+    pruned = 0
+    stale_keys = [k for k in path_hashes if k not in seen_keys]
+    for key in stale_keys:
+        out_path = _output_path_for_key(key)
+        if out_path.exists():
+            out_path.unlink()
+            if verbose:
+                print(f"    Pruned: {key}", file=sys.stderr)
+        old_hash = path_hashes.pop(key)
+        if hash_to_key.get(old_hash) == key:
+            hash_to_key.pop(old_hash, None)
+        pruned += 1
+
+    print(f"  Documents: {written} indexed, {skipped} unchanged, "
+          f"{moved} moves detected, {pruned} pruned, {errors} errors",
+          file=sys.stderr)
+
+    idx_state["fileHashes"] = path_hashes
+    idx_state["lastSync"] = datetime.now(timezone.utc).isoformat()
+    idx_state["totalFiles"] = len(files)
+    state["index"] = idx_state
+    return written
+
+
+# -- Commands ------------------------------------------------------------------
+
+def cmd_sync(args):
+    with SyncLock():
+        state = _load_state()
+        sources = ["index"] if args.source == "all" else [args.source]
+
+        if args.reset:
+            for source in sources:
+                state.pop(source, None)
+            print(f"  State cleared for: {', '.join(sources)}", file=sys.stderr)
+
+        fns = {"index": sync_index}
+        total = 0
+        for source in sources:
+            try:
+                total += fns[source](state, verbose=args.verbose)
+            except Exception as e:
+                print(f"  {source} sync failed: {e}", file=sys.stderr)
+                if args.verbose:
+                    import traceback; traceback.print_exc()
+            _save_state(state)
+        print(f"Sync complete — {total} total items.", file=sys.stderr)
+
+
+def cmd_status(args):
+    print("Documents Index Status")
+    print("=" * 40)
+    state = {}
+    if STATE_FILE.exists():
+        try:
+            state = json.loads(STATE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            print("  State file corrupted")
+
+    info = state.get("index", {})
+    if "lastSync" in info:
+        print(f"  last sync:    {info['lastSync']}")
+        print(f"  total files:  {info.get('totalFiles', '?')}")
+        print(f"  indexed:      {len(info.get('fileHashes', {}))} files")
+    else:
+        print("  (not synced)")
+
+    print()
+    if DATA_DIR.exists():
+        files = list(DATA_DIR.rglob("*.md"))
+        print(f"  output files:  {len(files)} on disk")
+    print()
+
+
+def main():
+    p   = argparse.ArgumentParser(description="Edwin Documents Connector")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    s = sub.add_parser("sync", help="Index Desktop/Documents/Pictures/iCloud to data/documents/")
+    s.add_argument("source", choices=["all", "index"])
+    s.add_argument("--reset", action="store_true")
+    s.add_argument("--verbose", action="store_true")
+    s.set_defaults(func=cmd_sync)
+
+    st = sub.add_parser("status", help="Show index status")
+    st.set_defaults(func=cmd_status)
+
+    args = p.parse_args()
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        import traceback; traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""
+Edwin Photos Metadata Connector — Apple Photos library metadata archiver
+
+Modes:
+  sync <source>   — incremental extraction to data/photos/
+  status          — show last sync times
+
+Sources: metadata, all
+  "all" = metadata (only source for now)
+
+Database: ~/Pictures/Photos Library.photoslibrary/database/Photos.sqlite (read-only)
+  NO actual images are stored — only timestamps, filenames, and GPS coordinates.
+"""
+
+import os
+import sys
+import json
+import argparse
+import fcntl
+import tempfile
+import hashlib
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from collections import defaultdict
+import pytz
+
+
+# -- Config --------------------------------------------------------------------
+
+EDWIN_HOME      = Path(os.environ.get("EDWIN_HOME", Path(__file__).resolve().parent.parent.parent))
+
+PHOTOS_DB       = Path.home() / "Pictures" / "Photos Library.photoslibrary" / "database" / "Photos.sqlite"
+TZ              = os.environ.get("EDWIN_TZ", "America/New_York")
+DATA_DIR        = EDWIN_HOME / "data" / "photos"
+STATE_FILE      = DATA_DIR / ".sync-state.json"
+LOCK_FILE       = DATA_DIR / ".sync.lock"
+DEFAULT_SINCE   = 30
+
+COREDATA_EPOCH_OFFSET = 978307200
+
+# Known locations for rough reverse geocoding
+# Add your own frequent locations here: (latitude, longitude, "Label")
+KNOWN_LOCATIONS = [
+    (40.75, -73.99, "New York City, NY"),
+    (34.05, -118.24, "Los Angeles, CA"),
+    (41.88, -87.63, "Chicago, IL"),
+    (37.77, -122.42, "San Francisco, CA"),
+    (38.90, -77.04, "Washington, DC"),
+    (25.76, -80.19, "Miami, FL"),
+    (47.61, -122.33, "Seattle, WA"),
+    (33.45, -112.07, "Phoenix, AZ"),
+    (29.76, -95.37, "Houston, TX"),
+    (39.74, -104.99, "Denver, CO"),
+]
+
+
+def _reverse_geocode(lat, lon):
+    """Rough location label from GPS coordinates."""
+    if lat is None or lon is None:
+        return None
+    if lat == -180.0 or lon == -180.0 or (lat == 0 and lon == 0):
+        return None
+    for klat, klon, name in KNOWN_LOCATIONS:
+        if abs(lat - klat) < 0.08 and abs(lon - klon) < 0.08:
+            return name
+    return f"{lat:.2f}, {lon:.2f}"
+
+
+# -- Lockfile ------------------------------------------------------------------
+
+class SyncLock:
+    def __init__(self):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self._f = None
+
+    def __enter__(self):
+        self._f = open(LOCK_FILE, "w")
+        try:
+            fcntl.flock(self._f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Another sync is already running — exiting.", file=sys.stderr)
+            sys.exit(0)
+        self._f.write(str(os.getpid()))
+        self._f.flush()
+        return self
+
+    def __exit__(self, *_):
+        if self._f:
+            fcntl.flock(self._f, fcntl.LOCK_UN)
+            self._f.close()
+
+
+# -- State management ---------------------------------------------------------
+
+def _load_state():
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except json.JSONDecodeError:
+            print("  State file corrupted — starting fresh.", file=sys.stderr)
+    return {}
+
+def _save_state(state):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write(STATE_FILE, json.dumps(state, indent=2))
+
+def _atomic_write(path: Path, content: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# -- Helpers -------------------------------------------------------------------
+
+def _id_hash(item_id: str) -> str:
+    return hashlib.sha1(item_id.encode()).hexdigest()[:16]
+
+def _coredata_to_datetime(ts, tz):
+    if ts is None:
+        return None
+    unix_ts = ts + COREDATA_EPOCH_OFFSET
+    return datetime.fromtimestamp(unix_ts, tz=tz)
+
+def _day_path(day_str: str) -> Path:
+    month = day_str[:7]
+    folder = DATA_DIR / "metadata" / month
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / f"{day_str}.md"
+
+
+# -- Sync ----------------------------------------------------------------------
+
+PHOTOS_QUERY = """
+SELECT
+    ZDATECREATED,
+    ZLATITUDE,
+    ZLONGITUDE,
+    ZFILENAME,
+    ZKIND
+FROM ZASSET
+WHERE ZDATECREATED IS NOT NULL
+  AND ZDATECREATED >= ?
+ORDER BY ZDATECREATED ASC
+"""
+
+
+def sync_metadata(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = False):
+    tz = pytz.timezone(TZ)
+
+    meta_state = state.get("metadata", {})
+    last_sync_coredata = meta_state.get("lastSyncCoreData")
+    if last_sync_coredata is not None:
+        cutoff = float(last_sync_coredata)
+        print(f"  Syncing photos since last sync...", file=sys.stderr)
+    else:
+        since_dt = datetime.now(timezone.utc) - timedelta(days=since_days)
+        cutoff = since_dt.timestamp() - COREDATA_EPOCH_OFFSET
+        print(f"  Backfilling photos {since_days} days...", file=sys.stderr)
+
+    import sqlite3
+    if not PHOTOS_DB.exists():
+        print(f"  Photos database not found at {PHOTOS_DB}", file=sys.stderr)
+        return 0
+
+    uri = f"file:{PHOTOS_DB}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+
+    try:
+        rows = conn.execute(PHOTOS_QUERY, (cutoff,)).fetchall()
+        if verbose:
+            print(f"  Found {len(rows)} photos/videos in range", file=sys.stderr)
+
+        # Group by day
+        daily = defaultdict(list)
+        max_ts = cutoff
+
+        for row in rows:
+            dt = _coredata_to_datetime(row["ZDATECREATED"], tz)
+            if dt is None:
+                continue
+            day_key = dt.strftime("%Y-%m-%d")
+            loc = _reverse_geocode(row["ZLATITUDE"], row["ZLONGITUDE"])
+            kind = "video" if row["ZKIND"] == 1 else "photo"
+            filename = row["ZFILENAME"] or ""
+
+            daily[day_key].append({
+                "dt": dt,
+                "location": loc,
+                "kind": kind,
+                "filename": filename,
+            })
+            if row["ZDATECREATED"] > max_ts:
+                max_ts = row["ZDATECREATED"]
+
+        # Write daily files
+        written = 0
+        for day in sorted(daily.keys()):
+            items = daily[day]
+            photo_count = sum(1 for i in items if i["kind"] == "photo")
+            video_count = sum(1 for i in items if i["kind"] == "video")
+            total = len(items)
+            locations = set(i["location"] for i in items if i["location"])
+
+            idhash = _id_hash(f"photos-{day}")
+            lines = [
+                "---",
+                "source: photos",
+                f"date: {day}",
+                f"idhash: {idhash}",
+                f"photo_count: {photo_count}",
+                f"video_count: {video_count}",
+                "---",
+                "",
+                f"# Photos — {day}",
+                "",
+                "### Media Log",
+                f"*Photos ({day}, {total} items)*",
+                "",
+            ]
+
+            for item in items:
+                time_str = item["dt"].strftime("%I:%M %p").lstrip("0")
+                loc_str = f", {item['location']}" if item["location"] else ""
+                lines.append(f"- **{time_str}** — {item['filename']} ({item['kind']}{loc_str})")
+
+            lines.append("")
+
+            if locations:
+                lines.extend(["### Locations", f"*Photos ({day})*", ""])
+                loc_counts = defaultdict(int)
+                for i in items:
+                    if i["location"]:
+                        loc_counts[i["location"]] += 1
+                for loc, cnt in sorted(loc_counts.items(), key=lambda x: -x[1]):
+                    lines.append(f"- {loc}: {cnt} items")
+                lines.append("")
+
+            _atomic_write(_day_path(day), "\n".join(lines))
+            written += 1
+            if verbose:
+                print(f"    {day}: {total} items", file=sys.stderr)
+
+        print(f"  Photos: {written} days written ({len(rows)} items)", file=sys.stderr)
+
+        max_dt = _coredata_to_datetime(max_ts, pytz.utc)
+        state["metadata"] = {
+            "lastSyncCoreData": str(max_ts),
+            "lastSync": max_dt.isoformat() if max_dt else "",
+        }
+
+    finally:
+        conn.close()
+
+    return written
+
+
+# -- Commands ------------------------------------------------------------------
+
+def cmd_sync(args):
+    with SyncLock():
+        state = _load_state()
+        sources = ["metadata"] if args.source == "all" else [args.source]
+        if args.reset:
+            for source in sources:
+                state.pop(source, None)
+            print(f"  State cleared for: {', '.join(sources)}", file=sys.stderr)
+
+        fns = {"metadata": sync_metadata}
+        total = 0
+        for source in sources:
+            try:
+                total += fns[source](state, since_days=args.since, verbose=args.verbose)
+            except Exception as e:
+                print(f"  {source} sync failed: {e}", file=sys.stderr)
+                if args.verbose:
+                    import traceback; traceback.print_exc()
+            _save_state(state)
+        print(f"Sync complete — {total} total items.", file=sys.stderr)
+
+
+def cmd_status(args):
+    print("Photos Metadata Sync Status")
+    print("=" * 40)
+    state = {}
+    if STATE_FILE.exists():
+        try:
+            state = json.loads(STATE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            print("  State file corrupted")
+
+    for source in ("metadata",):
+        info = state.get(source, {})
+        if isinstance(info, dict) and "lastSync" in info:
+            print(f"  {source:12s}  last sync: {info['lastSync']}")
+        else:
+            print(f"  {source:12s}  (not synced)")
+    print()
+    meta_dir = DATA_DIR / "metadata"
+    if meta_dir.exists():
+        files = list(meta_dir.rglob("*.md"))
+        print(f"  daily files    {len(files)} on disk")
+    print()
+
+
+def main():
+    p   = argparse.ArgumentParser(description="Edwin Photos Metadata Connector")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    s = sub.add_parser("sync", help="Sync to data/photos/")
+    s.add_argument("source", choices=["all", "metadata"])
+    s.add_argument("--since", type=int, default=DEFAULT_SINCE)
+    s.add_argument("--reset", action="store_true")
+    s.add_argument("--verbose", action="store_true")
+    s.set_defaults(func=cmd_sync)
+
+    st = sub.add_parser("status", help="Show last sync times")
+    st.set_defaults(func=cmd_status)
+
+    args = p.parse_args()
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        import traceback; traceback.print_exc()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

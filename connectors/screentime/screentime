@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+"""
+Edwin Screentime Connector — macOS KnowledgeC database archiver
+
+Modes:
+  sync <source>   — incremental extraction to data/screentime/
+  status          — show last sync times
+
+Sources: usage, all
+  "all" = usage (only source for now)
+
+Database: ~/Library/Application Support/Knowledge/knowledgeC.db (read-only)
+"""
+
+import os
+import sys
+import json
+import argparse
+import fcntl
+import tempfile
+import hashlib
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from collections import defaultdict
+import pytz
+
+
+# -- Config --------------------------------------------------------------------
+
+DB_PATH         = Path.home() / "Library" / "Application Support" / "Knowledge" / "knowledgeC.db"
+EDWIN_HOME      = Path(os.environ.get("EDWIN_HOME", Path(__file__).resolve().parent.parent.parent))
+TZ              = os.environ.get("EDWIN_TZ", "America/New_York")
+DATA_DIR        = EDWIN_HOME / "data" / "screentime"
+STATE_FILE      = DATA_DIR / ".sync-state.json"
+LOCK_FILE       = DATA_DIR / ".sync.lock"
+DEFAULT_SINCE   = 30  # days back for initial sync
+
+# CoreData epoch offset: 978307200 seconds between Unix epoch and 2001-01-01
+COREDATA_EPOCH_OFFSET = 978307200
+
+# Friendly app names
+APP_NAMES = {
+    'com.apple.Safari': 'Safari',
+    'com.apple.Safari.WebApp': 'Safari Web App',
+    'com.apple.Terminal': 'Terminal',
+    'com.apple.finder': 'Finder',
+    'com.apple.Photos': 'Photos',
+    'com.apple.mail': 'Mail',
+    'com.apple.MobileSMS': 'Messages',
+    'com.apple.Notes': 'Notes',
+    'com.apple.Preview': 'Preview',
+    'com.apple.systempreferences': 'System Settings',
+    'com.apple.dt.Xcode': 'Xcode',
+    'com.microsoft.teams2': 'Teams',
+    'com.microsoft.Outlook': 'Outlook',
+    'com.microsoft.Word': 'Word',
+    'com.microsoft.Excel': 'Excel',
+    'com.microsoft.Powerpoint': 'PowerPoint',
+    'com.microsoft.onenote.mac': 'OneNote',
+    'com.microsoft.VSCode': 'VS Code',
+    'com.google.Chrome': 'Chrome',
+    'com.tinyspeck.slackmacgap': 'Slack',
+    'com.spotify.client': 'Spotify',
+    'com.1password.1password': '1Password',
+    'com.openai.chat': 'ChatGPT',
+    'com.hnc.Discord': 'Discord',
+    'us.zoom.xos': 'Zoom',
+    'com.figma.Desktop': 'Figma',
+    'abnerworks.Typora': 'Typora',
+    'com.anthropic.claudefordesktop': 'Claude Desktop',
+    'com.parallels.macvm': 'Parallels VM',
+    'com.parallels.desktop.console': 'Parallels Desktop',
+    'ai.openclaw.mac': 'OpenClaw',
+    'com.lukilabs.lukiapp': 'Luki',
+    'com.flightyapp.flighty': 'Flighty',
+    'com.electron.dockerdesktop': 'Docker Desktop',
+    'com.apple.ScreenSharing': 'Screen Sharing',
+    'com.apple.TextEdit': 'TextEdit',
+    'com.apple.SystemProfiler': 'System Information',
+    'com.apple.AppStore': 'App Store',
+    'bot.molt.mac': 'Molt',
+}
+
+
+def _friendly_name(bundle_id):
+    """Convert bundle ID to human-readable name."""
+    if not bundle_id:
+        return 'Unknown'
+    if bundle_id in APP_NAMES:
+        return APP_NAMES[bundle_id]
+    if bundle_id.startswith('com.apple.'):
+        return bundle_id.replace('com.apple.', '')
+    if bundle_id.startswith('com.'):
+        parts = bundle_id.split('.')
+        return parts[-1] if len(parts) > 2 else bundle_id
+    return bundle_id
+
+
+# -- Lockfile ------------------------------------------------------------------
+
+class SyncLock:
+    """Prevents concurrent sync runs via exclusive file lock."""
+    def __init__(self):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self._f = None
+
+    def __enter__(self):
+        self._f = open(LOCK_FILE, "w")
+        try:
+            fcntl.flock(self._f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Another sync is already running — exiting.", file=sys.stderr)
+            sys.exit(0)
+        self._f.write(str(os.getpid()))
+        self._f.flush()
+        return self
+
+    def __exit__(self, *_):
+        if self._f:
+            fcntl.flock(self._f, fcntl.LOCK_UN)
+            self._f.close()
+
+
+# -- State management ---------------------------------------------------------
+
+def _load_state():
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except json.JSONDecodeError:
+            print("  State file corrupted — starting fresh.", file=sys.stderr)
+    return {}
+
+
+def _save_state(state):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write(STATE_FILE, json.dumps(state, indent=2))
+
+
+def _atomic_write(path: Path, content: str):
+    """Write to temp file then rename — prevents corruption on power loss."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# -- Markdown helpers ----------------------------------------------------------
+
+def _id_hash(item_id: str) -> str:
+    return hashlib.sha1(item_id.encode()).hexdigest()[:16]
+
+
+def _format_duration(seconds):
+    """Format seconds into human-readable duration."""
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    minutes = seconds / 60
+    if minutes < 60:
+        return f"{int(minutes)}m"
+    hours = minutes / 60
+    remaining_min = int(minutes % 60)
+    if remaining_min:
+        return f"{int(hours)}h {remaining_min}m"
+    return f"{int(hours)}h"
+
+
+def _day_path(day_str: str) -> Path:
+    """Path for a daily screentime file: data/screentime/usage/YYYY-MM/YYYY-MM-DD.md"""
+    month = day_str[:7]
+    folder = DATA_DIR / "usage" / month
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / f"{day_str}.md"
+
+
+# -- Database helpers ----------------------------------------------------------
+
+def _connect_db():
+    """Open KnowledgeC database in read-only mode."""
+    import sqlite3
+    if not DB_PATH.exists():
+        print(f"KnowledgeC database not found at {DB_PATH}", file=sys.stderr)
+        sys.exit(1)
+    uri = f"file:{DB_PATH}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _coredata_to_unix(coredata_ts):
+    """Convert CoreData timestamp to Unix timestamp."""
+    if coredata_ts is None:
+        return None
+    return coredata_ts + COREDATA_EPOCH_OFFSET
+
+
+def _coredata_to_datetime(coredata_ts, tz):
+    """Convert CoreData timestamp to timezone-aware datetime."""
+    if coredata_ts is None:
+        return None
+    unix_ts = _coredata_to_unix(coredata_ts)
+    return datetime.fromtimestamp(unix_ts, tz=tz)
+
+
+# -- Sync ----------------------------------------------------------------------
+
+APP_USAGE_QUERY = """
+SELECT
+    ZSTARTDATE,
+    ZENDDATE,
+    ZVALUESTRING as app,
+    (ZENDDATE - ZSTARTDATE) as duration_sec
+FROM ZOBJECT
+WHERE ZSTREAMNAME = '/app/usage'
+  AND ZVALUESTRING IS NOT NULL
+  AND ZSTARTDATE >= ?
+ORDER BY ZSTARTDATE ASC
+"""
+
+def sync_usage(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = False):
+    """Sync app usage from KnowledgeC database."""
+    tz = pytz.timezone(TZ)
+
+    # Determine date boundary
+    usage_state = state.get("usage", {})
+    last_sync_coredata = usage_state.get("lastSyncCoreData")
+    if last_sync_coredata is not None:
+        cutoff = float(last_sync_coredata)
+        print(f"  Syncing usage since last sync...", file=sys.stderr)
+    else:
+        since_dt = datetime.now(timezone.utc) - timedelta(days=since_days)
+        cutoff = since_dt.timestamp() - COREDATA_EPOCH_OFFSET
+        print(f"  Backfilling usage {since_days} days...", file=sys.stderr)
+
+    conn = _connect_db()
+    try:
+        # Fetch app usage
+        app_rows = conn.execute(APP_USAGE_QUERY, (cutoff,)).fetchall()
+        if verbose:
+            print(f"  Found {len(app_rows)} app usage entries", file=sys.stderr)
+
+        # Group by day
+        daily_apps = defaultdict(lambda: defaultdict(float))
+        max_coredata = cutoff
+
+        for row in app_rows:
+            start_dt = _coredata_to_datetime(row["ZSTARTDATE"], tz)
+            if start_dt is None:
+                continue
+            day_key = start_dt.strftime("%Y-%m-%d")
+            app_name = _friendly_name(row["app"])
+            duration = row["duration_sec"] or 0
+            if duration > 0:
+                daily_apps[day_key][app_name] += duration
+            if row["ZENDDATE"] and row["ZENDDATE"] > max_coredata:
+                max_coredata = row["ZENDDATE"]
+
+        # Write daily files
+        all_days = sorted(daily_apps.keys())
+        written = 0
+
+        for day in all_days:
+            apps = daily_apps[day]
+
+            # Sort by duration descending
+            apps_sorted = sorted(apps.items(), key=lambda x: -x[1])
+
+            # Calculate totals
+            total_app_sec = sum(v for _, v in apps_sorted)
+            total_hours = total_app_sec / 3600
+
+            # Build markdown
+            id_str = f"screentime-{day}"
+            lines = [
+                "---",
+                "source: screentime",
+                f"date: {day}",
+                f"idhash: {_id_hash(id_str)}",
+                f"total_hours: {total_hours:.1f}",
+            ]
+            if apps_sorted:
+                lines.append(f"top_app: {apps_sorted[0][0]}")
+            lines.extend([
+                "---",
+                "",
+                f"# Screen Time — {day}",
+                "",
+            ])
+
+            # Apps section
+            lines.append("### Apps")
+            lines.append(f"*Screen Time ({day}, {_format_duration(total_app_sec)} total)*")
+            lines.append("")
+            lines.append("| App | Duration |")
+            lines.append("|-----|----------|")
+            for app_name, sec in apps_sorted:
+                if sec >= 5:  # skip <5 second entries
+                    lines.append(f"| {app_name} | {_format_duration(sec)} |")
+            lines.append("")
+
+            content = "\n".join(lines)
+            filepath = _day_path(day)
+            _atomic_write(filepath, content)
+            written += 1
+            if verbose:
+                print(f"    {day}: {len(apps_sorted)} apps", file=sys.stderr)
+
+        print(f"  Usage: {written} days written ({len(app_rows)} app events)",
+              file=sys.stderr)
+
+        # Update state
+        max_dt = _coredata_to_datetime(max_coredata, pytz.utc)
+        state["usage"] = {
+            "lastSyncCoreData": str(max_coredata),
+            "lastSync": max_dt.isoformat() if max_dt else "",
+        }
+
+    finally:
+        conn.close()
+
+    return written
+
+
+# -- Commands ------------------------------------------------------------------
+
+def cmd_sync(args):
+    if not DB_PATH.exists():
+        print(f"KnowledgeC database not found at {DB_PATH}", file=sys.stderr)
+        sys.exit(1)
+
+    with SyncLock():
+        state = _load_state()
+        sources = ["usage"] if args.source == "all" else [args.source]
+
+        if args.reset:
+            for source in sources:
+                state.pop(source, None)
+            print(f"  State cleared for: {', '.join(sources)}", file=sys.stderr)
+
+        fns = {"usage": sync_usage}
+        total = 0
+        for source in sources:
+            try:
+                total += fns[source](state, since_days=args.since, verbose=args.verbose)
+            except Exception as e:
+                print(f"  {source} sync failed: {e}", file=sys.stderr)
+                if args.verbose:
+                    import traceback; traceback.print_exc()
+            _save_state(state)
+        print(f"Sync complete — {total} total items.", file=sys.stderr)
+
+
+def cmd_status(args):
+    print("Screentime Sync Status")
+    print("=" * 40)
+    state = {}
+    if STATE_FILE.exists():
+        try:
+            state = json.loads(STATE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            print("  State file corrupted")
+
+    for source in ("usage",):
+        info = state.get(source, {})
+        if isinstance(info, dict) and "lastSync" in info:
+            print(f"  {source:12s}  last sync: {info['lastSync']}")
+        else:
+            print(f"  {source:12s}  (not synced)")
+
+    # File counts
+    print()
+    usage_dir = DATA_DIR / "usage"
+    if usage_dir.exists():
+        files = list(usage_dir.rglob("*.md"))
+        print(f"  daily files    {len(files)} on disk")
+    print()
+
+    # Database info
+    if DB_PATH.exists():
+        try:
+            conn = _connect_db()
+            total = conn.execute(
+                "SELECT COUNT(*) FROM ZOBJECT WHERE ZSTREAMNAME = '/app/usage' AND ZVALUESTRING IS NOT NULL"
+            ).fetchone()[0]
+            conn.close()
+            print(f"  Database: {total:,} app usage entries")
+        except Exception as e:
+            print(f"  Database: error reading ({e})")
+    else:
+        print(f"  Database: not found at {DB_PATH}")
+    print()
+
+
+# -- CLI -----------------------------------------------------------------------
+
+def main():
+    p   = argparse.ArgumentParser(description="Edwin Screentime Connector")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    # sync
+    s = sub.add_parser("sync", help="Sync Screen Time data to data/screentime/")
+    s.add_argument("source", choices=["all", "usage"])
+    s.add_argument("--since", type=int, default=DEFAULT_SINCE,
+                   help=f"Days back for initial/reset sync (default {DEFAULT_SINCE})")
+    s.add_argument("--reset", action="store_true",
+                   help="Clear saved state and re-fetch from --since days back")
+    s.add_argument("--verbose", action="store_true")
+    s.set_defaults(func=cmd_sync)
+
+    # status
+    st = sub.add_parser("status", help="Show last sync times and file counts")
+    st.set_defaults(func=cmd_status)
+
+    args = p.parse_args()
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        import traceback; traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

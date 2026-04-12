@@ -1,0 +1,36 @@
+# Edwin Plombery Configuration
+# Scheduler with web UI for all Edwin jobs
+
+pipelines_dir: ./pipelines.py
+
+schedules:
+  - pipeline: sync_o365
+    trigger:
+      type: interval
+      minutes: 15
+  - pipeline: sync_google
+    trigger:
+      type: interval
+      minutes: 30
+  - pipeline: sync_imessage
+    trigger:
+      type: interval
+      minutes: 60
+  - pipeline: run_indexer
+    trigger:
+      type: interval
+      minutes: 60
+  - pipeline: run_session_watcher
+    trigger:
+      type: interval
+      minutes: 15
+  - pipeline: run_systems_report
+    trigger:
+      type: cron
+      hour: 21
+      minute: 0
+  - pipeline: run_pm_export
+    trigger:
+      type: cron
+      hour: 22
+      minute: 0

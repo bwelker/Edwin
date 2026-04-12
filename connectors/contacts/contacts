@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""
+Edwin Apple Contacts Connector
+
+Reads Apple Contacts (AddressBook) database and syncs into the identity registry.
+Creates/updates canonical_people entries and adds phone/email aliases.
+
+Usage:
+    contacts sync       # Incremental sync from Apple Contacts to identity registry
+    contacts status     # Show sync stats
+    contacts export     # Export contacts as JSON (no registry changes)
+
+Data flow:
+  Apple Contacts DB -> parse -> dedup -> merge into identity registry
+
+Runs weekly via Plombery (Sunday 6 AM).
+"""
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import sys
+from datetime import datetime
+from pathlib import Path
+from collections import defaultdict
+
+EDWIN_HOME = Path(os.environ.get("EDWIN_HOME", Path(__file__).resolve().parent.parent.parent))
+
+# Apple Contacts database locations
+AB_DIR = Path.home() / "Library" / "Application Support" / "AddressBook"
+SOURCES_DIR = AB_DIR / "Sources"
+
+# Identity registry
+REGISTRY_DB = EDWIN_HOME / "data" / "identity" / "registry.db"
+
+# Phone normalization
+def normalize_phone(phone: str) -> str:
+    """Normalize phone to +1XXXXXXXXXX format."""
+    digits = re.sub(r"[^\d]", "", phone)
+    # Remove extensions
+    if "x" in phone.lower():
+        digits = re.sub(r"[^\d]", "", phone.split("x")[0].split("X")[0])
+
+    if len(digits) == 10:
+        return f"+1{digits}"
+    elif len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    elif len(digits) > 11:
+        return f"+{digits}"
+    return phone  # Return original if can't normalize
+
+
+def normalize_email(email: str) -> str:
+    """Normalize email to lowercase."""
+    return email.strip().lower()
+
+
+def read_apple_contacts() -> list[dict]:
+    """Read all contacts from Apple Contacts databases."""
+    contacts = []
+
+    # Find all AddressBook databases
+    dbs = []
+    main_db = AB_DIR / "AddressBook-v22.abcddb"
+    if main_db.exists():
+        dbs.append(main_db)
+
+    if SOURCES_DIR.exists():
+        for source_dir in SOURCES_DIR.iterdir():
+            src_db = source_dir / "AddressBook-v22.abcddb"
+            if src_db.exists():
+                dbs.append(src_db)
+
+    for db_path in dbs:
+        try:
+            conn = sqlite3.connect(str(db_path))
+            cursor = conn.cursor()
+
+            # Get all people with their phones and emails
+            cursor.execute("""
+                SELECT r.Z_PK, r.ZFIRSTNAME, r.ZLASTNAME, r.ZORGANIZATION,
+                       r.ZNICKNAME, r.ZMIDDLENAME
+                FROM ZABCDRECORD r
+            """)
+
+            people = {}
+            for row in cursor.fetchall():
+                pk, first, last, org, nick, middle = row
+                name = " ".join(filter(None, [first, middle, last])).strip()
+                if not name and org:
+                    name = org
+                if not name:
+                    continue
+
+                people[pk] = {
+                    "name": name,
+                    "first": first or "",
+                    "last": last or "",
+                    "org": org or "",
+                    "nickname": nick or "",
+                    "phones": [],
+                    "emails": [],
+                    "source_db": str(db_path),
+                }
+
+            # Get phone numbers
+            cursor.execute("SELECT ZOWNER, ZFULLNUMBER, ZLABEL FROM ZABCDPHONENUMBER")
+            for owner, number, label in cursor.fetchall():
+                if owner in people and number:
+                    normalized = normalize_phone(number)
+                    if normalized:
+                        people[owner]["phones"].append(normalized)
+
+            # Get email addresses
+            cursor.execute("SELECT ZOWNER, ZADDRESS, ZLABEL FROM ZABCDEMAILADDRESS")
+            for owner, addr, label in cursor.fetchall():
+                if owner in people and addr:
+                    # Skip malformed entries
+                    if "@" in addr and " " not in addr.strip():
+                        people[owner]["emails"].append(normalize_email(addr))
+
+            contacts.extend(people.values())
+            conn.close()
+
+        except Exception as e:
+            print(f"Error reading {db_path}: {e}", file=sys.stderr)
+
+    return contacts
+
+
+def sync_to_registry(contacts: list[dict]) -> dict:
+    """Sync Apple Contacts into the identity registry."""
+    if not REGISTRY_DB.exists():
+        print(f"Registry not found: {REGISTRY_DB}", file=sys.stderr)
+        return {"error": "registry not found"}
+
+    conn = sqlite3.connect(str(REGISTRY_DB))
+    cursor = conn.cursor()
+
+    stats = {
+        "total_contacts": len(contacts),
+        "new_people": 0,
+        "new_aliases": 0,
+        "skipped_existing": 0,
+        "skipped_no_data": 0,
+    }
+
+    for contact in contacts:
+        phones = contact["phones"]
+        emails = contact["emails"]
+        name = contact["name"]
+
+        if not phones and not emails:
+            stats["skipped_no_data"] += 1
+            continue
+
+        # Check if this person already exists by phone or email match
+        existing_id = None
+        for phone in phones:
+            cursor.execute(
+                "SELECT canonical_id FROM aliases WHERE alias_type='phone' AND alias_value=?",
+                (phone,)
+            )
+            row = cursor.fetchone()
+            if row:
+                existing_id = row[0]
+                break
+
+        if not existing_id:
+            for email in emails:
+                cursor.execute(
+                    "SELECT canonical_id FROM aliases WHERE alias_type='email' AND alias_value=?",
+                    (email,)
+                )
+                row = cursor.fetchone()
+                if row:
+                    existing_id = row[0]
+                    break
+
+        if not existing_id:
+            # Also check by name
+            cursor.execute(
+                "SELECT canonical_id FROM aliases WHERE alias_type='name' AND alias_value=?",
+                (name,)
+            )
+            row = cursor.fetchone()
+            if row:
+                existing_id = row[0]
+
+        if existing_id:
+            # Person exists -- add any new aliases
+            for phone in phones:
+                try:
+                    cursor.execute(
+                        "INSERT OR IGNORE INTO aliases (canonical_id, alias_type, alias_value, source) VALUES (?, 'phone', ?, 'apple-contacts')",
+                        (existing_id, phone)
+                    )
+                    if cursor.rowcount > 0:
+                        stats["new_aliases"] += 1
+                except sqlite3.IntegrityError:
+                    pass
+
+            for email in emails:
+                try:
+                    cursor.execute(
+                        "INSERT OR IGNORE INTO aliases (canonical_id, alias_type, alias_value, source) VALUES (?, 'email', ?, 'apple-contacts')",
+                        (existing_id, email)
+                    )
+                    if cursor.rowcount > 0:
+                        stats["new_aliases"] += 1
+                except sqlite3.IntegrityError:
+                    pass
+
+            # Add name alias if different
+            try:
+                cursor.execute(
+                    "INSERT OR IGNORE INTO aliases (canonical_id, alias_type, alias_value, source) VALUES (?, 'name', ?, 'apple-contacts')",
+                    (existing_id, name)
+                )
+                if cursor.rowcount > 0:
+                    stats["new_aliases"] += 1
+            except sqlite3.IntegrityError:
+                pass
+
+            stats["skipped_existing"] += 1
+        else:
+            # New person -- create canonical entry
+            import hashlib
+            person_id = hashlib.sha256(name.encode()).hexdigest()[:12]
+
+            try:
+                cursor.execute(
+                    "INSERT INTO canonical_people (id, display_name, notes) VALUES (?, ?, ?)",
+                    (person_id, name, f"Imported from Apple Contacts on {datetime.now().isoformat()}")
+                )
+            except sqlite3.IntegrityError:
+                # ID collision -- append random suffix
+                person_id = hashlib.sha256(f"{name}{datetime.now().isoformat()}".encode()).hexdigest()[:12]
+                cursor.execute(
+                    "INSERT INTO canonical_people (id, display_name, notes) VALUES (?, ?, ?)",
+                    (person_id, name, f"Imported from Apple Contacts on {datetime.now().isoformat()}")
+                )
+
+            # Add all aliases
+            cursor.execute(
+                "INSERT OR IGNORE INTO aliases (canonical_id, alias_type, alias_value, source) VALUES (?, 'name', ?, 'apple-contacts')",
+                (person_id, name)
+            )
+
+            for phone in phones:
+                try:
+                    cursor.execute(
+                        "INSERT OR IGNORE INTO aliases (canonical_id, alias_type, alias_value, source) VALUES (?, 'phone', ?, 'apple-contacts')",
+                        (person_id, phone)
+                    )
+                except sqlite3.IntegrityError:
+                    pass
+
+            for email in emails:
+                try:
+                    cursor.execute(
+                        "INSERT OR IGNORE INTO aliases (canonical_id, alias_type, alias_value, source) VALUES (?, 'email', ?, 'apple-contacts')",
+                        (person_id, email)
+                    )
+                except sqlite3.IntegrityError:
+                    pass
+
+            stats["new_people"] += 1
+            stats["new_aliases"] += 1 + len(phones) + len(emails)
+
+    conn.commit()
+    conn.close()
+    return stats
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Edwin Apple Contacts Connector")
+    parser.add_argument("command", choices=["sync", "status", "export"])
+    args = parser.parse_args()
+
+    contacts = read_apple_contacts()
+
+    if args.command == "export":
+        print(json.dumps(contacts, indent=2))
+        return
+
+    if args.command == "status":
+        with_phones = sum(1 for c in contacts if c["phones"])
+        with_emails = sum(1 for c in contacts if c["emails"])
+        total_phones = sum(len(c["phones"]) for c in contacts)
+        total_emails = sum(len(c["emails"]) for c in contacts)
+        print(f"Apple Contacts: {len(contacts)} people")
+        print(f"  With phones: {with_phones} ({total_phones} numbers)")
+        print(f"  With emails: {with_emails} ({total_emails} addresses)")
+        return
+
+    if args.command == "sync":
+        print(f"Read {len(contacts)} contacts from Apple Contacts")
+        stats = sync_to_registry(contacts)
+        print(f"Sync results:")
+        print(f"  New people created: {stats.get('new_people', 0)}")
+        print(f"  New aliases added: {stats.get('new_aliases', 0)}")
+        print(f"  Existing matched: {stats.get('skipped_existing', 0)}")
+        print(f"  Skipped (no data): {stats.get('skipped_no_data', 0)}")
+
+
+if __name__ == "__main__":
+    main()

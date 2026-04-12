@@ -1,0 +1,1182 @@
+#!/usr/bin/env python3
+"""
+Edwin O365 Connector — Microsoft Graph API
+Modes:
+  sync <source>   — incremental extraction to data/o365/
+  <crud command>  — interactive CRUD (send email, create event, etc.)
+
+Sources: mail, calendar, teams, sharepoint, onedrive, all
+"""
+
+import os
+import sys
+import json
+import argparse
+import re
+import time
+import fcntl
+import tempfile
+import hashlib
+import html as html_mod
+import requests
+from datetime import datetime, timedelta
+from pathlib import Path
+import pytz
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+EDWIN_HOME      = Path(os.environ.get("EDWIN_HOME", Path(__file__).resolve().parent.parent.parent))
+TENANT_ID       = os.environ.get("AZURE_TENANT_ID", "")
+CLIENT_ID       = os.environ.get("AZURE_CLIENT_ID", "")
+SECRET_FILE     = str(EDWIN_HOME / ".env")
+EMAIL_ADDRESS   = os.environ.get("EDWIN_EMAIL", "")
+TZ              = os.environ.get("EDWIN_TZ", "America/New_York")
+
+DATA_DIR        = EDWIN_HOME / "data" / "o365"
+STATE_FILE      = DATA_DIR / ".sync-state.json"
+LOCK_FILE       = DATA_DIR / ".sync.lock"
+APP_TOKEN_CACHE = Path.home() / ".config" / "edwin" / "o365-app-token.json"
+DEL_TOKEN_FILE  = Path.home() / ".config" / "edwin" / "o365-delegated-token.json"
+DEL_REDIRECT    = "http://localhost:8400/callback"
+DEL_SCOPES      = "Chat.ReadWrite ChatMessage.Send Chat.Create Chat.ReadWrite.All offline_access"
+
+GRAPH           = "https://graph.microsoft.com/v1.0"
+DEFAULT_SINCE   = 30  # days back for initial sync
+
+
+# ── Lockfile ──────────────────────────────────────────────────────────────────
+
+class SyncLock:
+    """Prevents concurrent sync runs via exclusive file lock."""
+    def __init__(self):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self._f = None
+
+    def __enter__(self):
+        self._f = open(LOCK_FILE, "w")
+        try:
+            fcntl.flock(self._f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Another sync is already running — exiting.", file=sys.stderr)
+            sys.exit(0)
+        self._f.write(str(os.getpid()))
+        self._f.flush()
+        return self
+
+    def __exit__(self, *_):
+        if self._f:
+            fcntl.flock(self._f, fcntl.LOCK_UN)
+            self._f.close()
+        # P3-12: Don't delete the lock file — another process may have already
+        # acquired the flock between our LOCK_UN and an unlink(), which would
+        # break mutual exclusion. The lock file is safe to leave on disk.
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+def _client_secret():
+    # Try ~/.edwin/credentials first, then fall back to .env
+    cred_file = Path.home() / ".edwin" / "credentials" / "o365" / "env"
+    for path in [cred_file, Path(SECRET_FILE)]:
+        if path.exists():
+            for line in path.read_text().splitlines():
+                if line.startswith("AZURE_CLIENT_SECRET="):
+                    return line.split("=", 1)[1].strip().strip('"')
+    raise ValueError("AZURE_CLIENT_SECRET not found")
+
+
+def get_app_token():
+    """Client credentials token with local cache (~1 hour). Safe to call per-request."""
+    APP_TOKEN_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    if APP_TOKEN_CACHE.exists():
+        try:
+            cached = json.loads(APP_TOKEN_CACHE.read_text())
+            if cached.get("expires_at", 0) > time.time() + 300:
+                return cached["access_token"]
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    resp = requests.post(
+        f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token",
+        data={"client_id": CLIENT_ID, "client_secret": _client_secret(),
+              "scope": "https://graph.microsoft.com/.default",
+              "grant_type": "client_credentials"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    token = resp.json()
+    token["expires_at"] = time.time() + token.get("expires_in", 3600)
+    _atomic_write(APP_TOKEN_CACHE, json.dumps(token, indent=2))
+    return token["access_token"]
+
+
+def get_delegated_token():
+    """Delegated token with refresh. Falls back to interactive login."""
+    DEL_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if DEL_TOKEN_FILE.exists():
+        try:
+            cached = json.loads(DEL_TOKEN_FILE.read_text())
+            if cached.get("expires_at", 0) > time.time() + 300:
+                return cached["access_token"]
+            if cached.get("refresh_token"):
+                resp = requests.post(
+                    f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token",
+                    data={"client_id": CLIENT_ID, "client_secret": _client_secret(),
+                          "refresh_token": cached["refresh_token"],
+                          "grant_type": "refresh_token", "scope": DEL_SCOPES},
+                    timeout=30,
+                )
+                if resp.status_code == 200:
+                    token = resp.json()
+                    token["expires_at"] = time.time() + token.get("expires_in", 3600)
+                    _atomic_write(DEL_TOKEN_FILE, json.dumps(token, indent=2))
+                    return token["access_token"]
+                print("Refresh token expired — re-login required.", file=sys.stderr)
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return _delegated_login()
+
+
+def _delegated_login():
+    import http.server, urllib.parse, threading, webbrowser
+    auth_code = [None]
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            code = params.get("code", [None])[0]
+            if not code:
+                # Favicon, preflight, or other non-callback request — return 404
+                self.send_response(404)
+                self.end_headers()
+                return
+            auth_code[0] = code
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"<h1>Login successful - close this tab.</h1>")
+            threading.Thread(target=self.server.shutdown).start()
+        def log_message(self, *_): pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 8400), Handler)
+    server.timeout = 120  # seconds
+    url = (f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/authorize?"
+           f"client_id={CLIENT_ID}&response_type=code&redirect_uri={DEL_REDIRECT}"
+           f"&scope={DEL_SCOPES.replace(' ','%20')}&response_mode=query")
+    print(f"Opening browser for Microsoft login...\n{url}", file=sys.stderr)
+    webbrowser.open(url)
+    # Loop until the real callback with auth code arrives (handles favicon/preflight)
+    deadline = time.time() + 120
+    while auth_code[0] is None and time.time() < deadline:
+        server.handle_request()
+
+    resp = requests.post(
+        f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token",
+        data={"client_id": CLIENT_ID, "client_secret": _client_secret(),
+              "code": auth_code[0], "redirect_uri": DEL_REDIRECT,
+              "grant_type": "authorization_code", "scope": DEL_SCOPES},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    token = resp.json()
+    token["expires_at"] = time.time() + token.get("expires_in", 3600)
+    _atomic_write(DEL_TOKEN_FILE, json.dumps(token, indent=2))
+    print("Delegated auth successful.", file=sys.stderr)
+    return token["access_token"]
+
+
+# ── Rate-limit cooldown ───────────────────────────────────────────────────────
+_last_throttle_time = 0.0   # epoch seconds of last 429 response
+_THROTTLE_COOLDOWN  = 2.0   # seconds to pause after a recent 429
+
+# ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+def _wait_retry_after_or_exp(retry_state):
+    """Use Retry-After header if available, otherwise fall back to exponential backoff."""
+    exc = retry_state.outcome.exception()
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        retry_after = exc.response.headers.get("Retry-After")
+        if retry_after is not None:
+            try:
+                return int(retry_after)
+            except (ValueError, TypeError):
+                pass
+    return wait_exponential(multiplier=2, min=2, max=60)(retry_state)
+
+
+def _is_retryable_http(exc):
+    """Retryable HTTP errors: 401 (token expiry), 429 (throttle), 503 (transient).
+
+    On 401, invalidate the cached app token so the next retry fetches a fresh one.
+    On 429, record the throttle time so subsequent requests can cool down.
+    """
+    global _last_throttle_time
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        status = exc.response.status_code
+        if status == 429:
+            _last_throttle_time = time.time()
+        if status == 401:
+            # P3-13: Bust the app token cache so the next call to get_app_token()
+            # fetches a fresh token instead of returning the expired cached one.
+            try:
+                APP_TOKEN_CACHE.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return True
+        return status in (429, 503)
+    if isinstance(exc, json.JSONDecodeError):
+        return True  # Malformed API response — retry
+    return False
+
+
+@retry(retry=retry_if_exception(_is_retryable_http),
+       wait=_wait_retry_after_or_exp,
+       stop=stop_after_attempt(5))
+def _get(url, token_getter, params=None, extra_headers=None):
+    """GET with auto token refresh, backoff on 401/429/503."""
+    if time.time() - _last_throttle_time < _THROTTLE_COOLDOWN:
+        time.sleep(_THROTTLE_COOLDOWN)
+    token = token_getter() if callable(token_getter) else token_getter
+    headers = {"Authorization": f"Bearer {token}"}
+    if extra_headers:
+        headers.update(extra_headers)
+    resp = requests.get(url, headers=headers, params=params, timeout=60)
+    resp.raise_for_status()
+    return resp.json()
+
+
+@retry(retry=retry_if_exception(_is_retryable_http),
+       wait=_wait_retry_after_or_exp,
+       stop=stop_after_attempt(5))
+def _post(url, token_getter, body):
+    if time.time() - _last_throttle_time < _THROTTLE_COOLDOWN:
+        time.sleep(_THROTTLE_COOLDOWN)
+    token = token_getter() if callable(token_getter) else token_getter
+    resp = requests.post(url, headers={"Authorization": f"Bearer {token}",
+                                       "Content-Type": "application/json"},
+                         json=body, timeout=60)
+    resp.raise_for_status()
+    return resp
+
+
+def _paginate(url, token_getter, params=None, extra_headers=None):
+    """Follow @odata.nextLink until exhausted. Token refreshed each page."""
+    data = _get(url, token_getter, params, extra_headers=extra_headers)
+    while True:
+        yield from data.get("value", [])
+        next_link = data.get("@odata.nextLink")
+        if not next_link:
+            break
+        data = _get(next_link, token_getter, extra_headers=extra_headers)
+
+
+def _paginate_delta(url, token_getter, params=None, extra_headers=None):
+    """Paginate and return (items, deltaLink). Token refreshed each page.
+    Raises requests.HTTPError with status 410 if deltaLink has expired."""
+    data = _get(url, token_getter, params, extra_headers=extra_headers)
+    items = []
+    while True:
+        items.extend(data.get("value", []))
+        if "@odata.deltaLink" in data:
+            return items, data["@odata.deltaLink"]
+        next_link = data.get("@odata.nextLink")
+        if not next_link:
+            break
+        data = _get(next_link, token_getter, extra_headers=extra_headers)
+    return items, None
+
+
+# ── State ─────────────────────────────────────────────────────────────────────
+
+def _load_state():
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except json.JSONDecodeError:
+            print("  State file corrupted — starting fresh.", file=sys.stderr)
+    return {}
+
+
+def _save_state(state):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write(STATE_FILE, json.dumps(state, indent=2))
+
+
+def _atomic_write(path: Path, content: str):
+    """Write to temp file then rename — prevents corruption on power loss."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# ── Markdown helpers ──────────────────────────────────────────────────────────
+
+def _md_path(source, dt: datetime) -> Path:
+    folder = DATA_DIR / source / dt.strftime("%Y-%m")
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / dt.strftime("%Y-%m-%d.md")
+
+
+def _id_hash(item_id: str) -> str:
+    return hashlib.sha1(item_id.encode()).hexdigest()[:16]
+
+
+def _already_written(path: Path, item_id: str) -> bool:
+    """Check if item ID hash exists in file or per-day files — prevents duplicate writes."""
+    idhash = f"idhash: {_id_hash(item_id)}"
+    if path.exists() and idhash in path.read_text():
+        return True
+    # Check per-day Teams files if conversation file is missing
+    if "teams" in str(path) and not path.exists():
+        channel_name = path.stem
+        daily_dir = DATA_DIR / "teams-daily" / channel_name
+        if daily_dir.exists():
+            for day_file in daily_dir.glob("*.md"):
+                if idhash in day_file.read_text():
+                    return True
+    return False
+
+
+def _append_md(path: Path, content: str):
+    """Atomic append — read existing content, write everything to a temp file, then replace."""
+    existing = ""
+    if path.exists():
+        existing = path.read_text(encoding="utf-8")
+    new_content = existing + content + "\n\n"
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _strip_html(html: str) -> str:
+    html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r'<br\s*/?>', '\n', html, flags=re.IGNORECASE)
+    html = re.sub(r'</?p[^>]*>', '\n', html, flags=re.IGNORECASE)
+    html = re.sub(r'</?div[^>]*>', '\n', html, flags=re.IGNORECASE)
+    html = re.sub(r'</?li[^>]*>', '\n- ', html, flags=re.IGNORECASE)
+    html = re.sub(r'<[^>]+>', '', html)
+    html = html_mod.unescape(html)
+    return re.sub(r'\n{3,}', '\n\n', html).strip()
+
+
+def _since_dt(days: int) -> datetime:
+    return datetime.now(pytz.utc) - timedelta(days=days)
+
+
+def _try_parse_iso(ts: str) -> datetime:
+    """Parse an ISO 8601 timestamp, handling Z suffix. Returns epoch-zero on failure."""
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (ValueError, TypeError, AttributeError):
+        return datetime(1970, 1, 1, tzinfo=pytz.utc)
+
+
+# ── Sync: Mail ────────────────────────────────────────────────────────────────
+
+def _mail_backfill(token_getter, since: datetime, state: dict):
+    """Fetch mail in monthly chunks — avoids Graph API offset pagination timeouts."""
+    tz    = pytz.timezone(TZ)
+    now   = datetime.now(pytz.utc)
+    count = 0
+
+    # Build month windows from since → now
+    cursor = since.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    while cursor <= now:
+        next_month = (cursor.replace(day=28) + timedelta(days=4)).replace(day=1)
+        window_end = min(next_month, now + timedelta(seconds=1))
+        start_str  = cursor.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_str    = window_end.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        print(f"  Backfilling mail {cursor.strftime('%Y-%m')}...", file=sys.stderr)
+        url    = f"{GRAPH}/users/{EMAIL_ADDRESS}/messages"
+        params = {
+            "$filter": f"receivedDateTime ge {start_str} and receivedDateTime lt {end_str}",
+            "$select": "id,subject,from,receivedDateTime,importance,isRead,bodyPreview,body,hasAttachments",
+            "$top": 50,
+        }
+        mail_headers = {"Prefer": "odata.maxpagesize=50"}
+        for msg in _paginate(url, token_getter, params, extra_headers=mail_headers):
+            count += _write_mail_item(msg, tz)
+
+        cursor = next_month
+
+    print(f"  Backfill complete: {count} mail items", file=sys.stderr)
+
+
+def _mail_file_path(source: str, dt: datetime, item_id: str) -> Path:
+    """Generate individual file path for a single email message."""
+    folder = DATA_DIR / source / dt.strftime("%Y-%m")
+    folder.mkdir(parents=True, exist_ok=True)
+    short_id = hashlib.sha1(item_id.encode()).hexdigest()[:8]
+    filename = f"{dt.strftime('%Y-%m-%d-%H%M%S')}-{short_id}.md"
+    return folder / filename
+
+
+def _write_mail_item(msg: dict, tz) -> int:
+    received = msg.get("receivedDateTime", "")
+    if not received:
+        return 0
+    dt = datetime.fromisoformat(received.replace("Z", "+00:00")).astimezone(tz)
+    item_id = msg.get("id", "")
+    path = _mail_file_path("mail", dt, item_id)
+    # Dedup: file exists = already written
+    if path.exists():
+        return 0
+    sender = msg.get("from", {}).get("emailAddress", {})
+    subject = msg.get("subject", "(no subject)")
+    body = msg.get("body", {})
+    content = body.get("content", msg.get("bodyPreview", ""))
+    if body.get("contentType") == "html":
+        content = _strip_html(content)
+    has_attachments = msg.get("hasAttachments", False)
+
+    md = (f"---\n"
+          f"source: o365-mail\n"
+          f"idhash: {_id_hash(item_id)}\n"
+          f"from: {sender.get('name','')} <{sender.get('address','')}>\n"
+          f"subject: {subject}\n"
+          f"date: {dt.isoformat()}\n"
+          f"read: {msg.get('isRead', False)}\n"
+          f"importance: {msg.get('importance','normal')}\n"
+          f"hasAttachments: {has_attachments}\n"
+          f"---\n\n"
+          f"## {subject}\n"
+          f"*From: {sender.get('name','')} <{sender.get('address','')}> | {dt.strftime('%Y-%m-%d %H:%M')}*\n\n"
+          f"**From:** {sender.get('name','')} <{sender.get('address','')}>\n"
+          f"**Date:** {dt.strftime('%Y-%m-%d %H:%M %Z')}\n"
+          + (f"**Attachments:** yes\n" if has_attachments else "")
+          + f"\n{content}")
+    # Write individual file atomically
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(md + "\n")
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return 1
+
+
+def sync_mail(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = False):
+    token_getter = get_app_token
+    tz = pytz.timezone(TZ)
+    last_sync = state.get("mail", {}).get("lastSync")
+
+    print("  Syncing mail...", file=sys.stderr)
+
+    # Messages delta is not supported for this tenant/app ("Change tracking is
+    # not supported against 'microsoft.graph.message'"). Use date-based backfill
+    # for both initial and incremental sync.
+    if last_sync:
+        since = datetime.fromisoformat(last_sync)
+    else:
+        since = _since_dt(since_days)
+
+    _mail_backfill(token_getter, since, state)
+
+    state.setdefault("mail", {})["lastSync"] = datetime.now(pytz.utc).isoformat()
+    count = 0  # backfill reports its own count
+    return count
+
+
+# ── Sync: Calendar ────────────────────────────────────────────────────────────
+
+def _write_calendar_item(event: dict, tz) -> int:
+    # Skip series masters — delta returns them with original creation date, not occurrence date
+    if event.get("type") == "seriesMaster":
+        return 0
+    if event.get("isCancelled") or event.get("@removed"):
+        return 0
+
+    start_obj = event.get("start", {})
+    start_str = start_obj.get("dateTime") or start_obj.get("date", "")
+    if not start_str:
+        return 0
+
+    # Handle both datetime (with time) and date-only (all-day events)
+    try:
+        if "T" in start_str:
+            dt = datetime.fromisoformat(start_str)
+            if dt.tzinfo is None:
+                dt = tz.localize(dt)
+        else:
+            d = datetime.strptime(start_str[:10], "%Y-%m-%d")
+            dt = tz.localize(d)
+    except Exception:
+        return 0
+    path = _md_path("calendar", dt)
+    item_id = event.get("id", "")
+    if _already_written(path, item_id):
+        return 0
+
+    subject    = event.get("subject") or "(no subject)"
+    sensitivity = event.get("sensitivity", "normal")
+    # Parse and localize end time the same way as start
+    end_obj = event.get("end", {})
+    end_raw = end_obj.get("dateTime") or end_obj.get("date", "")
+    end_display = end_raw  # fallback
+    try:
+        if end_raw and "T" in end_raw:
+            end_dt = datetime.fromisoformat(end_raw)
+            if end_dt.tzinfo is None:
+                end_dt = tz.localize(end_dt)
+            end_display = end_dt.astimezone(tz).strftime("%Y-%m-%d %H:%M")
+        elif end_raw:
+            end_d = datetime.strptime(end_raw[:10], "%Y-%m-%d")
+            end_dt = tz.localize(end_d)
+            end_display = end_dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        pass
+    location   = event.get("location", {}).get("displayName", "")
+    organizer  = event.get("organizer", {}).get("emailAddress", {})
+    attendees  = [a.get("emailAddress", {}).get("address", "")
+                  for a in event.get("attendees", [])]
+    body       = event.get("body", {}).get("content", "")
+    if event.get("body", {}).get("contentType") == "html":
+        body = _strip_html(body)
+    is_online  = event.get("isOnlineMeeting", False)
+
+    # Use clean date+time display
+    dt_local = dt.astimezone(tz)
+    dt_display = dt_local.strftime("%Y-%m-%d %H:%M")
+
+    md = (f"---\n"
+          f"source: o365-calendar\n"
+          f"idhash: {_id_hash(item_id)}\n"
+          f"subject: {subject}\n"
+          f"start: {dt_display}\n"
+          f"end: {end_display}\n"
+          f"organizer: {organizer.get('address','')}\n"
+          f"online: {is_online}\n"
+          + (f"sensitivity: {sensitivity}\n" if sensitivity != "normal" else "")
+          + f"---\n\n"
+          f"## {subject}\n\n"
+          f"**When:** {dt_local.strftime('%Y-%m-%d %H:%M')} {TZ}\n"
+          f"**Organizer:** {organizer.get('name','')}\n")
+    if location: md += f"**Location:** {location}\n"
+    if attendees: md += f"**Attendees:** {', '.join(attendees[:10])}\n"
+    if body: md += f"\n{body}"
+    _append_md(path, md)
+    return 1
+
+
+def _cal_dt(dt: datetime) -> str:
+    """Format datetime for calendarView: UTC, no microseconds, Z suffix."""
+    return dt.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def sync_calendar(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = False):
+    token_getter = get_app_token
+    tz   = pytz.timezone(TZ)
+    now  = datetime.now(tz)
+    last_sync  = state.get("calendar", {}).get("lastSync")
+    delta_link = state.get("calendar", {}).get("deltaLink")
+
+    cal_headers = {
+        "Prefer": f'odata.maxpagesize=50,outlook.timezone="{TZ}"'
+    }
+
+    if delta_link:
+        url, params = delta_link, None
+    else:
+        start = _cal_dt(now - timedelta(days=since_days))
+        end   = _cal_dt(now + timedelta(days=60))
+        url   = f"{GRAPH}/users/{EMAIL_ADDRESS}/calendarView/delta"
+        params = {
+            "startDateTime": start,
+            "endDateTime": end,
+            "$select": "id,subject,start,end,isAllDay,location,organizer,attendees,body,sensitivity,isCancelled,isOnlineMeeting,onlineMeetingUrl,recurrence",
+        }
+
+    print("  Syncing calendar...", file=sys.stderr)
+    try:
+        items, new_delta = _paginate_delta(url, token_getter, params, extra_headers=cal_headers)
+    except requests.HTTPError as e:
+        if e.response.status_code == 410:
+            print("  Calendar deltaLink expired (410) — resetting.", file=sys.stderr)
+            state.setdefault("calendar", {}).pop("deltaLink", None)
+            # Use lastSync as window start so we don't miss the gap
+            gap_start = (datetime.fromisoformat(last_sync) if last_sync
+                         else now - timedelta(days=since_days))
+            start = _cal_dt(gap_start)
+            end   = _cal_dt(now + timedelta(days=60))
+            url   = f"{GRAPH}/users/{EMAIL_ADDRESS}/calendarView/delta"
+            params = {
+                "startDateTime": start,
+                "endDateTime": end,
+                "$select": "id,subject,start,end,isAllDay,location,organizer,attendees,body,sensitivity,isCancelled,isOnlineMeeting,onlineMeetingUrl,recurrence",
+            }
+            items, new_delta = _paginate_delta(url, token_getter, params, extra_headers=cal_headers)
+        else:
+            raise
+
+    count = sum(_write_calendar_item(e, tz) for e in items)
+    if new_delta:
+        state.setdefault("calendar", {})["deltaLink"] = new_delta
+    state.setdefault("calendar", {})["lastSync"] = datetime.now(pytz.utc).isoformat()
+    print(f"  Calendar: {count} new/changed items", file=sys.stderr)
+    return count
+
+
+# ── Sync: Teams ───────────────────────────────────────────────────────────────
+
+def _sanitize_filename(name: str) -> str:
+    """Replace filesystem-unfriendly characters for use in file names."""
+    # Replace / \ : * ? " < > | with hyphen
+    name = re.sub(r'[/\\:*?"<>|]', '-', name)
+    # Collapse multiple hyphens/spaces
+    name = re.sub(r'-{2,}', '-', name)
+    name = name.strip(' .-')
+    return name or "unnamed"
+
+
+def _teams_conv_path(chat: dict, token_getter, verbose: bool = False,
+                     messages: list = None) -> Path:
+    """Determine the per-conversation file path for a Teams chat.
+
+    Returns path under data/o365/teams/{oneOnOne,named,group}/<name>.md
+    """
+    chat_type = chat.get("chatType", "group")
+    topic = (chat.get("topic") or "").strip()
+    teams_dir = DATA_DIR / "teams"
+
+    if chat_type == "oneOnOne":
+        name = ""
+        # Try to get the other person's name from messages first (no extra API call)
+        if messages:
+            for msg in messages:
+                from_user = (msg.get("from") or {}).get("user") or {}
+                sender_email = (from_user.get("email") or "").lower()
+                sender_name = (from_user.get("displayName") or "").strip()
+                if sender_email and sender_email != EMAIL_ADDRESS.lower() and sender_name:
+                    name = sender_name
+                    break
+            if not name:
+                # All messages are from us — try the other direction
+                for msg in messages:
+                    from_user = (msg.get("from") or {}).get("user") or {}
+                    sender_name = (from_user.get("displayName") or "").strip()
+                    if sender_name and sender_name.lower() != EMAIL_ADDRESS.split("@")[0].replace(".", " "):
+                        name = sender_name
+                        break
+        # Fallback: fetch members via API
+        if not name:
+            try:
+                members = list(_paginate(
+                    f"{GRAPH}/users/{EMAIL_ADDRESS}/chats/{chat['id']}/members",
+                    token_getter, {"$top": 10}
+                ))
+                other = [m for m in members
+                         if (m.get("email") or "").lower() != EMAIL_ADDRESS.lower()]
+                if other:
+                    name = other[0].get("displayName", "").strip()
+            except requests.HTTPError:
+                pass
+        if not name:
+            name = chat["id"][:16]
+        subdir = teams_dir / "oneOnOne"
+        filename = _sanitize_filename(name) + ".md"
+
+    elif topic:
+        # Named chat (group or meeting with a topic)
+        subdir = teams_dir / "named"
+        filename = _sanitize_filename(topic) + ".md"
+
+    else:
+        # Unnamed group or meeting without topic
+        subdir = teams_dir / "group"
+        short_id = chat["id"].split("@")[0][-16:] if "@" in chat["id"] else chat["id"][:16]
+        filename = _sanitize_filename(short_id) + ".md"
+
+    subdir.mkdir(parents=True, exist_ok=True)
+    return subdir / filename
+
+
+def sync_teams(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = False):
+    """Teams has no delta API — tracks by lastSync timestamp.
+
+    Messages are written to per-conversation files:
+      teams/oneOnOne/<other-person>.md
+      teams/named/<topic>.md
+      teams/group/<chat-id-short>.md
+    """
+    token_getter = get_app_token
+    tz = pytz.timezone(TZ)
+    last_sync = state.get("teams", {}).get("lastSync")
+    since = (datetime.fromisoformat(last_sync) if last_sync
+             else _since_dt(since_days))
+    since_str = since.strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"  Syncing Teams since {since_str}...", file=sys.stderr)
+
+    chats = list(_paginate(f"{GRAPH}/users/{EMAIL_ADDRESS}/chats", token_getter,
+                           {"$expand": "lastMessagePreview", "$top": 50}))
+    count = 0
+    for chat in chats:
+        # Skip chats with no activity since last sync
+        last_preview = chat.get("lastMessagePreview") or {}
+        last_ts = last_preview.get("createdDateTime", "")
+        if last_ts:
+            try:
+                last_dt = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+                since_dt = datetime.fromisoformat(since_str.replace("Z", "+00:00"))
+                if last_dt < since_dt:
+                    continue
+            except (ValueError, TypeError):
+                pass  # If parsing fails, don't skip — process the chat
+
+        # Try server-side filter first; fall back to client-side if Graph rejects it
+        try:
+            messages = list(_paginate(
+                f"{GRAPH}/users/{EMAIL_ADDRESS}/chats/{chat['id']}/messages",
+                token_getter,
+                {"$top": 50, "$filter": f"lastModifiedDateTime gt {since_str}"}
+            ))
+        except requests.HTTPError as e:
+            if e.response.status_code in (400, 501):
+                # Filter not supported on this chat type — fetch all, filter locally
+                try:
+                    all_msgs = list(_paginate(
+                        f"{GRAPH}/users/{EMAIL_ADDRESS}/chats/{chat['id']}/messages",
+                        token_getter, {"$top": 50}
+                    ))
+                    _since_parsed = datetime.fromisoformat(since_str.replace("Z", "+00:00"))
+                    messages = [m for m in all_msgs
+                                if _try_parse_iso(m.get("lastModifiedDateTime") or "") >= _since_parsed]
+                except requests.HTTPError as e2:
+                    if e2.response.status_code in (403, 404):
+                        continue
+                    raise
+            elif e.response.status_code in (403, 404):
+                # No access to this specific chat — skip silently
+                continue
+            else:
+                raise
+
+        if not messages:
+            continue
+
+        # Resolve conversation file path (oneOnOne/named/group)
+        conv_path = _teams_conv_path(chat, token_getter, verbose, messages=messages)
+        topic = (chat.get("topic") or "").strip() or chat.get("chatType", "chat")
+
+        # Group messages by day for per-day-per-channel files
+        daily_messages = {}
+
+        for msg in messages:
+            if msg.get("messageType") != "message":
+                continue
+            ts = msg.get("createdDateTime", "")
+            if not ts:
+                continue
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(tz)
+            msg_id = msg.get("id", "")
+            if _already_written(conv_path, msg_id):
+                continue
+            from_user = (msg.get("from") or {}).get("user") or {}
+            sender = from_user.get("displayName", "Unknown")
+            body = msg.get("body", {}).get("content", "")
+            if msg.get("body", {}).get("contentType") == "html":
+                body = _strip_html(body)
+            if not body.strip():
+                continue
+
+            md = (f"---\n"
+                  f"source: o365-teams\n"
+                  f"idhash: {_id_hash(msg_id)}\n"
+                  f"chat: {topic}\n"
+                  f"from: {sender}\n"
+                  f"date: {dt.isoformat()}\n"
+                  f"---\n\n"
+                  f"**{sender}** ({dt.strftime('%H:%M %Z')}): {body}")
+            # Write to conversation file (legacy)
+            _append_md(conv_path, md)
+            # Collect for per-day file
+            day_key = dt.strftime("%Y-%m-%d")
+            daily_messages.setdefault(day_key, []).append(md)
+            count += 1
+
+        # Write per-day-per-channel files for Haiku context indexing
+        if daily_messages:
+            # Create channel subfolder using same name as conversation file
+            channel_name = conv_path.stem  # e.g., "Dev Daily Update"
+            channel_dir = DATA_DIR / "teams-daily" / channel_name
+            channel_dir.mkdir(parents=True, exist_ok=True)
+            for day_key, day_msgs in sorted(daily_messages.items()):
+                day_path = channel_dir / f"{day_key}.md"
+                day_content = "\n\n".join(day_msgs)
+                if day_path.exists():
+                    existing = day_path.read_text(encoding="utf-8")
+                    # Only append messages not already in the file
+                    new_msgs = [m for m in day_msgs
+                                if _id_hash(m.split("idhash: ")[1].split("\n")[0]) not in existing]
+                    if new_msgs:
+                        _append_md(day_path, "\n\n".join(new_msgs))
+                else:
+                    _atomic_write(day_path, day_content + "\n")
+
+    state.setdefault("teams", {})["lastSync"] = datetime.now(pytz.utc).isoformat()
+    print(f"  Teams: {count} new messages", file=sys.stderr)
+    return count
+
+
+# ── Sync: SharePoint / OneDrive ───────────────────────────────────────────────
+
+def sync_sharepoint(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = False):
+    token_getter = get_app_token
+    tz = pytz.timezone(TZ)
+    last_sync  = state.get("sharepoint", {}).get("lastSync")
+    delta_link = state.get("sharepoint", {}).get("deltaLink")
+
+    try:
+        drive = _get(f"{GRAPH}/users/{EMAIL_ADDRESS}/drive", token_getter)
+        drive_id = drive.get("id")
+    except requests.HTTPError as e:
+        print(f"  SharePoint: could not get drive ({e}) — skipping.", file=sys.stderr)
+        return 0
+
+    if delta_link:
+        url, params = delta_link, None
+    else:
+        url = f"{GRAPH}/drives/{drive_id}/root/delta"
+        params = {"$select": "id,name,lastModifiedDateTime,size,webUrl,file,folder,parentReference"}
+
+    print("  Syncing SharePoint/OneDrive...", file=sys.stderr)
+    try:
+        items, new_delta = _paginate_delta(url, token_getter, params)
+    except requests.HTTPError as e:
+        if e.response.status_code == 410:
+            print("  SharePoint deltaLink expired (410) — resetting.", file=sys.stderr)
+            state.setdefault("sharepoint", {}).pop("deltaLink", None)
+            url = f"{GRAPH}/drives/{drive_id}/root/delta"
+            params = {"$select": "id,name,lastModifiedDateTime,size,webUrl,file,folder,parentReference"}
+            items, new_delta = _paginate_delta(url, token_getter, params)
+        else:
+            raise
+
+    today = datetime.now(tz)
+    since_cutoff = (_since_dt(since_days)).strftime("%Y-%m-%d")
+    path  = _md_path("sharepoint", today)
+
+    # Build a set of all known idhashes across all sharepoint files (cross-day dedup)
+    sp_dir = DATA_DIR / "sharepoint"
+    known_idhashes = set()
+    if sp_dir.exists():
+        import glob as _glob
+        for md_file in _glob.glob(str(sp_dir / "**" / "*.md"), recursive=True):
+            try:
+                text = Path(md_file).read_text(encoding="utf-8")
+                for match in re.finditer(r"idhash: ([a-f0-9]+)", text):
+                    known_idhashes.add(match.group(1))
+            except OSError:
+                pass
+
+    lines = []
+    for item in items:
+        if item.get("@removed") or item.get("folder"):
+            continue
+        modified = item.get("lastModifiedDateTime", "")[:10]
+        # Skip items not modified within the since window (e.g. initial full enumeration)
+        if modified and modified < since_cutoff:
+            continue
+        item_id  = item.get("id", "")
+        if _id_hash(item_id) in known_idhashes:
+            continue
+        name     = item.get("name", "")
+        url_link = item.get("webUrl", "")
+        size     = item.get("size", 0)
+        parent   = (item.get("parentReference") or {}).get("path", "").replace("/drive/root:", "")
+        lines.append(f"- id: {item_id} [{name}]({url_link}) `{parent}/{name}` ({size:,} bytes) modified {modified}")
+
+    if lines:
+        md = (f"---\nsource: o365-sharepoint\ndate: {today.strftime('%Y-%m-%d')}\n---\n\n"
+              f"## SharePoint/OneDrive Changes\n\n" + "\n".join(lines))
+        _append_md(path, md)
+
+    if new_delta:
+        state.setdefault("sharepoint", {})["deltaLink"] = new_delta
+    state.setdefault("sharepoint", {})["lastSync"] = datetime.now(pytz.utc).isoformat()
+    count = len(lines)
+    print(f"  SharePoint: {count} changed files", file=sys.stderr)
+    return count
+
+
+def sync_onedrive(state, since_days=DEFAULT_SINCE, verbose=False):
+    return sync_sharepoint(state, since_days, verbose)
+
+
+# ── Sync: All ────────────────────────────────────────────────────────────────
+
+def cmd_sync(args):
+    with SyncLock():
+        state   = _load_state()
+        sources = (["mail", "calendar", "teams", "sharepoint"]
+                   if args.source == "all" else [args.source])
+
+        if args.reset:
+            for source in sources:
+                state.pop(source, None)
+            print(f"  State cleared for: {', '.join(sources)}", file=sys.stderr)
+
+        fns     = {"mail": sync_mail, "calendar": sync_calendar,
+                   "teams": sync_teams, "sharepoint": sync_sharepoint,
+                   "onedrive": sync_onedrive}
+        total   = 0
+        for source in sources:
+            try:
+                total += fns[source](state, since_days=args.since, verbose=args.verbose)
+            except Exception as e:
+                print(f"  {source} sync failed: {e}", file=sys.stderr)
+                if args.verbose:
+                    import traceback; traceback.print_exc()
+            _save_state(state)
+        print(f"Sync complete — {total} total items.", file=sys.stderr)
+
+
+# ── Interactive: Mail ─────────────────────────────────────────────────────────
+
+def cmd_mail(args):
+    token_getter = get_app_token
+    params = {"$select": "subject,from,receivedDateTime,importance,isRead,bodyPreview,body,hasAttachments"}
+    filters, searches = [], []
+    if args.unread:    filters.append("isRead eq false")
+    if args.important: filters.append("importance eq 'high'")
+    if args.query:     searches.append(f'"{args.query}"')
+    if args.from_user: searches.append(f'"{args.from_user}"')
+    if searches: params["$search"] = " AND ".join(searches)
+    else:        params["$orderby"] = "receivedDateTime desc"
+    if filters:  params["$filter"] = " and ".join(filters)
+    if args.max: params["$top"] = args.max
+
+    emails = list(_paginate(f"{GRAPH}/users/{EMAIL_ADDRESS}/messages", token_getter, params))
+    if args.json: print(json.dumps(emails, indent=2)); return
+    for e in emails:
+        sender = e.get("from", {}).get("emailAddress", {})
+        flag   = "* " if e.get("importance") == "high" else ""
+        unread = "[UNREAD] " if not e.get("isRead") else ""
+        attach = " [ATTACH]" if e.get("hasAttachments") else ""
+        print(f"{unread}{flag}{sender.get('name','?')} -- {e.get('subject','(no subject)')}{attach}")
+        print(f"  {e.get('receivedDateTime','')[:16]}")
+        # Show full body if available, otherwise bodyPreview
+        body_obj = e.get("body", {})
+        content = body_obj.get("content", e.get("bodyPreview", ""))
+        if body_obj.get("contentType") == "html":
+            content = _strip_html(content)
+        if content:
+            # Truncate for display unless --json
+            print(f"  {content[:200]}{'...' if len(content) > 200 else ''}")
+        print()
+
+
+def cmd_send(args):
+    token_getter = get_app_token
+    to  = [{"emailAddress": {"address": a.strip()}} for a in args.to.split(",")]
+    cc  = [{"emailAddress": {"address": a.strip()}} for a in args.cc.split(",")] if args.cc else []
+    msg = {"subject": args.subject,
+           "body": {"contentType": "HTML" if args.html else "Text", "content": args.body},
+           "toRecipients": to}
+    if cc: msg["ccRecipients"] = cc
+    if args.importance: msg["importance"] = args.importance
+    if args.reply_to:
+        _post(f"{GRAPH}/users/{EMAIL_ADDRESS}/messages/{args.reply_to}/reply",
+              token_getter, {"message": msg, "comment": args.body})
+    elif args.draft:
+        msg["isDraft"] = True
+        r = _post(f"{GRAPH}/users/{EMAIL_ADDRESS}/messages", token_getter, msg)
+        print(f"Draft created (ID: {r.json().get('id','')[:20]}...)")
+        return
+    else:
+        _post(f"{GRAPH}/users/{EMAIL_ADDRESS}/sendMail", token_getter,
+              {"message": msg, "saveToSentItems": True})
+    print(f"Email sent to {args.to}")
+
+
+# ── Interactive: Calendar ─────────────────────────────────────────────────────
+
+def cmd_calendar(args):
+    token_getter = get_app_token
+    tz    = pytz.timezone(TZ)
+    start = (datetime.fromisoformat(args.from_date).astimezone(tz) if args.from_date
+             else datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0))
+    end   = (datetime.fromisoformat(args.to_date).astimezone(tz) if args.to_date
+             else start + timedelta(days=7))
+    params = {"startDateTime": start.isoformat(), "endDateTime": end.isoformat(),
+              "$select": "subject,start,end,isAllDay,location,organizer,isCancelled",
+              "$orderby": "start/dateTime"}
+    events = [e for e in _paginate(f"{GRAPH}/users/{EMAIL_ADDRESS}/calendar/calendarView",
+                                   token_getter, params)
+              if not e.get("isCancelled")]
+    if args.json: print(json.dumps(events, indent=2)); return
+    for e in events:
+        subject = e.get("subject", "(no subject)")
+        if e.get("isAllDay"):
+            print(f"All day -- {subject}")
+        else:
+            t = datetime.fromisoformat(e["start"]["dateTime"].split(".")[0])
+            print(f"{t.strftime('%-I:%M %p')} -- {subject}")
+        loc = e.get("location", {}).get("displayName", "")
+        if loc: print(f"  {loc}")
+        print()
+
+
+def cmd_event(args):
+    token_getter = get_app_token
+    event = {"subject": args.subject,
+             "start": {"dateTime": args.start, "timeZone": "Eastern Standard Time"},
+             "end":   {"dateTime": args.end,   "timeZone": "Eastern Standard Time"}}
+    if args.body:      event["body"] = {"contentType": "HTML" if args.html else "Text", "content": args.body}
+    if args.location:  event["location"] = {"displayName": args.location}
+    if args.attendees: event["attendees"] = [{"emailAddress": {"address": a.strip()}, "type": "required"}
+                                              for a in args.attendees.split(",")]
+    if args.teams:
+        event["isOnlineMeeting"] = True
+        event["onlineMeetingProvider"] = "teamsForBusiness"
+    r = _post(f"{GRAPH}/users/{EMAIL_ADDRESS}/events", token_getter, event)
+    evt = r.json()
+    print(f"Created: {evt.get('subject')}")
+    if evt.get("onlineMeeting"):
+        print(f"Teams: {evt['onlineMeeting'].get('joinUrl','')}")
+
+
+def cmd_cancel(args):
+    token = get_app_token()
+    url = f"{GRAPH}/users/{EMAIL_ADDRESS}/events/{args.event_id}"
+    if args.cancel:
+        _post(f"{url}/cancel", get_app_token, {"comment": args.comment or "Meeting cancelled"})
+    else:
+        requests.delete(url, headers={"Authorization": f"Bearer {token}"}, timeout=30).raise_for_status()
+    print("Event deleted/cancelled")
+
+
+def cmd_availability(args):
+    r = _post(f"{GRAPH}/users/{EMAIL_ADDRESS}/calendar/getSchedule", get_app_token, {
+        "schedules": [a.strip() for a in args.users.split(",")],
+        "startTime": {"dateTime": args.start, "timeZone": "Eastern Standard Time"},
+        "endTime":   {"dateTime": args.end,   "timeZone": "Eastern Standard Time"},
+        "availabilityViewInterval": args.interval or 30,
+    })
+    for s in r.json().get("value", []):
+        print(f"\n=== {s.get('scheduleId','')} ===")
+        print(f"  {s.get('availabilityView','')}")
+        for item in s.get("scheduleItems", []):
+            print(f"  {item.get('start',{}).get('dateTime','')[:16]} -- "
+                  f"{item.get('end',{}).get('dateTime','')[:16]} | "
+                  f"{item.get('status','')} | {item.get('subject','(private)')}")
+
+
+# ── Interactive: Teams ────────────────────────────────────────────────────────
+
+def cmd_teams(args):
+    chats = list(_paginate(f"{GRAPH}/users/{EMAIL_ADDRESS}/chats", get_app_token,
+                           {"$expand": "lastMessagePreview", "$top": 50}))
+    if args.json: print(json.dumps(chats, indent=2)); return
+    for c in chats[:args.max or 20]:
+        last    = c.get("lastMessagePreview") or {}
+        ts      = last.get("createdDateTime", "")[:16]
+        preview = ((last.get("body") or {}).get("content", ""))[:80]
+        topic   = c.get("topic") or c.get("chatType", "?")
+        print(f"{ts}  {topic}")
+        if preview: print(f"  {preview}")
+        print(f"  ID: {c['id']}")
+        print()
+
+
+def cmd_teams_send(args):
+    _post(f"{GRAPH}/me/chats/{args.chat_id}/messages", get_delegated_token,
+          {"body": {"contentType": "html" if args.html else "text", "content": args.message}})
+    print("Teams message sent")
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def main():
+    p   = argparse.ArgumentParser(description="Edwin O365 Connector")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    # sync
+    s = sub.add_parser("sync", help="Incremental sync to data/o365/")
+    s.add_argument("source", choices=["all", "mail", "calendar", "teams", "sharepoint", "onedrive"])
+    s.add_argument("--since", type=int, default=DEFAULT_SINCE,
+                   help=f"Days back for initial/reset sync (default {DEFAULT_SINCE})")
+    s.add_argument("--reset", action="store_true",
+                   help="Clear saved state and re-fetch from --since days back")
+    s.add_argument("--verbose", action="store_true")
+    s.set_defaults(func=cmd_sync)
+
+    # mail
+    m = sub.add_parser("mail"); m.set_defaults(func=cmd_mail)
+    m.add_argument("--query"); m.add_argument("--from-user")
+    m.add_argument("--unread", action="store_true"); m.add_argument("--important", action="store_true")
+    m.add_argument("--max", type=int); m.add_argument("--json", action="store_true")
+
+    # send
+    snd = sub.add_parser("send"); snd.set_defaults(func=cmd_send)
+    snd.add_argument("--to", required=True); snd.add_argument("--cc")
+    snd.add_argument("--subject", required=True); snd.add_argument("--body", required=True)
+    snd.add_argument("--html", action="store_true")
+    snd.add_argument("--importance", choices=["low", "normal", "high"])
+    snd.add_argument("--draft", action="store_true"); snd.add_argument("--reply-to")
+
+    # calendar
+    cal = sub.add_parser("calendar"); cal.set_defaults(func=cmd_calendar)
+    cal.add_argument("--from-date"); cal.add_argument("--to-date")
+    cal.add_argument("--json", action="store_true")
+
+    # event
+    ev = sub.add_parser("event"); ev.set_defaults(func=cmd_event)
+    ev.add_argument("--subject", required=True); ev.add_argument("--start", required=True)
+    ev.add_argument("--end", required=True); ev.add_argument("--body")
+    ev.add_argument("--html", action="store_true"); ev.add_argument("--location")
+    ev.add_argument("--attendees"); ev.add_argument("--teams", action="store_true")
+
+    # cancel
+    cn = sub.add_parser("cancel"); cn.set_defaults(func=cmd_cancel)
+    cn.add_argument("event_id"); cn.add_argument("--cancel", action="store_true")
+    cn.add_argument("--comment")
+
+    # availability
+    av = sub.add_parser("availability"); av.set_defaults(func=cmd_availability)
+    av.add_argument("--users", required=True); av.add_argument("--start", required=True)
+    av.add_argument("--end", required=True); av.add_argument("--interval", type=int)
+
+    # teams
+    t = sub.add_parser("teams"); t.set_defaults(func=cmd_teams)
+    t.add_argument("--max", type=int); t.add_argument("--json", action="store_true")
+
+    # teams-send
+    ts = sub.add_parser("teams-send"); ts.set_defaults(func=cmd_teams_send)
+    ts.add_argument("--chat-id", required=True); ts.add_argument("--message", required=True)
+    ts.add_argument("--html", action="store_true")
+
+    args = p.parse_args()
+    try:
+        args.func(args)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        import traceback; traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

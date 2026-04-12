@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+"""
+Edwin Calls Connector — macOS Call History database archiver
+
+Modes:
+  sync <source>   — incremental extraction to data/calls/
+  status          — show last sync times
+
+Sources: calls, all
+  "all" = calls (only source for now)
+
+Database: ~/Library/Application Support/CallHistoryDB/CallHistory.storedata (read-only)
+  Synced via iCloud from iPhone.
+"""
+
+import os
+import sys
+import json
+import argparse
+import fcntl
+import tempfile
+import hashlib
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from collections import defaultdict
+import pytz
+
+
+# -- Config --------------------------------------------------------------------
+
+EDWIN_HOME      = Path(os.environ.get("EDWIN_HOME", Path(__file__).resolve().parent.parent.parent))
+
+DB_PATH         = Path.home() / "Library" / "Application Support" / "CallHistoryDB" / "CallHistory.storedata"
+REGISTRY_DB     = EDWIN_HOME / "data" / "identity" / "registry.db"
+TZ              = os.environ.get("EDWIN_TZ", "America/New_York")
+DATA_DIR        = EDWIN_HOME / "data" / "calls"
+STATE_FILE      = DATA_DIR / ".sync-state.json"
+LOCK_FILE       = DATA_DIR / ".sync.lock"
+DEFAULT_SINCE   = 30  # days back for initial sync
+
+# CoreData epoch offset: 978307200 seconds between Unix epoch and 2001-01-01
+COREDATA_EPOCH_OFFSET = 978307200
+
+# Call type mapping
+CALL_TYPES = {
+    1: "Phone",
+    8: "FaceTime Audio",
+    16: "FaceTime Video",
+}
+
+
+# -- Lockfile ------------------------------------------------------------------
+
+class SyncLock:
+    """Prevents concurrent sync runs via exclusive file lock."""
+    def __init__(self):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self._f = None
+
+    def __enter__(self):
+        self._f = open(LOCK_FILE, "w")
+        try:
+            fcntl.flock(self._f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Another sync is already running — exiting.", file=sys.stderr)
+            sys.exit(0)
+        self._f.write(str(os.getpid()))
+        self._f.flush()
+        return self
+
+    def __exit__(self, *_):
+        if self._f:
+            fcntl.flock(self._f, fcntl.LOCK_UN)
+            self._f.close()
+
+
+# -- State management ---------------------------------------------------------
+
+def _load_state():
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except json.JSONDecodeError:
+            print("  State file corrupted — starting fresh.", file=sys.stderr)
+    return {}
+
+
+def _save_state(state):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write(STATE_FILE, json.dumps(state, indent=2))
+
+
+def _atomic_write(path: Path, content: str):
+    """Write to temp file then rename — prevents corruption on power loss."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# -- Markdown helpers ----------------------------------------------------------
+
+def _id_hash(item_id: str) -> str:
+    return hashlib.sha1(item_id.encode()).hexdigest()[:16]
+
+
+def _format_duration(seconds):
+    """Format seconds into human-readable duration."""
+    if not seconds or seconds <= 0:
+        return "0s"
+    minutes = int(seconds) // 60
+    secs = int(seconds) % 60
+    if minutes >= 60:
+        hours = minutes // 60
+        remaining = minutes % 60
+        if remaining:
+            return f"{hours}h {remaining}m"
+        return f"{hours}h"
+    if minutes > 0:
+        return f"{minutes}m {secs}s" if secs else f"{minutes}m"
+    return f"{secs}s"
+
+
+def _day_path(day_str: str) -> Path:
+    """Path for a daily calls file: data/calls/YYYY-MM/YYYY-MM-DD.md"""
+    month = day_str[:7]
+    folder = DATA_DIR / month
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / f"{day_str}.md"
+
+
+# -- Database helpers ----------------------------------------------------------
+
+def _connect_db():
+    """Open CallHistory database in read-only mode."""
+    import sqlite3
+    if not DB_PATH.exists():
+        print(f"CallHistory database not found at {DB_PATH}", file=sys.stderr)
+        sys.exit(1)
+    uri = f"file:{DB_PATH}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _coredata_to_datetime(coredata_ts, tz):
+    """Convert CoreData timestamp to timezone-aware datetime."""
+    if coredata_ts is None:
+        return None
+    unix_ts = coredata_ts + COREDATA_EPOCH_OFFSET
+    return datetime.fromtimestamp(unix_ts, tz=tz)
+
+
+# -- Identity Registry (lazy) --------------------------------------------------
+
+_registry_conn = None
+
+def _resolve_identity(handle: str) -> str:
+    """Resolve a phone number to a display name via identity registry.
+    Returns the resolved name or the original handle if not found."""
+    global _registry_conn
+    if not handle or handle == "Unknown":
+        return handle
+    if not REGISTRY_DB.exists():
+        return handle
+    try:
+        import sqlite3 as _sqlite3
+        if _registry_conn is None:
+            _registry_conn = _sqlite3.connect(str(REGISTRY_DB))
+            _registry_conn.row_factory = _sqlite3.Row
+        row = _registry_conn.execute(
+            "SELECT p.display_name FROM aliases a JOIN canonical_people p ON a.canonical_id = p.id "
+            "WHERE a.alias_value = ? COLLATE NOCASE", (handle,)
+        ).fetchone()
+        if row:
+            return row["display_name"]
+        # Try with/without +1 prefix
+        if handle.startswith("+1") and len(handle) > 2:
+            row = _registry_conn.execute(
+                "SELECT p.display_name FROM aliases a JOIN canonical_people p ON a.canonical_id = p.id "
+                "WHERE a.alias_value = ? AND a.alias_type = 'phone'", (handle[2:],)
+            ).fetchone()
+            if row:
+                return row["display_name"]
+    except Exception:
+        pass
+    return handle
+
+
+# -- Sync ----------------------------------------------------------------------
+
+CALLS_QUERY = """
+SELECT
+    c.ZDATE,
+    c.ZADDRESS,
+    h.ZNORMALIZEDVALUE as HANDLE_NUMBER,
+    c.ZNAME,
+    c.ZORIGINATED,
+    c.ZANSWERED,
+    CAST(c.ZDURATION AS INTEGER) as duration,
+    c.ZCALLTYPE,
+    c.ZUNIQUE_ID
+FROM ZCALLRECORD c
+LEFT JOIN Z_2REMOTEPARTICIPANTHANDLES j ON j.Z_2REMOTEPARTICIPANTCALLS = c.Z_PK
+LEFT JOIN ZHANDLE h ON h.Z_PK = j.Z_4REMOTEPARTICIPANTHANDLES
+WHERE c.ZDATE >= ?
+ORDER BY c.ZDATE ASC
+"""
+
+
+def sync_calls(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = False):
+    """Sync call records from CallHistory database."""
+    tz = pytz.timezone(TZ)
+
+    # Determine date boundary
+    call_state = state.get("calls", {})
+    last_sync_coredata = call_state.get("lastSyncCoreData")
+    if last_sync_coredata is not None:
+        cutoff = float(last_sync_coredata)
+        print(f"  Syncing calls since last sync...", file=sys.stderr)
+    else:
+        since_dt = datetime.now(timezone.utc) - timedelta(days=since_days)
+        cutoff = since_dt.timestamp() - COREDATA_EPOCH_OFFSET
+        print(f"  Backfilling calls {since_days} days...", file=sys.stderr)
+
+    if verbose:
+        print(f"  Identity registry: {'available' if REGISTRY_DB.exists() else 'not found'}", file=sys.stderr)
+
+    conn = _connect_db()
+    try:
+        rows = conn.execute(CALLS_QUERY, (cutoff,)).fetchall()
+        if verbose:
+            print(f"  Found {len(rows)} call records in range", file=sys.stderr)
+
+        # Group by day -- dedup since ZHANDLE join can produce multiple rows per call
+        daily_calls = defaultdict(list)
+        seen_ids = set()
+        max_coredata = cutoff
+
+        for row in rows:
+            unique_id = row["ZUNIQUE_ID"] or f"{row['ZDATE']}-{row['ZADDRESS'] or ''}"
+            if unique_id in seen_ids:
+                continue
+            seen_ids.add(unique_id)
+
+            dt = _coredata_to_datetime(row["ZDATE"], tz)
+            if dt is None:
+                continue
+            day_key = dt.strftime("%Y-%m-%d")
+
+            # Use normalized handle number (from ZHANDLE join), fall back to ZADDRESS
+            address = row["HANDLE_NUMBER"] or row["ZADDRESS"] or ""
+
+            # Resolve caller name: DB name → identity registry → raw address
+            name = row["ZNAME"] or _resolve_identity(address) or "Unknown"
+
+            # Direction and status
+            duration = row["duration"] or 0
+            if row["ZORIGINATED"]:
+                direction = "outgoing"
+            else:
+                direction = "incoming"
+            # Only mark as missed if no duration -- a call with duration connected
+            if not row["ZANSWERED"] and duration == 0:
+                direction = "missed"
+
+            # Call type
+            call_type = CALL_TYPES.get(row["ZCALLTYPE"], f"type-{row['ZCALLTYPE']}")
+
+            daily_calls[day_key].append({
+                "dt": dt,
+                "name": name,
+                "address": address,
+                "direction": direction,
+                "duration": row["duration"] or 0,
+                "call_type": call_type,
+                "unique_id": unique_id,
+            })
+
+            if row["ZDATE"] > max_coredata:
+                max_coredata = row["ZDATE"]
+
+        # Merge with existing daily files to avoid overwriting full-day data
+        # on incremental syncs that only pick up new records
+        for day in sorted(daily_calls.keys()):
+            filepath = _day_path(day)
+            if filepath.exists():
+                # Parse existing idhashes to detect duplicates
+                existing_ids = set()
+                for line in filepath.read_text().splitlines():
+                    if line.startswith("<!-- idhash:"):
+                        existing_ids.add(line.strip())
+                if existing_ids:
+                    # Re-read existing calls from the DB for this full day
+                    day_start_dt = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=tz)
+                    day_end_dt = day_start_dt + timedelta(days=1)
+                    day_start_cd = day_start_dt.astimezone(pytz.utc).timestamp() - COREDATA_EPOCH_OFFSET
+                    day_end_cd = day_end_dt.astimezone(pytz.utc).timestamp() - COREDATA_EPOCH_OFFSET
+                    full_day_rows = conn.execute(
+                        CALLS_QUERY.replace("WHERE c.ZDATE >= ?", "WHERE c.ZDATE >= ? AND c.ZDATE < ?"),
+                        (day_start_cd, day_end_cd)
+                    ).fetchall()
+                    full_day_seen = set()
+                    full_day_calls = []
+                    for row in full_day_rows:
+                        uid = row["ZUNIQUE_ID"] or f"{row['ZDATE']}-{row['ZADDRESS'] or ''}"
+                        if uid in full_day_seen:
+                            continue
+                        full_day_seen.add(uid)
+                        dt = _coredata_to_datetime(row["ZDATE"], tz)
+                        if dt is None:
+                            continue
+                        address = row["HANDLE_NUMBER"] or row["ZADDRESS"] or ""
+                        name = row["ZNAME"] or _resolve_identity(address) or "Unknown"
+                        duration = row["duration"] or 0
+                        if row["ZORIGINATED"]:
+                            direction = "outgoing"
+                        else:
+                            direction = "incoming"
+                        if not row["ZANSWERED"] and duration == 0:
+                            direction = "missed"
+                        call_type = CALL_TYPES.get(row["ZCALLTYPE"], f"type-{row['ZCALLTYPE']}")
+                        full_day_calls.append({
+                            "dt": dt, "name": name, "address": address,
+                            "direction": direction, "duration": duration,
+                            "call_type": call_type, "unique_id": uid,
+                        })
+                    if full_day_calls:
+                        daily_calls[day] = full_day_calls
+
+        # Write daily files
+        written = 0
+        for day in sorted(daily_calls.keys()):
+            calls = daily_calls[day]
+            call_count = len(calls)
+            total_duration = sum(c["duration"] for c in calls)
+
+            id_str = f"calls-{day}"
+            lines = [
+                "---",
+                "source: calls",
+                f"date: {day}",
+                f"idhash: {_id_hash(id_str)}",
+                f"call_count: {call_count}",
+                "---",
+                "",
+                f"# Calls — {day}",
+                "",
+                "### Call Log",
+                f"*Calls ({day}, {call_count} calls, {_format_duration(total_duration)} total)*",
+                "",
+            ]
+
+            for call in calls:
+                idhash = f"<!-- idhash: {_id_hash(call['unique_id'])} -->"
+                time_str = call["dt"].strftime("%I:%M %p").lstrip("0")
+                dur_str = _format_duration(call["duration"])
+
+                # Show address in parens if name differs
+                name_str = call["name"]
+                if call["address"] and call["name"] != call["address"]:
+                    name_str = f"{call['name']}"
+
+                lines.append(idhash)
+                lines.append(f"- **{time_str}** — {name_str} ({call['direction']}, {dur_str}, {call['call_type']})")
+
+            lines.append("")
+            content = "\n".join(lines)
+
+            filepath = _day_path(day)
+            _atomic_write(filepath, content)
+            written += 1
+            if verbose:
+                print(f"    {day}: {call_count} calls", file=sys.stderr)
+
+        print(f"  Calls: {written} days written ({len(rows)} call records)",
+              file=sys.stderr)
+
+        # Update state
+        max_dt = _coredata_to_datetime(max_coredata, pytz.utc)
+        state["calls"] = {
+            "lastSyncCoreData": str(max_coredata),
+            "lastSync": max_dt.isoformat() if max_dt else "",
+        }
+
+    finally:
+        conn.close()
+
+    return written
+
+
+# -- Commands ------------------------------------------------------------------
+
+def cmd_sync(args):
+    if not DB_PATH.exists():
+        print(f"CallHistory database not found at {DB_PATH}", file=sys.stderr)
+        sys.exit(1)
+
+    with SyncLock():
+        state = _load_state()
+        sources = ["calls"] if args.source == "all" else [args.source]
+
+        if args.reset:
+            for source in sources:
+                state.pop(source, None)
+            print(f"  State cleared for: {', '.join(sources)}", file=sys.stderr)
+
+        fns = {"calls": sync_calls}
+        total = 0
+        for source in sources:
+            try:
+                total += fns[source](state, since_days=args.since, verbose=args.verbose)
+            except Exception as e:
+                print(f"  {source} sync failed: {e}", file=sys.stderr)
+                if args.verbose:
+                    import traceback; traceback.print_exc()
+            _save_state(state)
+        print(f"Sync complete — {total} total items.", file=sys.stderr)
+
+
+def cmd_status(args):
+    print("Calls Sync Status")
+    print("=" * 40)
+    state = {}
+    if STATE_FILE.exists():
+        try:
+            state = json.loads(STATE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            print("  State file corrupted")
+
+    for source in ("calls",):
+        info = state.get(source, {})
+        if isinstance(info, dict) and "lastSync" in info:
+            print(f"  {source:12s}  last sync: {info['lastSync']}")
+        else:
+            print(f"  {source:12s}  (not synced)")
+
+    # File counts
+    print()
+    total_files = len(list(DATA_DIR.rglob("*.md")))
+    print(f"  daily files    {total_files} on disk")
+    print()
+
+    # Database info
+    if DB_PATH.exists():
+        try:
+            conn = _connect_db()
+            total = conn.execute("SELECT COUNT(*) FROM ZCALLRECORD").fetchone()[0]
+            conn.close()
+            print(f"  Database: {total:,} call records")
+        except Exception as e:
+            print(f"  Database: error reading ({e})")
+    else:
+        print(f"  Database: not found at {DB_PATH}")
+    print()
+
+
+# -- CLI -----------------------------------------------------------------------
+
+def main():
+    p   = argparse.ArgumentParser(description="Edwin Calls Connector")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    # sync
+    s = sub.add_parser("sync", help="Sync to data/calls/")
+    s.add_argument("source", choices=["all", "calls"])
+    s.add_argument("--since", type=int, default=DEFAULT_SINCE,
+                   help=f"Days back for initial/reset sync (default {DEFAULT_SINCE})")
+    s.add_argument("--reset", action="store_true",
+                   help="Clear saved state and re-fetch from --since days back")
+    s.add_argument("--verbose", action="store_true")
+    s.set_defaults(func=cmd_sync)
+
+    # status
+    st = sub.add_parser("status", help="Show last sync times and file counts")
+    st.set_defaults(func=cmd_status)
+
+    args = p.parse_args()
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        import traceback; traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

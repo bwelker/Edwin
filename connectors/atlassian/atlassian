@@ -1,0 +1,1268 @@
+#!/usr/bin/env python3
+"""
+Edwin Atlassian Connector — Bitbucket + Jira + Confluence archiver
+
+Modes:
+  sync <source>   — incremental extraction to data/atlassian/
+  status          — show last sync times
+
+Sources: bitbucket, jira, confluence, all
+
+APIs:
+  Bitbucket: REST v2 (Basic auth with app password)
+  Jira:      REST v3 (Basic auth with API token)
+  Confluence: REST v2 (Basic auth with API token)
+"""
+
+import os
+import sys
+import json
+import argparse
+import base64
+import fcntl
+import tempfile
+import hashlib
+import html
+import html.parser
+import re
+import time
+import urllib.request
+import urllib.error
+import urllib.parse
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from collections import defaultdict
+import pytz
+
+
+# -- Config --------------------------------------------------------------------
+
+EDWIN_HOME      = Path(os.environ.get("EDWIN_HOME", Path(__file__).resolve().parent.parent.parent))
+
+TZ              = os.environ.get("EDWIN_TZ", "America/New_York")
+DATA_DIR        = EDWIN_HOME / "data" / "atlassian"
+STATE_FILE      = DATA_DIR / ".sync-state.json"
+LOCK_FILE       = DATA_DIR / ".sync.lock"
+ENV_FILE        = Path(__file__).resolve().parent.parent.parent / ".env"
+DEFAULT_SINCE   = 30  # days back for initial sync
+
+
+def _load_env():
+    """Load credentials from ~/.edwin/credentials/ (preferred) or .env (fallback)."""
+    env = {}
+    # Load .env first as base, then overlay with credentials dir
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, val = line.partition("=")
+                env[key.strip()] = val.strip()
+    # Override with ~/.edwin/credentials/ files (atlassian + bitbucket)
+    cred_base = Path.home() / ".edwin" / "credentials"
+    for subdir in ["atlassian", "bitbucket"]:
+        cred_file = cred_base / subdir / "env"
+        if cred_file.exists():
+            for line in cred_file.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, _, val = line.partition("=")
+                    env[key.strip()] = val.strip()
+    return env
+
+
+# -- Lockfile ------------------------------------------------------------------
+
+class SyncLock:
+    def __init__(self):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self._f = None
+
+    def __enter__(self):
+        self._f = open(LOCK_FILE, "w")
+        try:
+            fcntl.flock(self._f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Another sync is already running — exiting.", file=sys.stderr)
+            sys.exit(0)
+        self._f.write(str(os.getpid()))
+        self._f.flush()
+        return self
+
+    def __exit__(self, *_):
+        if self._f:
+            fcntl.flock(self._f, fcntl.LOCK_UN)
+            self._f.close()
+
+
+# -- State management ---------------------------------------------------------
+
+def _load_state():
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except json.JSONDecodeError:
+            print("  State file corrupted — starting fresh.", file=sys.stderr)
+    return {}
+
+
+def _save_state(state):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write(STATE_FILE, json.dumps(state, indent=2))
+
+
+def _atomic_write(path: Path, content: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# -- Markdown helpers ----------------------------------------------------------
+
+def _id_hash(item_id: str) -> str:
+    return hashlib.sha1(item_id.encode()).hexdigest()[:16]
+
+
+def _sanitize_filename(name: str, max_len: int = 60) -> str:
+    s = re.sub(r'[/\\:*?"<>|]', '-', name)
+    s = re.sub(r'-{2,}', '-', s).strip(' .-')
+    if len(s) > max_len:
+        s = s[:max_len].rsplit('-', 1)[0]
+    return s or "untitled"
+
+
+def _try_parse_iso(s):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _format_date(dt_str):
+    dt = _try_parse_iso(dt_str)
+    return dt.strftime("%Y-%m-%d") if dt else ""
+
+
+def _format_datetime(dt_str):
+    dt = _try_parse_iso(dt_str)
+    return dt.strftime("%Y-%m-%d %H:%M") if dt else ""
+
+
+def _get_user(obj):
+    if not obj:
+        return "Unknown"
+    if isinstance(obj, dict):
+        return obj.get("display_name") or obj.get("displayName") or obj.get("name") or obj.get("nickname") or "Unknown"
+    return str(obj)
+
+
+def _strip_html(text):
+    """Strip HTML tags for plain text."""
+    if not text:
+        return ""
+    return re.sub(r'<[^>]+>', '', text).strip()
+
+
+# -- HTTP client with retry ----------------------------------------------------
+
+class APIClient:
+    """HTTP client with rate limiting and retry."""
+
+    def __init__(self, auth_header: str, base_delay: float = 0.5):
+        self._auth = auth_header
+        self._base_delay = base_delay
+        self._last_req = 0.0
+        self._backoff = 2.0
+
+    def get(self, url: str, max_retries: int = 5):
+        for attempt in range(max_retries):
+            # Rate limit
+            elapsed = time.time() - self._last_req
+            if elapsed < self._base_delay:
+                time.sleep(self._base_delay - elapsed)
+
+            req = urllib.request.Request(url, headers={
+                "Authorization": self._auth,
+                "Accept": "application/json",
+            })
+            self._last_req = time.time()
+
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    self._backoff = 2.0
+                    return json.loads(resp.read().decode())
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    retry_after = e.headers.get("Retry-After")
+                    wait = int(retry_after) if retry_after else min(self._backoff, 120)
+                    self._backoff = min(self._backoff * 2, 120)
+                    print(f"    Rate limited — waiting {wait}s", file=sys.stderr)
+                    time.sleep(wait)
+                    continue
+                elif e.code == 404:
+                    return None
+                elif e.code in (500, 502, 503, 504):
+                    wait = 2 ** attempt
+                    print(f"    Server error {e.code} — retrying in {wait}s", file=sys.stderr)
+                    time.sleep(wait)
+                    continue
+                else:
+                    print(f"    HTTP {e.code}: {e.reason}", file=sys.stderr)
+                    return None
+            except (urllib.error.URLError, TimeoutError) as e:
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                print(f"    Network error: {e}", file=sys.stderr)
+                return None
+        return None
+
+    def paginate(self, url: str, key: str = "values") -> list:
+        results = []
+        while url:
+            data = self.get(url)
+            if not data:
+                break
+            results.extend(data.get(key, data.get("results", [])))
+            url = data.get("next") or data.get("_links", {}).get("next")
+        return results
+
+
+# ==============================================================================
+# BITBUCKET
+# ==============================================================================
+
+def sync_bitbucket(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = False):
+    env = _load_env()
+    username = env.get("BITBUCKET_USERNAME")
+    app_pw = env.get("BITBUCKET_APP_PASSWORD")
+    workspace = env.get("BITBUCKET_WORKSPACE")
+    if not all([username, app_pw, workspace]):
+        print("  Bitbucket: missing BITBUCKET_USERNAME/APP_PASSWORD/WORKSPACE in .env", file=sys.stderr)
+        return 0
+
+    auth = "Basic " + base64.b64encode(f"{username}:{app_pw}".encode()).decode()
+    client = APIClient(auth, base_delay=0.5)
+    api = "https://api.bitbucket.org/2.0"
+
+    bb_state = state.get("bitbucket", {})
+    since_dt = datetime.now(timezone.utc) - timedelta(days=since_days)
+
+    # Get repositories
+    print(f"  Fetching repositories for workspace '{workspace}'...", file=sys.stderr)
+    repos = client.paginate(f"{api}/repositories/{workspace}?pagelen=100")
+    print(f"  Found {len(repos)} repositories", file=sys.stderr)
+
+    total_prs = 0
+    total_commits = 0
+    bb_dir = DATA_DIR / "bitbucket"
+
+    for repo in repos:
+        slug = repo.get("slug")
+        if not slug:
+            continue
+
+        # Per-repo incremental: check last sync
+        repo_state = bb_state.get("repos", {}).get(slug, {})
+        last_sync_str = repo_state.get("lastSync")
+        if last_sync_str:
+            effective_since = _try_parse_iso(last_sync_str) or since_dt
+        else:
+            effective_since = since_dt
+
+        # --- PRs ---
+        pr_url = f"{api}/repositories/{workspace}/{slug}/pullrequests?state=all&pagelen=50"
+        prs = []
+        page_url = pr_url
+        while page_url:
+            data = client.get(page_url)
+            if not data:
+                break
+            for pr in data.get("values", []):
+                updated = _try_parse_iso(pr.get("updated_on") or pr.get("created_on"))
+                if updated and updated < effective_since:
+                    page_url = None
+                    break
+                prs.append(pr)
+            else:
+                page_url = data.get("next")
+                continue
+            break
+
+        if prs and verbose:
+            print(f"    {slug}: {len(prs)} PRs", file=sys.stderr)
+
+        pr_dir = bb_dir / slug / "pulls"
+        for pr in prs:
+            pr_id = pr.get("id")
+            # Get comments and activity
+            comments = client.paginate(
+                f"{api}/repositories/{workspace}/{slug}/pullrequests/{pr_id}/comments?pagelen=100")
+            # Activity endpoint doesn't support pagelen param
+            activity_data = client.get(
+                f"{api}/repositories/{workspace}/{slug}/pullrequests/{pr_id}/activity")
+            activity = activity_data.get("values", []) if activity_data else []
+
+            content = _format_bitbucket_pr(pr, comments, activity, workspace, slug)
+            filepath = pr_dir / f"PR-{pr_id}.md"
+            _atomic_write(filepath, content)
+            total_prs += 1
+
+        # --- Commits ---
+        commits = []
+        commit_url = f"{api}/repositories/{workspace}/{slug}/commits?pagelen=100"
+        page_url = commit_url
+        while page_url:
+            data = client.get(page_url)
+            if not data:
+                break
+            for commit in data.get("values", []):
+                commit_dt = _try_parse_iso(commit.get("date"))
+                if commit_dt and commit_dt < effective_since:
+                    page_url = None
+                    break
+                commits.append(commit)
+            else:
+                page_url = data.get("next")
+                continue
+            break
+
+        if commits:
+            # Group by month
+            by_month = defaultdict(list)
+            for commit in commits:
+                dt = _try_parse_iso(commit.get("date"))
+                if dt:
+                    by_month[dt.strftime("%Y-%m")].append(commit)
+
+            commit_dir = bb_dir / slug / "commits"
+            for month, month_commits in by_month.items():
+                content = _format_bitbucket_commits(month_commits, workspace, slug, month)
+                _atomic_write(commit_dir / f"{month}.md", content)
+                total_commits += len(month_commits)
+
+            if verbose:
+                print(f"    {slug}: {len(commits)} commits", file=sys.stderr)
+
+        # Update per-repo state
+        if "repos" not in bb_state:
+            bb_state["repos"] = {}
+        bb_state["repos"][slug] = {"lastSync": datetime.now(timezone.utc).isoformat()}
+
+    print(f"  Bitbucket: {total_prs} PRs, {total_commits} commits across {len(repos)} repos",
+          file=sys.stderr)
+
+    bb_state["lastSync"] = datetime.now(timezone.utc).isoformat()
+    state["bitbucket"] = bb_state
+    return total_prs + total_commits
+
+
+def _format_bitbucket_pr(pr, comments, activity, workspace, slug):
+    pr_id = pr.get("id")
+    title = pr.get("title", "Untitled")
+    author = _get_user(pr.get("author"))
+    pr_state = pr.get("state", "UNKNOWN")
+    created = pr.get("created_on", "")
+    updated = pr.get("updated_on", "")
+    description = pr.get("description", "") or ""
+
+    reviewers = [_get_user(r) for r in pr.get("reviewers", [])]
+    approvals = [_get_user(p.get("user")) for p in pr.get("participants", []) if p.get("approved")]
+
+    idhash = _id_hash(f"bitbucket-pr-{workspace}-{slug}-{pr_id}")
+    lines = [
+        "---",
+        "source: bitbucket",
+        f"workspace: {workspace}",
+        f"repo: {slug}",
+        "type: pull_request",
+        f"pr_id: {pr_id}",
+        f"idhash: {idhash}",
+        f"state: {pr_state}",
+        f"author: {author}",
+        f"created: {_format_date(created)}",
+        f"updated: {_format_date(updated)}",
+        "---",
+        "",
+        f"# PR #{pr_id}: {title}",
+        f"*PR #{pr_id} in {slug} ({workspace}, {pr_state}, {_format_date(created)})*",
+        "",
+        f"**Author:** {author}",
+        f"**State:** {pr_state}",
+        f"**Created:** {_format_datetime(created)}",
+        f"**Updated:** {_format_datetime(updated)}",
+    ]
+    if reviewers:
+        lines.append(f"**Reviewers:** {', '.join(reviewers)}")
+    if approvals:
+        lines.append(f"**Approved by:** {', '.join(approvals)}")
+    lines.append("")
+
+    if description.strip():
+        lines.extend(["## Description", f"*PR #{pr_id}: {title} ({slug}, {_format_date(created)})*", "", description.strip(), ""])
+
+    if comments:
+        lines.extend(["## Comments", f"*PR #{pr_id}: {title} ({slug}, {_format_date(created)})*", ""])
+        for c in comments:
+            c_author = _get_user(c.get("user"))
+            c_date = _format_datetime(c.get("created_on"))
+            c_text = c.get("content", {}).get("raw", "") or ""
+            inline = c.get("inline")
+            if inline:
+                path = inline.get("path", "")
+                line_num = inline.get("to") or inline.get("from", "")
+                lines.append(f"### Inline: {path}:{line_num}")
+            c_idhash = _id_hash(f"bb-comment-{c.get('id', '')}")
+            lines.append(f"<!-- idhash: {c_idhash} -->")
+            lines.append(f"**{c_author}** ({c_date}):")
+            lines.append(f"> {c_text.replace(chr(10), chr(10) + '> ')}")
+            lines.append("")
+
+    approval_events = [a for a in activity if a.get("approval")]
+    if approval_events:
+        lines.extend(["## Approvals", f"*PR #{pr_id}: {title} ({slug}, {_format_date(created)})*", ""])
+        for event in approval_events:
+            approval = event.get("approval", {})
+            lines.append(f"- **{_get_user(approval.get('user'))}** approved on {_format_datetime(approval.get('date'))}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _format_bitbucket_commits(commits, workspace, slug, month):
+    idhash = _id_hash(f"bitbucket-commits-{workspace}-{slug}-{month}")
+    lines = [
+        "---",
+        "source: bitbucket",
+        f"workspace: {workspace}",
+        f"repo: {slug}",
+        "type: commits",
+        f"year_month: {month}",
+        f"idhash: {idhash}",
+        f"commit_count: {len(commits)}",
+        "---",
+        "",
+        f"# Commits — {slug} — {month}",
+        "",
+    ]
+    for commit in commits:
+        c_hash = commit.get("hash", "")[:12]
+        message = (commit.get("message", "") or "").strip()
+        author = _get_user(commit.get("author", {}).get("user"))
+        date = _format_datetime(commit.get("date"))
+        first_line = message.split("\n")[0] if message else "No message"
+
+        c_idhash = _id_hash(f"bb-commit-{commit.get('hash', '')}")
+        lines.append(f"## `{c_hash}` — {first_line}")
+        lines.append(f"*Commit in {slug} ({workspace}, {date})*")
+        lines.append("")
+        lines.append(f"<!-- idhash: {c_idhash} -->")
+        lines.append(f"**Author:** {author}  ")
+        lines.append(f"**Date:** {date}")
+        if "\n" in message:
+            lines.extend(["", f"```", message, "```"])
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ==============================================================================
+# JIRA
+# ==============================================================================
+
+def _adf_to_markdown(node, depth=0):
+    """Convert Atlassian Document Format to markdown."""
+    if node is None:
+        return ""
+    if isinstance(node, str):
+        return node
+    if not isinstance(node, dict):
+        return str(node)
+
+    ntype = node.get("type", "")
+    content = node.get("content", [])
+    text = node.get("text", "")
+
+    if ntype == "text":
+        result = text
+        for mark in node.get("marks", []):
+            mt = mark.get("type", "")
+            if mt == "strong":
+                result = f"**{result}**"
+            elif mt == "em":
+                result = f"*{result}*"
+            elif mt == "code":
+                result = f"`{result}`"
+            elif mt == "link":
+                href = mark.get("attrs", {}).get("href", "")
+                result = f"[{result}]({href})"
+        return result
+    if ntype == "paragraph":
+        return "".join(_adf_to_markdown(c, depth) for c in content) + "\n\n"
+    if ntype == "heading":
+        level = node.get("attrs", {}).get("level", 1)
+        inner = "".join(_adf_to_markdown(c, depth) for c in content)
+        return "#" * level + " " + inner + "\n\n"
+    if ntype == "bulletList":
+        items = []
+        for item in content:
+            ic = "".join(_adf_to_markdown(c, depth + 1) for c in item.get("content", []))
+            items.append("  " * depth + "- " + ic.strip())
+        return "\n".join(items) + "\n\n"
+    if ntype == "orderedList":
+        items = []
+        for i, item in enumerate(content, 1):
+            ic = "".join(_adf_to_markdown(c, depth + 1) for c in item.get("content", []))
+            items.append("  " * depth + f"{i}. " + ic.strip())
+        return "\n".join(items) + "\n\n"
+    if ntype == "listItem":
+        return "".join(_adf_to_markdown(c, depth) for c in content)
+    if ntype == "codeBlock":
+        lang = node.get("attrs", {}).get("language", "")
+        inner = "".join(_adf_to_markdown(c, depth) for c in content)
+        return f"```{lang}\n{inner}\n```\n\n"
+    if ntype == "blockquote":
+        inner = "".join(_adf_to_markdown(c, depth) for c in content)
+        return "\n".join("> " + line for line in inner.strip().split("\n")) + "\n\n"
+    if ntype == "table":
+        rows = []
+        for row in content:
+            cells = []
+            for cell in row.get("content", []):
+                ct = "".join(_adf_to_markdown(c, depth) for c in cell.get("content", []))
+                cells.append(ct.strip().replace("\n", " "))
+            rows.append("| " + " | ".join(cells) + " |")
+        if rows:
+            ncols = max(r.count("|") - 1 for r in rows)
+            rows.insert(1, "| " + " | ".join(["---"] * ncols) + " |")
+        return "\n".join(rows) + "\n\n"
+    if ntype == "panel":
+        pt = node.get("attrs", {}).get("panelType", "info")
+        inner = "".join(_adf_to_markdown(c, depth) for c in content)
+        return f"> **{pt.upper()}:** {inner.strip()}\n\n"
+    if ntype == "inlineCard":
+        url = node.get("attrs", {}).get("url", "")
+        return f"[{url}]({url})"
+    if ntype == "mention":
+        return "@" + node.get("attrs", {}).get("text", "user")
+    if ntype == "hardBreak":
+        return "\n"
+    if ntype == "rule":
+        return "---\n\n"
+    if content:
+        return "".join(_adf_to_markdown(c, depth) for c in content)
+    return text
+
+
+def _convert_description(desc):
+    if desc is None:
+        return ""
+    if isinstance(desc, str):
+        return desc
+    if isinstance(desc, dict):
+        return _adf_to_markdown(desc).strip()
+    return str(desc)
+
+
+def sync_jira(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = False):
+    env = _load_env()
+    email = env.get("ATLASSIAN_EMAIL")
+    token = env.get("ATLASSIAN_API_TOKEN")
+    site = env.get("ATLASSIAN_SITE")
+    if not all([email, token, site]):
+        print("  Jira: missing ATLASSIAN_EMAIL/API_TOKEN/SITE in .env", file=sys.stderr)
+        return 0
+
+    auth = "Basic " + base64.b64encode(f"{email}:{token}".encode()).decode()
+    client = APIClient(auth, base_delay=1.0)
+    base_url = f"https://{site}"
+
+    jira_state = state.get("jira", {})
+    since_dt = datetime.now(timezone.utc) - timedelta(days=since_days)
+
+    # Get projects
+    print(f"  Fetching Jira projects...", file=sys.stderr)
+    projects = []
+    start_at = 0
+    while True:
+        data = client.get(f"{base_url}/rest/api/3/project/search?startAt={start_at}&maxResults=100")
+        if not data or "values" not in data:
+            break
+        projects.extend(data["values"])
+        if data.get("isLast", True) or len(data["values"]) < 100:
+            break
+        start_at += 100
+
+    print(f"  Found {len(projects)} projects", file=sys.stderr)
+
+    total_tickets = 0
+    jira_dir = DATA_DIR / "jira"
+
+    for project in projects:
+        proj_key = project.get("key", "")
+        proj_name = project.get("name", "")
+
+        # Build JQL with incremental sync
+        proj_state = jira_state.get("projects", {}).get(proj_key, {})
+        last_sync_str = proj_state.get("lastSync")
+        if last_sync_str:
+            effective_since = last_sync_str[:10]  # YYYY-MM-DD
+        else:
+            effective_since = since_dt.strftime("%Y-%m-%d")
+
+        jql = f'project = "{proj_key}" AND updated >= "{effective_since}" ORDER BY updated ASC'
+
+        # Paginate with v3 search/jql (uses nextPageToken, no total count)
+        proj_dir = jira_dir / proj_key
+        project_count = 0
+        next_token = None
+        first_page = True
+
+        while True:
+            params = {"jql": jql, "maxResults": 100, "fields": "key"}
+            if next_token:
+                params["nextPageToken"] = next_token
+            search_url = f"{base_url}/rest/api/3/search/jql?{urllib.parse.urlencode(params)}"
+            result = client.get(search_url)
+            if not result or "issues" not in result:
+                break
+            issues = result["issues"]
+            if not issues:
+                break
+
+            if first_page and verbose:
+                print(f"    {proj_key} ({proj_name}): fetching tickets...", file=sys.stderr)
+                first_page = False
+
+            for stub in issues:
+                issue_key = stub.get("key", "")
+                # Full issue details
+                issue = client.get(f"{base_url}/rest/api/3/issue/{issue_key}")
+                if not issue:
+                    continue
+
+                # Comments
+                comments = []
+                cdata = client.get(f"{base_url}/rest/api/3/issue/{issue_key}/comment?maxResults=100")
+                if cdata:
+                    comments = cdata.get("comments", [])
+
+                # Changelog (status transitions)
+                changelog = []
+                cldata = client.get(f"{base_url}/rest/api/3/issue/{issue_key}/changelog?maxResults=100")
+                if cldata:
+                    changelog = cldata.get("values", [])
+
+                content = _format_jira_issue(issue, comments, changelog)
+                _atomic_write(proj_dir / f"{issue_key}.md", content)
+                project_count += 1
+                total_tickets += 1
+
+                if verbose and project_count % 25 == 0:
+                    print(f"      {proj_key}: {project_count}...", file=sys.stderr)
+
+            # v3 search/jql uses nextPageToken for pagination
+            if result.get("isLast", True):
+                break
+            next_token = result.get("nextPageToken")
+            if not next_token:
+                break
+
+        # Update per-project state
+        if "projects" not in jira_state:
+            jira_state["projects"] = {}
+        jira_state["projects"][proj_key] = {
+            "lastSync": datetime.now(timezone.utc).isoformat(),
+            "count": project_count,
+        }
+
+    print(f"  Jira: {total_tickets} tickets across {len(projects)} projects",
+          file=sys.stderr)
+
+    jira_state["lastSync"] = datetime.now(timezone.utc).isoformat()
+    state["jira"] = jira_state
+    return total_tickets
+
+
+def _format_jira_issue(issue, comments, changelog):
+    fields = issue.get("fields", {})
+    key = issue.get("key", "UNKNOWN")
+    summary = fields.get("summary", "No summary")
+    status = (fields.get("status") or {}).get("name", "Unknown")
+    priority = (fields.get("priority") or {}).get("name", "None")
+    issue_type = (fields.get("issuetype") or {}).get("name", "Unknown")
+    assignee = _get_user(fields.get("assignee"))
+    reporter = _get_user(fields.get("reporter"))
+    created = _format_date(fields.get("created", ""))
+    updated = _format_date(fields.get("updated", ""))
+    resolved = _format_date(fields.get("resolutiondate", ""))
+    proj_key = (fields.get("project") or {}).get("key", "")
+    description = _convert_description(fields.get("description"))
+    labels = fields.get("labels", []) or []
+    components = [c.get("name", "") for c in (fields.get("components") or [])]
+
+    idhash = _id_hash(f"jira-{key}")
+    lines = [
+        "---",
+        "source: jira",
+        f"project: {proj_key}",
+        f"key: {key}",
+        f"idhash: {idhash}",
+        f"status: {status}",
+        f"assignee: {assignee}",
+        f"type: {issue_type}",
+        f"priority: {priority}",
+        f"created: {created}",
+        f"updated: {updated}",
+        "---",
+        "",
+        f"# [{key}] {summary}",
+        f"*{key}: {summary} ({status}, {assignee})*",
+        "",
+        "## Metadata",
+        f"*{key}: {summary} ({status}, {assignee})*",
+        "",
+        f"- **Type:** {issue_type}",
+        f"- **Status:** {status}",
+        f"- **Priority:** {priority}",
+        f"- **Assignee:** {assignee}",
+        f"- **Reporter:** {reporter}",
+        f"- **Created:** {created}",
+        f"- **Updated:** {updated}",
+    ]
+    if resolved:
+        lines.append(f"- **Resolved:** {resolved}")
+    if labels:
+        lines.append(f"- **Labels:** {', '.join(labels)}")
+    if components:
+        lines.append(f"- **Components:** {', '.join(components)}")
+    lines.append("")
+
+    lines.extend([
+        "## Description",
+        f"*{key}: {summary} ({status}, {assignee})*",
+        "",
+        description if description else "*No description provided*",
+        "",
+    ])
+
+    # Status transitions
+    transitions = []
+    for entry in changelog:
+        entry_created = entry.get("created", "")
+        entry_author = _get_user(entry.get("author"))
+        for item in entry.get("items", []):
+            if item.get("field") == "status":
+                transitions.append({
+                    "date": _format_datetime(entry_created),
+                    "from": item.get("fromString", ""),
+                    "to": item.get("toString", ""),
+                    "author": entry_author,
+                })
+
+    if transitions:
+        lines.extend([
+            "## Status History",
+            f"*{key}: {summary} ({status}, {assignee})*",
+            "",
+        ])
+        for t in transitions:
+            lines.append(f"- **{t['date']}**: {t['from']} → {t['to']} (by {t['author']})")
+        lines.append("")
+
+    if comments:
+        lines.extend([
+            "## Comments",
+            f"*{key}: {summary} ({status}, {assignee})*",
+            "",
+        ])
+        for c in comments:
+            c_author = _get_user(c.get("author"))
+            c_date = _format_datetime(c.get("created", ""))
+            c_body = _convert_description(c.get("body"))
+            c_idhash = _id_hash(f"jira-comment-{c.get('id', '')}")
+            lines.append(f"### {c_author} — {c_date}")
+            lines.append(f"<!-- idhash: {c_idhash} -->")
+            lines.append("")
+            lines.append(c_body if c_body else "*Empty comment*")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+# ==============================================================================
+# CONFLUENCE
+# ==============================================================================
+
+class _ConfluenceHTMLParser(html.parser.HTMLParser):
+    """Parse Confluence storage format (XHTML) to markdown."""
+
+    def __init__(self):
+        super().__init__()
+        self.output = []
+        self.current_text = []
+        self.in_table = False
+        self.table_rows = []
+        self.current_row = []
+        self.current_cell = []
+        self.in_code = False
+        self.in_pre = False
+        self.list_stack = []
+        self.in_link = False
+        self.link_href = ""
+        self.link_text = []
+        self.heading_level = 0
+        self.in_strong = False
+        self.in_em = False
+        self.skip_content = False
+
+    def handle_starttag(self, tag, attrs):
+        attrs_dict = dict(attrs)
+        if tag in ("script", "style", "ac:parameter"):
+            self.skip_content = True
+            return
+        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            self._flush()
+            self.heading_level = int(tag[1])
+        elif tag == "p":
+            self._flush()
+        elif tag == "br":
+            self.current_text.append("\n")
+        elif tag in ("strong", "b"):
+            self.in_strong = True
+        elif tag in ("em", "i"):
+            self.in_em = True
+        elif tag == "a":
+            self.in_link = True
+            self.link_href = attrs_dict.get("href", "")
+            self.link_text = []
+        elif tag == "code":
+            self.in_code = True
+            self.current_text.append("`")
+        elif tag == "pre":
+            self._flush()
+            self.in_pre = True
+            self.output.append("\n```\n")
+        elif tag in ("ul", "ol"):
+            self._flush()
+            self.list_stack.append({"type": tag, "count": 0})
+        elif tag == "li":
+            self._flush()
+            if self.list_stack:
+                indent = "  " * (len(self.list_stack) - 1)
+                info = self.list_stack[-1]
+                if info["type"] == "ol":
+                    info["count"] += 1
+                    self.output.append(f"{indent}{info['count']}. ")
+                else:
+                    self.output.append(f"{indent}- ")
+        elif tag == "table":
+            self._flush()
+            self.in_table = True
+            self.table_rows = []
+        elif tag == "tr":
+            self.current_row = []
+        elif tag in ("td", "th"):
+            self.current_cell = []
+        elif tag == "blockquote":
+            self._flush()
+            self.output.append("> ")
+        elif tag == "hr":
+            self._flush()
+            self.output.append("\n---\n")
+        elif tag == "ac:structured-macro":
+            if attrs_dict.get("ac:name", "") in ("code", "noformat"):
+                self._flush()
+                self.in_pre = True
+                self.output.append("\n```\n")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "ac:parameter"):
+            self.skip_content = False
+            return
+        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            text = "".join(self.current_text).strip()
+            self.current_text = []
+            if text:
+                self.output.append(f"\n{'#' * self.heading_level} {text}\n\n")
+            self.heading_level = 0
+        elif tag == "p":
+            self._flush()
+            self.output.append("\n\n")
+        elif tag in ("strong", "b"):
+            self.in_strong = False
+        elif tag in ("em", "i"):
+            self.in_em = False
+        elif tag == "a":
+            if self.in_link:
+                text = "".join(self.link_text).strip()
+                if self.link_href and text:
+                    self.current_text.append(f"[{text}]({self.link_href})")
+                elif text:
+                    self.current_text.append(text)
+                self.in_link = False
+                self.link_text = []
+        elif tag == "code":
+            self.current_text.append("`")
+            self.in_code = False
+        elif tag == "pre":
+            self._flush()
+            self.output.append("\n```\n\n")
+            self.in_pre = False
+        elif tag in ("ul", "ol"):
+            self._flush()
+            if self.list_stack:
+                self.list_stack.pop()
+            self.output.append("\n")
+        elif tag == "li":
+            self._flush()
+            self.output.append("\n")
+        elif tag in ("td", "th"):
+            self.current_row.append("".join(self.current_cell).strip())
+        elif tag == "tr":
+            if self.current_row:
+                self.table_rows.append(self.current_row)
+        elif tag == "table":
+            self._render_table()
+            self.in_table = False
+        elif tag == "ac:structured-macro":
+            if self.in_pre:
+                self._flush()
+                self.output.append("\n```\n\n")
+                self.in_pre = False
+
+    def handle_data(self, data):
+        if self.skip_content:
+            return
+        if self.in_link:
+            self.link_text.append(data)
+        elif self.in_table and self.current_row is not None:
+            self.current_cell.append(data)
+        else:
+            text = data
+            if self.in_strong:
+                text = f"**{data}**"
+            if self.in_em:
+                text = f"*{data}*"
+            self.current_text.append(text)
+
+    def _flush(self):
+        if self.current_text:
+            self.output.append(re.sub(r'\s+', ' ', "".join(self.current_text)))
+            self.current_text = []
+
+    def _render_table(self):
+        if not self.table_rows:
+            return
+        ncols = max(len(r) for r in self.table_rows)
+        self.output.append("\n")
+        for i, row in enumerate(self.table_rows):
+            while len(row) < ncols:
+                row.append("")
+            self.output.append("| " + " | ".join(row) + " |\n")
+            if i == 0:
+                self.output.append("| " + " | ".join(["---"] * ncols) + " |\n")
+        self.output.append("\n")
+
+    def get_markdown(self):
+        self._flush()
+        text = "".join(self.output)
+        return re.sub(r'\n{3,}', '\n\n', text).strip()
+
+
+def _storage_to_markdown(storage):
+    if not storage:
+        return ""
+    storage = html.unescape(storage)
+    parser = _ConfluenceHTMLParser()
+    try:
+        parser.feed(storage)
+        return parser.get_markdown()
+    except Exception:
+        return re.sub(r'<[^>]+>', ' ', storage).strip()
+
+
+def sync_confluence(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = False):
+    env = _load_env()
+    email = env.get("ATLASSIAN_EMAIL")
+    token = env.get("ATLASSIAN_API_TOKEN")
+    site = env.get("ATLASSIAN_SITE")
+    if not all([email, token, site]):
+        print("  Confluence: missing ATLASSIAN_EMAIL/API_TOKEN/SITE in .env", file=sys.stderr)
+        return 0
+
+    auth = "Basic " + base64.b64encode(f"{email}:{token}".encode()).decode()
+    client = APIClient(auth, base_delay=1.0)
+    api_v2 = f"https://{site}/wiki/api/v2"
+    api_v1 = f"https://{site}/wiki/rest/api"
+
+    conf_state = state.get("confluence", {})
+    since_dt = datetime.now(timezone.utc) - timedelta(days=since_days)
+
+    # Get spaces
+    print(f"  Fetching Confluence spaces...", file=sys.stderr)
+    spaces = []
+    url = f"{api_v2}/spaces?limit=250"
+    while url:
+        data = client.get(url)
+        if not data:
+            break
+        for space in data.get("results", []):
+            # Skip personal spaces
+            if space.get("key", "").startswith("~"):
+                continue
+            spaces.append(space)
+        url = data.get("_links", {}).get("next")
+        if url and not url.startswith("http"):
+            url = f"https://{site}/wiki/api/v2{url}" if "/api/v2" not in url else f"https://{site}{url}"
+
+    print(f"  Found {len(spaces)} spaces (excluding personal)", file=sys.stderr)
+
+    total_pages = 0
+    conf_dir = DATA_DIR / "confluence"
+
+    for space in spaces:
+        space_id = space.get("id")
+        space_key = space.get("key")
+        space_name = space.get("name", space_key)
+
+        # Per-space incremental
+        space_state = conf_state.get("spaces", {}).get(space_key, {})
+        last_sync_str = space_state.get("lastSync")
+        cutoff = _try_parse_iso(last_sync_str) or since_dt
+
+        # Get pages
+        pages = []
+        page_url = f"{api_v2}/spaces/{space_id}/pages?limit=250&body-format=storage"
+        while page_url:
+            data = client.get(page_url)
+            if not data:
+                break
+            for page in data.get("results", []):
+                updated_str = page.get("version", {}).get("createdAt", "")
+                updated = _try_parse_iso(updated_str)
+                if updated and updated < cutoff:
+                    continue
+                pages.append(page)
+            links = data.get("_links", {})
+            page_url = links.get("next")
+            if page_url and not page_url.startswith("http"):
+                page_url = f"https://{site}{page_url}"
+
+        # Get blog posts
+        blogs = []
+        blog_url = f"{api_v2}/spaces/{space_id}/blogposts?limit=250&body-format=storage"
+        while blog_url:
+            data = client.get(blog_url)
+            if not data:
+                break
+            for post in data.get("results", []):
+                updated_str = post.get("version", {}).get("createdAt", "")
+                updated = _try_parse_iso(updated_str)
+                if updated and updated < cutoff:
+                    continue
+                blogs.append(post)
+            links = data.get("_links", {})
+            blog_url = links.get("next")
+            if blog_url and not blog_url.startswith("http"):
+                blog_url = f"https://{site}{blog_url}"
+
+        all_items = [(p, "page") for p in pages] + [(b, "blogpost") for b in blogs]
+        if not all_items:
+            continue
+
+        if verbose:
+            print(f"    {space_key} ({space_name}): {len(pages)} pages, {len(blogs)} blogs", file=sys.stderr)
+
+        space_dir = conf_dir / space_key
+        for item, item_type in all_items:
+            page_id = item.get("id")
+            title = item.get("title", "Untitled")
+
+            # Get full body
+            body_storage = item.get("body", {}).get("storage", {}).get("value", "")
+            if not body_storage:
+                detail = client.get(f"{api_v2}/pages/{page_id}?body-format=storage")
+                if detail:
+                    body_storage = detail.get("body", {}).get("storage", {}).get("value", "")
+
+            body_md = _storage_to_markdown(body_storage)
+
+            # Get labels
+            labels_data = client.get(f"{api_v2}/pages/{page_id}/labels")
+            labels = [l.get("name", "") for l in (labels_data or {}).get("results", [])]
+
+            # Get comments via v1 API
+            comments = []
+            cdata = client.get(f"{api_v1}/content/{page_id}/child/comment?expand=body.storage,version", )
+            if cdata:
+                for c in cdata.get("results", []):
+                    comments.append({
+                        "author": c.get("version", {}).get("by", {}).get("displayName", "Unknown"),
+                        "created": c.get("version", {}).get("when", ""),
+                        "body": c.get("body", {}).get("storage", {}).get("value", ""),
+                    })
+
+            version = item.get("version", {})
+            slug = _sanitize_filename(title)
+            idhash = _id_hash(f"confluence-{space_key}-{page_id}")
+
+            lines = [
+                "---",
+                "source: confluence",
+                f"type: {item_type}",
+                f"space: {space_key}",
+                f"space_name: {space_name}",
+                f"page_id: {page_id}",
+                f"idhash: {idhash}",
+                f"title: {title}",
+                f"updated: {version.get('createdAt', '')}",
+                f"version: {version.get('number', 1)}",
+            ]
+            if labels:
+                lines.append(f"labels: {', '.join(labels)}")
+            lines.extend([
+                "---",
+                "",
+                f"# {title}",
+                f"*{title} ({space_key}, updated {_format_date(version.get('createdAt', ''))})*",
+                "",
+                body_md,
+            ])
+
+            if comments:
+                lines.extend(["", "---", "", "## Comments",
+                              f"*{title} ({space_key})*", ""])
+                for c in comments:
+                    c_body = _storage_to_markdown(c.get("body", ""))
+                    c_idhash = _id_hash(f"conf-comment-{page_id}-{c.get('created', '')}")
+                    lines.append(f"<!-- idhash: {c_idhash} -->")
+                    lines.append(f"**{c['author']}** ({_format_datetime(c['created'])}):")
+                    lines.append("")
+                    lines.append(c_body)
+                    lines.append("")
+
+            content = "\n".join(lines)
+            _atomic_write(space_dir / f"{page_id}-{slug}.md", content)
+            total_pages += 1
+
+        # Update per-space state
+        if "spaces" not in conf_state:
+            conf_state["spaces"] = {}
+        conf_state["spaces"][space_key] = {
+            "lastSync": datetime.now(timezone.utc).isoformat(),
+            "count": len(all_items),
+        }
+
+    print(f"  Confluence: {total_pages} pages across {len(spaces)} spaces",
+          file=sys.stderr)
+
+    conf_state["lastSync"] = datetime.now(timezone.utc).isoformat()
+    state["confluence"] = conf_state
+    return total_pages
+
+
+# ==============================================================================
+# COMMANDS
+# ==============================================================================
+
+def cmd_sync(args):
+    with SyncLock():
+        state = _load_state()
+        sources = ["bitbucket", "jira", "confluence"] if args.source == "all" else [args.source]
+
+        if args.reset:
+            for source in sources:
+                state.pop(source, None)
+            print(f"  State cleared for: {', '.join(sources)}", file=sys.stderr)
+
+        fns = {"bitbucket": sync_bitbucket, "jira": sync_jira, "confluence": sync_confluence}
+        total = 0
+        for source in sources:
+            try:
+                total += fns[source](state, since_days=args.since, verbose=args.verbose)
+            except Exception as e:
+                print(f"  {source} sync failed: {e}", file=sys.stderr)
+                if args.verbose:
+                    import traceback; traceback.print_exc()
+            _save_state(state)
+        print(f"Sync complete — {total} total items.", file=sys.stderr)
+
+
+def cmd_status(args):
+    print("Atlassian Sync Status")
+    print("=" * 40)
+    state = {}
+    if STATE_FILE.exists():
+        try:
+            state = json.loads(STATE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            print("  State file corrupted")
+
+    for source in ("bitbucket", "jira", "confluence"):
+        info = state.get(source, {})
+        if isinstance(info, dict) and "lastSync" in info:
+            print(f"\n  {source:12s}  last sync: {info['lastSync']}")
+            if source == "bitbucket" and "repos" in info:
+                print(f"  {'':12s}  repos: {len(info['repos'])}")
+            if source == "jira" and "projects" in info:
+                total = sum(p.get("count", 0) for p in info["projects"].values())
+                print(f"  {'':12s}  projects: {len(info['projects'])}, tickets: {total}")
+            if source == "confluence" and "spaces" in info:
+                total = sum(s.get("count", 0) for s in info["spaces"].values())
+                print(f"  {'':12s}  spaces: {len(info['spaces'])}, pages: {total}")
+        else:
+            print(f"\n  {source:12s}  (not synced)")
+
+    # File counts
+    print()
+    for subdir in ("bitbucket", "jira", "confluence"):
+        d = DATA_DIR / subdir
+        if d.exists():
+            files = list(d.rglob("*.md"))
+            print(f"  {subdir:12s}  {len(files)} files on disk")
+    print()
+
+
+# -- CLI -----------------------------------------------------------------------
+
+def main():
+    p   = argparse.ArgumentParser(description="Edwin Atlassian Connector")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    s = sub.add_parser("sync", help="Sync to data/atlassian/")
+    s.add_argument("source", choices=["all", "bitbucket", "jira", "confluence"])
+    s.add_argument("--since", type=int, default=DEFAULT_SINCE,
+                   help=f"Days back for initial/reset sync (default {DEFAULT_SINCE})")
+    s.add_argument("--reset", action="store_true",
+                   help="Clear saved state and re-fetch from --since days back")
+    s.add_argument("--verbose", action="store_true")
+    s.set_defaults(func=cmd_sync)
+
+    st = sub.add_parser("status", help="Show last sync times and file counts")
+    st.set_defaults(func=cmd_status)
+
+    args = p.parse_args()
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        import traceback; traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

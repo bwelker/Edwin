@@ -1,0 +1,40 @@
+# Edwin Shared Layer
+# Qdrant (vector store) + Neo4j (knowledge graph)
+# Start with: docker compose up -d
+
+services:
+  edwin-qdrant:
+    container_name: edwin-qdrant
+    image: qdrant/qdrant:latest
+    ports:
+      - "${QDRANT_PORT:-6380}:6333"
+      - "${QDRANT_GRPC:-6381}:6334"
+    volumes:
+      - ./data/.qdrant:/qdrant/storage
+    restart: unless-stopped
+
+  edwin-neo4j:
+    container_name: edwin-neo4j
+    image: neo4j:5
+    ports:
+      - "${NEO4J_WEB:-7476}:7474"
+      - "${NEO4J_BOLT:-7690}:7687"
+    volumes:
+      - ./data/.neo4j:/data
+    restart: unless-stopped
+    environment:
+      - NEO4J_AUTH=neo4j/changeme
+      - NEO4J_PLUGINS=["apoc"]
+
+  # Optional: Ollama in Docker (CPU-only, slower than native)
+  # Uncomment if you don't have native Ollama installed.
+  # Native Ollama (ollama.com) is recommended for GPU acceleration.
+  #
+  # edwin-ollama:
+  #   container_name: edwin-ollama
+  #   image: ollama/ollama:latest
+  #   ports:
+  #     - "11434:11434"
+  #   volumes:
+  #     - ./data/.ollama:/root/.ollama
+  #   restart: unless-stopped

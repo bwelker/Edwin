@@ -1,0 +1,602 @@
+#!/usr/bin/env python3
+"""Session Slicer -- split Claude Code JSONL session logs into 20-minute
+sliding-window time slices for better embedding and retrieval."""
+
+import hashlib
+import json
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+# Auto-detect EDWIN_HOME: env var > ~/Edwin
+EDWIN_HOME = Path(os.environ.get("EDWIN_HOME", Path.home() / "Edwin"))
+
+# Auto-detect the Claude Code project JSONL directory.
+# Looks for the project directory matching this EDWIN_HOME path.
+def _detect_jsonl_dir() -> Path:
+    """Find the Claude Code project JSONL dir for this Edwin instance."""
+    # Try env var first
+    env_dir = os.environ.get("SESSION_JSONL_DIR")
+    if env_dir:
+        return Path(env_dir)
+    # Auto-detect from EDWIN_HOME path: ~/.claude/projects/-<path-with-dashes>
+    claude_projects = Path.home() / ".claude" / "projects"
+    if claude_projects.exists():
+        # Convert EDWIN_HOME to the slug format Claude Code uses
+        home_str = str(EDWIN_HOME).replace("/", "-")
+        if home_str.startswith("-"):
+            candidate = claude_projects / home_str
+            if candidate.exists():
+                return candidate
+    # Fallback: just use the first project dir that exists
+    if claude_projects.exists():
+        for d in sorted(claude_projects.iterdir()):
+            if d.is_dir() and not d.name.startswith("."):
+                return d
+    return claude_projects
+
+JSONL_DIR = _detect_jsonl_dir()
+OUTPUT_DIR = EDWIN_HOME / "data" / "sessions" / "slices"
+SUBAGENT_OUTPUT_DIR = EDWIN_HOME / "data" / "sessions" / "subagent-slices"
+STATE_FILE = EDWIN_HOME / "tools" / "session-slicer" / ".slicer-state.json"
+SUBAGENT_STATE_FILE = EDWIN_HOME / "tools" / "session-slicer" / ".subagent-slicer-state.json"
+
+WINDOW_MINUTES = 10
+OVERLAP_MINUTES = 5
+MIN_MESSAGES = 3
+
+# Message types to skip
+SKIP_TYPES = {"queue-operation", "heartbeat", "bridge-status"}
+
+
+def load_state(state_file: Path = STATE_FILE) -> dict:
+    if state_file.exists():
+        return json.loads(state_file.read_text())
+    return {"files": {}}
+
+
+def save_state(state: dict, state_file: Path = STATE_FILE):
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state_file.write_text(json.dumps(state, indent=2))
+
+
+def file_hash(path: Path) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def parse_timestamp(ts_str: str) -> datetime:
+    """Parse ISO timestamp, handling Z suffix and various formats."""
+    ts_str = ts_str.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(ts_str)
+    except ValueError:
+        # Fallback: strip fractional seconds
+        if "." in ts_str:
+            base, frac = ts_str.split(".", 1)
+            # Keep timezone if present
+            if "+" in frac:
+                frac_part, tz = frac.split("+", 1)
+                ts_str = f"{base}+{tz}"
+            elif frac.endswith("+00:00"):
+                ts_str = base + "+00:00"
+            else:
+                ts_str = base
+        return datetime.fromisoformat(ts_str)
+
+
+def extract_messages(jsonl_path: Path, start_line: int = 0) -> list[dict]:
+    """Extract user/assistant messages with timestamps from a JSONL file."""
+    messages = []
+    with open(jsonl_path) as f:
+        for i, line in enumerate(f):
+            if i < start_line:
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            msg_type = obj.get("type", "")
+            if msg_type in SKIP_TYPES:
+                continue
+
+            # Must have a timestamp and a message with a role
+            ts_str = obj.get("timestamp")
+            msg = obj.get("message", {})
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role", "")
+            if role not in ("user", "assistant"):
+                continue
+            if not ts_str:
+                continue
+
+            try:
+                ts = parse_timestamp(ts_str)
+            except (ValueError, TypeError):
+                continue
+
+            content = msg.get("content", "")
+            session_id = obj.get("sessionId", "")
+
+            # Parse content blocks
+            parsed = parse_content(role, content)
+            if parsed:
+                messages.append({
+                    "timestamp": ts,
+                    "role": role,
+                    "content": parsed,
+                    "line": i,
+                    "session_id": session_id,
+                })
+
+    return messages
+
+
+def parse_content(role: str, content) -> str | None:
+    """Parse message content into readable text. Returns None if nothing useful."""
+    if isinstance(content, str):
+        text = content.strip()
+        return text if text else None
+
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type", "")
+
+            if btype == "text":
+                text = block.get("text", "").strip()
+                if text:
+                    parts.append(text)
+
+            elif btype == "tool_use":
+                name = block.get("name", "unknown")
+                inp = block.get("input", {})
+                # Summarize tool call -- just name and key args
+                summary = summarize_tool_call(name, inp)
+                parts.append(f"[Tool: {summary}]")
+
+            elif btype == "tool_result":
+                # Skip tool results -- too verbose
+                continue
+
+            elif btype == "thinking":
+                # Skip thinking blocks
+                continue
+
+        return "\n".join(parts) if parts else None
+
+    return None
+
+
+def summarize_tool_call(name: str, inp: dict) -> str:
+    """Create a brief summary of a tool call."""
+    if name in ("Read", "read"):
+        fp = inp.get("file_path", "")
+        if fp:
+            return f"Read({Path(fp).name})"
+        return "Read"
+
+    if name in ("Write", "write"):
+        fp = inp.get("file_path", "")
+        if fp:
+            return f"Write({Path(fp).name})"
+        return "Write"
+
+    if name in ("Edit", "edit"):
+        fp = inp.get("file_path", "")
+        if fp:
+            return f"Edit({Path(fp).name})"
+        return "Edit"
+
+    if name in ("Bash", "bash"):
+        cmd = inp.get("command", "")
+        if cmd:
+            # First 60 chars of command
+            return f"Bash({cmd[:60]})"
+        return "Bash"
+
+    if name in ("Grep", "grep"):
+        pattern = inp.get("pattern", "")
+        return f"Grep({pattern[:40]})"
+
+    if name in ("Glob", "glob"):
+        pattern = inp.get("pattern", "")
+        return f"Glob({pattern[:40]})"
+
+    if name == "Agent":
+        desc = inp.get("description", "")
+        return f"Agent({desc[:50]})"
+
+    # Generic: name + first string arg
+    for k, v in inp.items():
+        if isinstance(v, str) and v:
+            return f"{name}({v[:40]})"
+    return name
+
+
+def create_windows(messages: list[dict]) -> list[list[dict]]:
+    """Create sliding windows from sorted messages."""
+    if not messages:
+        return []
+
+    messages.sort(key=lambda m: m["timestamp"])
+    start_time = messages[0]["timestamp"]
+    end_time = messages[-1]["timestamp"]
+
+    windows = []
+    window_start = start_time
+
+    while window_start <= end_time:
+        window_end = window_start + timedelta(minutes=WINDOW_MINUTES)
+        window_msgs = [
+            m for m in messages
+            if window_start <= m["timestamp"] < window_end
+        ]
+        if len(window_msgs) >= MIN_MESSAGES:
+            windows.append(window_msgs)
+        window_start += timedelta(minutes=OVERLAP_MINUTES)
+
+    return windows
+
+
+def format_slice(window_msgs: list[dict], session_id: str) -> str:
+    """Format a window of messages as markdown with YAML frontmatter."""
+    start_ts = window_msgs[0]["timestamp"]
+    end_ts = window_msgs[-1]["timestamp"]
+
+    # Convert to local time for display
+    from zoneinfo import ZoneInfo
+    tz_name = os.environ.get("TZ", "America/New_York")
+    tz = ZoneInfo(tz_name)
+    start_local = start_ts.astimezone(tz)
+    end_local = end_ts.astimezone(tz)
+    date_str = start_local.strftime("%Y-%m-%d")
+
+    frontmatter = f"""---
+date: {date_str}
+start_time: {start_local.strftime("%H:%M")}
+end_time: {end_local.strftime("%H:%M")}
+session_id: {session_id}
+message_count: {len(window_msgs)}
+type: session-slice
+---"""
+
+    lines = [frontmatter, ""]
+    lines.append(f"# Session Slice -- {date_str} {start_local.strftime('%H:%M')}-{end_local.strftime('%H:%M')}")
+    lines.append("")
+
+    for msg in window_msgs:
+        msg_local = msg["timestamp"].astimezone(tz)
+        time_str = msg_local.strftime("%H:%M")
+        speaker = "User" if msg["role"] == "user" else "Edwin"
+        lines.append(f"**{speaker}** ({time_str}):")
+        lines.append("")
+        lines.append(msg["content"])
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def write_slice(window_msgs: list[dict], session_id: str,
+                 output_dir: Path = OUTPUT_DIR,
+                 prefix: str = "") -> Path | None:
+    """Write a slice file, return the path."""
+    from zoneinfo import ZoneInfo
+    tz_name = os.environ.get("TZ", "America/New_York")
+    tz = ZoneInfo(tz_name)
+
+    start_ts = window_msgs[0]["timestamp"].astimezone(tz)
+    end_ts = window_msgs[-1]["timestamp"].astimezone(tz)
+
+    date_dir = output_dir / start_ts.strftime("%Y-%m-%d")
+    date_dir.mkdir(parents=True, exist_ok=True)
+
+    base = f"{start_ts.strftime('%H%M')}-{end_ts.strftime('%H%M')}"
+    if prefix:
+        base = f"{prefix}-{base}"
+    filename = f"{base}.md"
+    filepath = date_dir / filename
+
+    content = format_slice(window_msgs, session_id)
+    filepath.write_text(content)
+    return filepath
+
+
+def process_jsonl(jsonl_path: Path, state: dict, force: bool = False,
+                   output_dir: Path = OUTPUT_DIR,
+                   key_override: str | None = None,
+                   slice_prefix: str = "") -> int:
+    """Process a single JSONL file. Returns number of slices created.
+
+    Args:
+        jsonl_path: Path to the JSONL file to slice
+        state: Slicer state dict (mutated in place)
+        force: Reprocess from line 0 even if unchanged
+        output_dir: Where to write slice files
+        key_override: Use this state key instead of jsonl_path.name (avoids
+                      collisions when multiple JSONLs share a basename, e.g.
+                      subagent files in different parent session directories).
+        slice_prefix: Optional filename prefix for slice files.
+    """
+    fname = key_override or jsonl_path.name
+    fhash = file_hash(jsonl_path)
+    file_state = state["files"].get(fname, {})
+
+    if not force and file_state.get("hash") == fhash:
+        return 0  # No changes
+
+    start_line = 0 if force else file_state.get("last_line", 0)
+    messages = extract_messages(jsonl_path, start_line=start_line)
+
+    if not messages:
+        # Update state even if no messages (file might be all system msgs)
+        state["files"][fname] = {
+            "hash": fhash,
+            "last_line": file_state.get("last_line", 0),
+            "slices": file_state.get("slices", 0),
+        }
+        return 0
+
+    session_id = messages[0].get("session_id", jsonl_path.stem)
+    windows = create_windows(messages)
+
+    slices_created = 0
+    for window in windows:
+        path = write_slice(window, session_id, output_dir=output_dir,
+                            prefix=slice_prefix)
+        if path:
+            slices_created += 1
+
+    # Update state
+    max_line = max(m["line"] for m in messages) + 1
+    prev_slices = file_state.get("slices", 0) if not force else 0
+    state["files"][fname] = {
+        "hash": fhash,
+        "last_line": max_line,
+        "slices": prev_slices + slices_created,
+    }
+
+    return slices_created
+
+
+def cmd_sync():
+    """Incremental sync -- process new/changed content."""
+    state = load_state()
+    jsonl_files = sorted(JSONL_DIR.glob("*.jsonl"))
+
+    if not jsonl_files:
+        print("No JSONL files found.")
+        return
+
+    total_slices = 0
+    processed = 0
+    for jf in jsonl_files:
+        n = process_jsonl(jf, state)
+        if n > 0:
+            processed += 1
+            total_slices += n
+
+    save_state(state)
+    print(f"OK")
+    print(f"Processed {processed} changed files, created {total_slices} new slices.")
+    print(f"Total files tracked: {len(state['files'])}")
+    print(f"Total slices in state: {sum(f.get('slices', 0) for f in state['files'].values())}")
+
+
+def cmd_reprocess():
+    """Full reprocess of all JSONLs."""
+    # Clear output directory
+    if OUTPUT_DIR.exists():
+        import shutil
+        shutil.rmtree(OUTPUT_DIR)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    state = {"files": {}}
+    jsonl_files = sorted(JSONL_DIR.glob("*.jsonl"))
+
+    if not jsonl_files:
+        print("No JSONL files found.")
+        return
+
+    total_slices = 0
+    for jf in jsonl_files:
+        n = process_jsonl(jf, state, force=True)
+        total_slices += n
+
+    save_state(state)
+
+    # Count date dirs and files
+    date_dirs = sorted(d for d in OUTPUT_DIR.iterdir() if d.is_dir())
+    total_files = sum(1 for d in date_dirs for f in d.glob("*.md"))
+
+    print(f"OK")
+    print(f"Reprocessed {len(jsonl_files)} JSONL files.")
+    print(f"Created {total_slices} slices across {len(date_dirs)} days.")
+    print(f"Output: {OUTPUT_DIR}")
+
+    if date_dirs:
+        print(f"Date range: {date_dirs[0].name} to {date_dirs[-1].name}")
+
+    # Total size
+    total_bytes = sum(f.stat().st_size for d in date_dirs for f in d.glob("*.md"))
+    if total_bytes > 1024 * 1024:
+        print(f"Total size: {total_bytes / (1024*1024):.1f} MB")
+    else:
+        print(f"Total size: {total_bytes / 1024:.1f} KB")
+
+
+def find_subagent_jsonls() -> list[tuple[Path, str]]:
+    """Return [(path, state_key)] for all subagent JSONLs.
+
+    State key encodes the parent session id + agent file basename so two
+    different parent sessions can have agents with same basename without
+    colliding.
+    """
+    out = []
+    for parent in JSONL_DIR.glob("*/subagents"):
+        if not parent.is_dir():
+            continue
+        parent_id = parent.parent.name
+        for jf in sorted(parent.glob("agent-*.jsonl")):
+            key = f"{parent_id}/{jf.name}"
+            out.append((jf, key))
+    return out
+
+
+def cmd_subagents_sync():
+    """Incremental subagent JSONL sync."""
+    state = load_state(SUBAGENT_STATE_FILE)
+    pairs = find_subagent_jsonls()
+    if not pairs:
+        print("No subagent JSONL files found.")
+        return
+
+    total_slices = 0
+    processed = 0
+    for jf, key in pairs:
+        # Use first 8 chars of agent id as a per-slice prefix to disambiguate
+        # slice filenames if multiple subagents wrote in the same time window
+        agent_id = jf.stem.replace("agent-", "")[:8]
+        n = process_jsonl(jf, state,
+                           output_dir=SUBAGENT_OUTPUT_DIR,
+                           key_override=key,
+                           slice_prefix=f"sub-{agent_id}")
+        if n > 0:
+            processed += 1
+            total_slices += n
+
+    save_state(state, SUBAGENT_STATE_FILE)
+    print("OK")
+    print(f"Processed {processed} changed subagent files, created {total_slices} new slices.")
+    print(f"Total subagent files tracked: {len(state['files'])}")
+    print(f"Total subagent slices in state: {sum(f.get('slices', 0) for f in state['files'].values())}")
+
+
+def cmd_subagents_reprocess():
+    """Full reprocess of all subagent JSONLs."""
+    if SUBAGENT_OUTPUT_DIR.exists():
+        import shutil
+        shutil.rmtree(SUBAGENT_OUTPUT_DIR)
+    SUBAGENT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    state = {"files": {}}
+    pairs = find_subagent_jsonls()
+    if not pairs:
+        print("No subagent JSONL files found.")
+        return
+
+    total_slices = 0
+    for jf, key in pairs:
+        agent_id = jf.stem.replace("agent-", "")[:8]
+        n = process_jsonl(jf, state, force=True,
+                           output_dir=SUBAGENT_OUTPUT_DIR,
+                           key_override=key,
+                           slice_prefix=f"sub-{agent_id}")
+        total_slices += n
+
+    save_state(state, SUBAGENT_STATE_FILE)
+
+    date_dirs = sorted(d for d in SUBAGENT_OUTPUT_DIR.iterdir() if d.is_dir())
+    total_files = sum(1 for d in date_dirs for f in d.glob("*.md"))
+
+    print("OK")
+    print(f"Reprocessed {len(pairs)} subagent JSONL files.")
+    print(f"Created {total_slices} slices across {len(date_dirs)} days.")
+    print(f"Output: {SUBAGENT_OUTPUT_DIR}")
+    if date_dirs:
+        print(f"Date range: {date_dirs[0].name} to {date_dirs[-1].name}")
+    total_bytes = sum(f.stat().st_size for d in date_dirs for f in d.glob("*.md"))
+    if total_bytes > 1024 * 1024:
+        print(f"Total size: {total_bytes / (1024*1024):.1f} MB")
+    else:
+        print(f"Total size: {total_bytes / 1024:.1f} KB")
+
+
+def cmd_subagents_status():
+    """Show subagent slicer stats."""
+    state = load_state(SUBAGENT_STATE_FILE)
+    pairs = find_subagent_jsonls()
+
+    print(f"Subagent JSONL source: {JSONL_DIR}/*/subagents/")
+    print(f"Output dir:            {SUBAGENT_OUTPUT_DIR}")
+    print(f"Subagent JSONL files found: {len(pairs)}")
+    print(f"Files tracked in state:     {len(state.get('files', {}))}")
+
+    total_slices = sum(f.get("slices", 0) for f in state.get("files", {}).values())
+    print(f"Total subagent slices in state: {total_slices}")
+
+    if SUBAGENT_OUTPUT_DIR.exists():
+        date_dirs = sorted(d for d in SUBAGENT_OUTPUT_DIR.iterdir() if d.is_dir())
+        total_files = sum(1 for d in date_dirs for f in d.glob("*.md"))
+        print(f"Slice files on disk:        {total_files}")
+        if date_dirs:
+            print(f"Date range:                 {date_dirs[0].name} to {date_dirs[-1].name}")
+
+
+def cmd_status():
+    """Show processing stats."""
+    state = load_state()
+    jsonl_files = sorted(JSONL_DIR.glob("*.jsonl"))
+
+    print(f"JSONL source: {JSONL_DIR}")
+    print(f"Output dir:   {OUTPUT_DIR}")
+    print(f"JSONL files found: {len(jsonl_files)}")
+    print(f"Files tracked in state: {len(state.get('files', {}))}")
+
+    total_slices = sum(f.get("slices", 0) for f in state.get("files", {}).values())
+    print(f"Total slices in state: {total_slices}")
+
+    if OUTPUT_DIR.exists():
+        date_dirs = sorted(d for d in OUTPUT_DIR.iterdir() if d.is_dir())
+        total_files = sum(1 for d in date_dirs for f in d.glob("*.md"))
+        print(f"Slice files on disk: {total_files}")
+        if date_dirs:
+            print(f"Date range: {date_dirs[0].name} to {date_dirs[-1].name}")
+        total_bytes = sum(f.stat().st_size for d in date_dirs for f in d.glob("*.md"))
+        if total_bytes > 1024 * 1024:
+            print(f"Total size: {total_bytes / (1024*1024):.1f} MB")
+        else:
+            print(f"Total size: {total_bytes / 1024:.1f} KB")
+    else:
+        print("No output directory yet.")
+
+
+def main():
+    USAGE = ("Usage: session-slicer <sync|reprocess|status|"
+             "subagents-sync|subagents-reprocess|subagents-status>")
+    if len(sys.argv) < 2:
+        print(USAGE)
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+    if cmd == "sync":
+        cmd_sync()
+    elif cmd == "reprocess":
+        cmd_reprocess()
+    elif cmd == "status":
+        cmd_status()
+    elif cmd == "subagents-sync":
+        cmd_subagents_sync()
+    elif cmd == "subagents-reprocess":
+        cmd_subagents_reprocess()
+    elif cmd == "subagents-status":
+        cmd_subagents_status()
+    else:
+        print(f"Unknown command: {cmd}")
+        print(USAGE)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

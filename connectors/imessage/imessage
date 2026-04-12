@@ -1,0 +1,767 @@
+#!/usr/bin/env python3
+"""
+Edwin iMessage Connector — macOS Messages database archiver
+
+Modes:
+  sync <source>   — incremental extraction to data/imessage/
+  status          — show last sync times
+
+Sources: messages, all
+  "all" = messages (only source for now)
+
+Database: ~/Library/Messages/chat.db (read-only, requires Full Disk Access)
+"""
+
+import os
+import sys
+import json
+import argparse
+import re
+import sqlite3
+import fcntl
+import tempfile
+import hashlib
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from collections import defaultdict
+import pytz
+
+
+# -- Config --------------------------------------------------------------------
+
+EDWIN_HOME      = Path(os.environ.get("EDWIN_HOME", Path(__file__).resolve().parent.parent.parent))
+
+DB_PATH         = Path.home() / "Library" / "Messages" / "chat.db"
+TZ              = os.environ.get("EDWIN_TZ", "America/New_York")
+DATA_DIR        = EDWIN_HOME / "data" / "imessage"
+REGISTRY_DB     = EDWIN_HOME / "data" / "identity" / "registry.db"
+
+# -- Identity Registry (lazy) --------------------------------------------------
+
+_registry_conn = None
+
+def _resolve_sender(handle: str) -> str:
+    """Resolve a phone/email handle to a display name via identity registry.
+    Returns the resolved name or the original handle if not found."""
+    global _registry_conn
+    if not handle or handle == "Unknown":
+        return handle
+    if not REGISTRY_DB.exists():
+        return handle
+    try:
+        if _registry_conn is None:
+            _registry_conn = sqlite3.connect(str(REGISTRY_DB))
+            _registry_conn.row_factory = sqlite3.Row
+        row = _registry_conn.execute(
+            "SELECT p.display_name FROM aliases a JOIN canonical_people p ON a.canonical_id = p.id "
+            "WHERE a.alias_value = ? COLLATE NOCASE", (handle,)
+        ).fetchone()
+        if row:
+            return row["display_name"]
+        # Try with/without +1 prefix
+        if handle.startswith("+1") and len(handle) > 2:
+            row = _registry_conn.execute(
+                "SELECT p.display_name FROM aliases a JOIN canonical_people p ON a.canonical_id = p.id "
+                "WHERE a.alias_value = ? AND a.alias_type = 'phone'", (handle[2:],)
+            ).fetchone()
+            if row:
+                return row["display_name"]
+    except Exception:
+        pass
+    return handle
+STATE_FILE      = DATA_DIR / ".sync-state.json"
+LOCK_FILE       = DATA_DIR / ".sync.lock"
+DEFAULT_SINCE   = 30  # days back for initial sync
+
+# Apple epoch: seconds since 2001-01-01 00:00:00 UTC, stored as nanoseconds
+APPLE_EPOCH = datetime(2001, 1, 1, tzinfo=timezone.utc)
+
+
+# -- Lockfile ------------------------------------------------------------------
+
+class SyncLock:
+    """Prevents concurrent sync runs via exclusive file lock."""
+    def __init__(self):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self._f = None
+
+    def __enter__(self):
+        self._f = open(LOCK_FILE, "w")
+        try:
+            fcntl.flock(self._f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Another sync is already running — exiting.", file=sys.stderr)
+            sys.exit(0)
+        self._f.write(str(os.getpid()))
+        self._f.flush()
+        return self
+
+    def __exit__(self, *_):
+        if self._f:
+            fcntl.flock(self._f, fcntl.LOCK_UN)
+            self._f.close()
+
+
+# -- State management ----------------------------------------------------------
+
+def _load_state():
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except json.JSONDecodeError:
+            print("  State file corrupted — starting fresh.", file=sys.stderr)
+    return {}
+
+
+def _save_state(state):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write(STATE_FILE, json.dumps(state, indent=2))
+
+
+def _atomic_write(path: Path, content: str):
+    """Write to temp file then rename — prevents corruption on power loss."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# -- Markdown helpers ----------------------------------------------------------
+
+def _id_hash(item_id: str) -> str:
+    return hashlib.sha1(item_id.encode()).hexdigest()[:16]
+
+
+def _sanitize_filename(name: str) -> str:
+    name = re.sub(r'[/\\:*?"<>|]', '-', name)
+    name = re.sub(r'-{2,}', '-', name)
+    name = name.strip(' .-')
+    return name[:80] or "unnamed"
+
+
+def _conv_path(filename: str) -> Path:
+    """Path for a conversation file (legacy -- full history per contact)."""
+    folder = DATA_DIR / "conversations"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / f"{filename}.md"
+
+
+def _daily_conv_path(filename: str, day_key: str) -> Path:
+    """Path for a per-day conversation file for Haiku context indexing.
+
+    Format: data/imessage/daily/{contact}/YYYY-MM-DD.md
+    """
+    folder = DATA_DIR / "daily" / filename
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / f"{day_key}.md"
+
+
+def _already_written(path: Path, msg_guid: str) -> bool:
+    """Check if message guid hash exists in conversation file OR any per-day file.
+
+    Checks the legacy conversation file first (fast path), then falls back to
+    scanning per-day files in the daily/ directory for this contact.
+    """
+    idhash = f"idhash: {_id_hash(msg_guid)}"
+    # Check legacy conversation file
+    if path.exists() and idhash in path.read_text():
+        return True
+    # Check per-day files for this contact
+    contact = path.stem  # e.g., "+15551234567"
+    daily_dir = DATA_DIR / "daily" / contact
+    if daily_dir.exists():
+        for day_file in daily_dir.glob("*.md"):
+            if idhash in day_file.read_text():
+                return True
+    return False
+
+
+# -- Database helpers ----------------------------------------------------------
+
+def _connect_db():
+    """Open Messages database in read-only mode."""
+    if not DB_PATH.exists():
+        print(f"Messages database not found at {DB_PATH}", file=sys.stderr)
+        print("Ensure Full Disk Access is enabled for this process.", file=sys.stderr)
+        sys.exit(1)
+    uri = f"file:{DB_PATH}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _apple_ts_to_datetime(ns_timestamp, tz):
+    """Convert Apple nanosecond timestamp to timezone-aware datetime."""
+    if not ns_timestamp:
+        return None
+    seconds = ns_timestamp / 1_000_000_000
+    dt = APPLE_EPOCH + timedelta(seconds=seconds)
+    return dt.astimezone(tz)
+
+
+def _datetime_to_apple_ts(dt):
+    """Convert datetime to Apple nanosecond timestamp."""
+    delta = dt - APPLE_EPOCH
+    return int(delta.total_seconds() * 1_000_000_000)
+
+
+def _extract_attributed_text(blob: bytes) -> str:
+    """Extract plain text from NSAttributedString binary plist (attributedBody).
+
+    Voice messages and some edited messages store text here instead of the text column.
+    The blob is an NSKeyedArchiver binary plist. The text is typically the longest
+    string value in the archive.
+    """
+    if not blob:
+        return ""
+    try:
+        import plistlib
+        plist = plistlib.loads(blob)
+        # NSKeyedArchiver format: text is in $objects array
+        objects = plist.get("$objects", [])
+        # Find the longest string that isn't a class name or key
+        candidates = [
+            obj for obj in objects
+            if isinstance(obj, str) and len(obj) > 1
+            and not obj.startswith("NS") and not obj.startswith("$")
+            and not obj.startswith("__kIM") and not obj.startswith("kIM")
+        ]
+        if candidates:
+            return max(candidates, key=len)
+    except Exception:
+        # Fallback: try to find readable text in the raw bytes
+        try:
+            text = blob.decode("utf-8", errors="ignore")
+            # Look for text between common markers
+            import re
+            matches = re.findall(r'[\x20-\x7e]{10,}', text)
+            if matches:
+                return max(matches, key=len)
+        except Exception:
+            pass
+    return ""
+
+
+# -- Chat metadata -------------------------------------------------------------
+
+def _get_chat_participants(conn, chat_rowid):
+    """Get all participant handles for a chat."""
+    rows = conn.execute("""
+        SELECT h.id
+        FROM chat_handle_join chj
+        JOIN handle h ON chj.handle_id = h.ROWID
+        WHERE chj.chat_id = ?
+        ORDER BY h.id
+    """, (chat_rowid,)).fetchall()
+    return [r["id"] for r in rows]
+
+
+def _resolve_chat_filename(chat):
+    """Determine filename for a conversation based on chat metadata."""
+    display_name = chat["display_name"]
+    chat_identifier = chat["chat_identifier"] or ""
+    chat_rowid = chat["chat_rowid"]
+    is_group = chat_identifier.startswith("chat")
+
+    if display_name:
+        return _sanitize_filename(display_name)
+    elif is_group:
+        return f"group-{chat_rowid}"
+    else:
+        # 1:1 chat — use the identifier (phone/email from chat_identifier)
+        # chat_identifier looks like "iMessage;-;+15551234567" or "SMS;-;+15551234567"
+        parts = chat_identifier.split(";-;")
+        handle = parts[-1] if len(parts) > 1 else chat_identifier
+        return _sanitize_filename(handle)
+
+
+# -- Formatters ----------------------------------------------------------------
+
+def _format_attachment(att):
+    """Format attachment metadata inline."""
+    transfer_name = att["transfer_name"] or ""
+    mime_type = att["mime_type"] or ""
+    total_bytes = att["total_bytes"] or 0
+
+    name = transfer_name or "attachment"
+    size_str = ""
+    if total_bytes > 0:
+        if total_bytes >= 1_048_576:
+            size_str = f"{total_bytes / 1_048_576:.1f} MB"
+        elif total_bytes >= 1024:
+            size_str = f"{total_bytes / 1024:.0f} KB"
+        else:
+            size_str = f"{total_bytes} B"
+
+    parts = [name]
+    if mime_type:
+        parts.append(mime_type)
+    if size_str:
+        parts.append(size_str)
+    return f"[attachment: {', '.join(parts)}]"
+
+
+def _format_conversation(chat_info, messages, tz):
+    """Format a full conversation file with frontmatter + day-grouped messages."""
+    display_name = chat_info["display_name"] or chat_info["resolved_name"]
+    chat_identifier = chat_info["chat_identifier"] or ""
+    service = chat_info["service_name"] or "iMessage"
+    is_group = chat_identifier.startswith("chat")
+    participants = chat_info.get("participants", [])
+
+    lines = [
+        "---",
+        "source: imessage",
+        f"chat_id: {chat_info['chat_rowid']}",
+        f"chat_identifier: {chat_identifier}",
+        f"service: {service}",
+    ]
+    if chat_info["display_name"]:
+        lines.append(f"display_name: {chat_info['display_name']}")
+    if participants:
+        lines.append(f"participants: {', '.join(participants)}")
+    lines.append(f"is_group: {str(is_group).lower()}")
+    lines.extend(["---", "", f"# {display_name}", ""])
+
+    # Group messages by day
+    days = defaultdict(list)
+    for msg in messages:
+        dt = msg["dt"]
+        if dt is None:
+            continue
+        day_key = dt.strftime("%Y-%m-%d")
+        days[day_key].append(msg)
+
+    # Output days in chronological order
+    for day_key in sorted(days.keys()):
+        day_msgs = days[day_key]
+        ctx = f"*{display_name} ({service}, {day_key})*"
+        lines.extend([f"### {day_key}", ctx, ""])
+
+        for msg in day_msgs:
+            idhash_comment = f"<!-- idhash: {_id_hash(msg['guid'])} -->"
+            dt = msg["dt"]
+            time_str = dt.strftime("%I:%M %p").lstrip("0")
+            sender = "You" if msg["is_from_me"] else _resolve_sender(msg["sender_handle"] or "Unknown")
+            text = msg["text"] or ""
+
+            # Format message line
+            if text:
+                lines.append(idhash_comment)
+                lines.append(f"**{sender}** ({time_str}): {text}")
+            elif msg["attachments"]:
+                att_strs = [_format_attachment(a) for a in msg["attachments"]]
+                lines.append(idhash_comment)
+                lines.append(f"**{sender}** ({time_str}): {' '.join(att_strs)}")
+            else:
+                continue  # skip empty messages
+
+            # Append attachment info for messages that have both text and attachments
+            if text and msg["attachments"]:
+                for att in msg["attachments"]:
+                    lines.append(_format_attachment(att))
+
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# -- Sync ----------------------------------------------------------------------
+
+MESSAGES_QUERY = """
+SELECT
+    m.ROWID as message_id,
+    m.guid,
+    m.text,
+    m.attributedBody,
+    m.date,
+    m.is_from_me,
+    m.service,
+    m.date_retracted,
+    h.id as sender_handle,
+    c.ROWID as chat_rowid,
+    c.chat_identifier,
+    c.display_name,
+    c.service_name
+FROM message m
+LEFT JOIN handle h ON m.handle_id = h.ROWID
+LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+LEFT JOIN chat c ON cmj.chat_id = c.ROWID
+WHERE m.date >= ?
+  AND (m.associated_message_type IS NULL OR m.associated_message_type = 0)
+  AND (m.date_retracted IS NULL OR m.date_retracted = 0)
+  AND c.ROWID IS NOT NULL
+ORDER BY c.ROWID, m.date ASC
+"""
+
+ATTACHMENTS_QUERY = """
+SELECT
+    maj.message_id,
+    a.filename as attachment_path,
+    a.mime_type,
+    a.total_bytes,
+    a.transfer_name
+FROM message_attachment_join maj
+JOIN attachment a ON maj.attachment_id = a.ROWID
+JOIN message m ON maj.message_id = m.ROWID
+WHERE m.date >= ?
+ORDER BY maj.message_id
+"""
+
+
+def sync_messages(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = False):
+    """Sync messages from Messages database."""
+    tz = pytz.timezone(TZ)
+
+    # Determine date boundary
+    last_sync_ns = None
+    msg_state = state.get("messages", {})
+    last_sync_str = msg_state.get("lastSyncDate")
+    if last_sync_str:
+        # lastSyncDate is stored as Apple nanosecond timestamp
+        last_sync_ns = int(last_sync_str)
+        print(f"  Syncing messages since last sync...", file=sys.stderr)
+    else:
+        since_dt = datetime.now(timezone.utc) - timedelta(days=since_days)
+        last_sync_ns = _datetime_to_apple_ts(since_dt)
+        print(f"  Backfilling messages {since_days} days...", file=sys.stderr)
+
+    conn = _connect_db()
+    try:
+        # Fetch all messages in range
+        rows = conn.execute(MESSAGES_QUERY, (last_sync_ns,)).fetchall()
+        if verbose:
+            print(f"  Found {len(rows)} messages in range", file=sys.stderr)
+
+        # Fetch all attachments in range
+        att_rows = conn.execute(ATTACHMENTS_QUERY, (last_sync_ns,)).fetchall()
+        att_by_msg = defaultdict(list)
+        for att in att_rows:
+            att_by_msg[att["message_id"]].append(dict(att))
+
+        # Group messages by chat
+        chats = defaultdict(lambda: {"info": None, "messages": []})
+        max_date = last_sync_ns
+
+        for row in rows:
+            chat_rowid = row["chat_rowid"]
+            if chat_rowid is None:
+                continue
+
+            # Track max date for state
+            if row["date"] and row["date"] > max_date:
+                max_date = row["date"]
+
+            # Store chat info (from first message seen)
+            if chats[chat_rowid]["info"] is None:
+                chats[chat_rowid]["info"] = {
+                    "chat_rowid": chat_rowid,
+                    "chat_identifier": row["chat_identifier"],
+                    "display_name": row["display_name"],
+                    "service_name": row["service_name"],
+                }
+
+            dt = _apple_ts_to_datetime(row["date"], tz)
+            # Voice messages store transcription in attributedBody, not text
+            msg_text = row["text"]
+            if not msg_text and row["attributedBody"]:
+                msg_text = _extract_attributed_text(row["attributedBody"])
+            chats[chat_rowid]["messages"].append({
+                "guid": row["guid"],
+                "text": msg_text,
+                "dt": dt,
+                "is_from_me": row["is_from_me"],
+                "sender_handle": row["sender_handle"],
+                "attachments": att_by_msg.get(row["message_id"], []),
+            })
+
+        # Write each conversation
+        written = 0
+        skipped = 0
+        for chat_rowid, chat_data in chats.items():
+            info = chat_data["info"]
+            messages = chat_data["messages"]
+
+            # Resolve filename
+            filename = _resolve_chat_filename(info)
+            filepath = _conv_path(filename)
+
+            # Get participants for frontmatter
+            try:
+                info["participants"] = _get_chat_participants(conn, chat_rowid)
+            except Exception:
+                info["participants"] = []
+
+            # Resolve display name
+            if info["display_name"]:
+                info["resolved_name"] = info["display_name"]
+            elif info["participants"]:
+                info["resolved_name"] = ", ".join(info["participants"][:3])
+                if len(info["participants"]) > 3:
+                    info["resolved_name"] += f" +{len(info['participants']) - 3}"
+            else:
+                identifier = info["chat_identifier"] or ""
+                parts = identifier.split(";-;")
+                raw_id = parts[-1] if len(parts) > 1 else identifier
+                info["resolved_name"] = _resolve_sender(raw_id)
+
+            # Filter out already-written messages
+            new_messages = []
+            for msg in messages:
+                if not _already_written(filepath, msg["guid"]):
+                    new_messages.append(msg)
+                else:
+                    skipped += 1
+
+            if not new_messages:
+                continue
+
+            # If file exists, we need to append new day sections or add to existing ones
+            if filepath.exists():
+                _append_messages_to_file(filepath, info, new_messages, tz)
+            else:
+                # New file — write full conversation
+                content = _format_conversation(info, new_messages, tz)
+                _atomic_write(filepath, content)
+
+            written += len(new_messages)
+            if verbose:
+                print(f"    {filename}: {len(new_messages)} messages", file=sys.stderr)
+
+        print(f"  Messages: {written} new, {skipped} already synced "
+              f"({len(chats)} conversations)", file=sys.stderr)
+
+        # Update state (lastSyncDate = Apple ns for queries, lastSync = ISO for status display)
+        max_dt = _apple_ts_to_datetime(max_date, pytz.utc)
+        state["messages"] = {
+            "lastSyncDate": str(max_date),
+            "lastSync": max_dt.isoformat() if max_dt else "",
+        }
+
+    finally:
+        conn.close()
+
+    return written
+
+
+def _append_messages_to_file(filepath: Path, chat_info, messages, tz):
+    """Append new messages to an existing conversation file."""
+    existing = filepath.read_text(encoding="utf-8")
+    display_name = chat_info["display_name"] or chat_info["resolved_name"]
+    service = chat_info["service_name"] or "iMessage"
+
+    # Group new messages by day
+    days = defaultdict(list)
+    for msg in messages:
+        if msg["dt"] is None:
+            continue
+        day_key = msg["dt"].strftime("%Y-%m-%d")
+        days[day_key].append(msg)
+
+    # Append each day's messages
+    new_lines = []
+    for day_key in sorted(days.keys()):
+        day_msgs = days[day_key]
+        day_header = f"### {day_key}"
+        ctx = f"*{display_name} ({service}, {day_key})*"
+
+        # Check if this day section already exists
+        if day_header in existing:
+            # Find the right place to insert — after existing messages for this day
+            # We'll append after the last non-empty line of this day section
+            pass  # handled below
+        else:
+            new_lines.extend(["", day_header, ctx, ""])
+
+        for msg in day_msgs:
+            idhash_comment = f"<!-- idhash: {_id_hash(msg['guid'])} -->"
+            dt = msg["dt"]
+            time_str = dt.strftime("%I:%M %p").lstrip("0")
+            sender = "You" if msg["is_from_me"] else _resolve_sender(msg["sender_handle"] or "Unknown")
+            text = msg["text"] or ""
+
+            if text:
+                new_lines.append(f"{idhash_comment}")
+                new_lines.append(f"**{sender}** ({time_str}): {text}")
+            elif msg["attachments"]:
+                att_strs = [_format_attachment(a) for a in msg["attachments"]]
+                new_lines.append(f"{idhash_comment}")
+                new_lines.append(f"**{sender}** ({time_str}): {' '.join(att_strs)}")
+            else:
+                continue
+
+            if text and msg["attachments"]:
+                for att in msg["attachments"]:
+                    new_lines.append(_format_attachment(att))
+
+    if new_lines:
+        new_content = existing.rstrip() + "\n" + "\n".join(new_lines) + "\n"
+        _atomic_write(filepath, new_content)
+
+    # Write per-day conversation files for Haiku context indexing
+    contact_name = filepath.stem  # e.g., "+15551234567" or "group-33"
+    for day_key in sorted(days.keys()):
+        day_msgs = days[day_key]
+        daily_path = _daily_conv_path(contact_name, day_key)
+
+        day_lines = [
+            "---",
+            "source: imessage",
+            f"chat_id: {chat_info.get('chat_id', '')}",
+            f"chat_identifier: {chat_info.get('chat_identifier', '')}",
+            f"contact: {display_name}",
+            f"date: {day_key}",
+            f"service: {service}",
+            "---",
+            "",
+            f"# {display_name} -- {day_key}",
+            f"*{display_name} ({service}, {day_key})*",
+            "",
+        ]
+
+        for msg in day_msgs:
+            idhash_comment = f"<!-- idhash: {_id_hash(msg['guid'])} -->"
+            dt = msg["dt"]
+            time_str = dt.strftime("%I:%M %p").lstrip("0")
+            sender = "You" if msg["is_from_me"] else _resolve_sender(msg["sender_handle"] or "Unknown")
+            text = msg["text"] or ""
+
+            if text:
+                day_lines.append(idhash_comment)
+                day_lines.append(f"**{sender}** ({time_str}): {text}")
+            elif msg["attachments"]:
+                att_strs = [_format_attachment(a) for a in msg["attachments"]]
+                day_lines.append(idhash_comment)
+                day_lines.append(f"**{sender}** ({time_str}): {' '.join(att_strs)}")
+
+            if text and msg["attachments"]:
+                for att in msg["attachments"]:
+                    day_lines.append(_format_attachment(att))
+
+        if daily_path.exists():
+            # Append new messages not already in the file
+            existing_daily = daily_path.read_text(encoding="utf-8")
+            new_day_msgs = [l for l in day_lines[12:]  # skip frontmatter/header
+                          if l.startswith("<!-- idhash:") and _id_hash(l.split("idhash: ")[1].split(" -->")[0]) not in existing_daily]
+            if new_day_msgs:
+                _atomic_write(daily_path, existing_daily.rstrip() + "\n" + "\n".join(day_lines[12:]) + "\n")
+        else:
+            _atomic_write(daily_path, "\n".join(day_lines) + "\n")
+
+
+# -- Commands ------------------------------------------------------------------
+
+def cmd_sync(args):
+    if not DB_PATH.exists():
+        print(f"Messages database not found at {DB_PATH}", file=sys.stderr)
+        print("Ensure Full Disk Access is enabled.", file=sys.stderr)
+        sys.exit(1)
+
+    with SyncLock():
+        state = _load_state()
+        sources = ["messages"] if args.source == "all" else [args.source]
+
+        if args.reset:
+            for source in sources:
+                state.pop(source, None)
+            print(f"  State cleared for: {', '.join(sources)}", file=sys.stderr)
+
+        fns = {"messages": sync_messages}
+        total = 0
+        for source in sources:
+            try:
+                total += fns[source](state, since_days=args.since, verbose=args.verbose)
+            except Exception as e:
+                print(f"  {source} sync failed: {e}", file=sys.stderr)
+                if args.verbose:
+                    import traceback; traceback.print_exc()
+            _save_state(state)
+        print(f"Sync complete — {total} total items.", file=sys.stderr)
+
+
+def cmd_status(args):
+    print("iMessage Sync Status")
+    print("=" * 40)
+    state = {}
+    if STATE_FILE.exists():
+        try:
+            state = json.loads(STATE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            print("  State file corrupted")
+
+    tz = pytz.timezone(TZ)
+    for source in ("messages",):
+        info = state.get(source, {})
+        if isinstance(info, dict) and "lastSyncDate" in info:
+            ns = int(info["lastSyncDate"])
+            dt = _apple_ts_to_datetime(ns, tz)
+            ts_str = dt.strftime("%Y-%m-%d %H:%M %Z") if dt else "unknown"
+            print(f"  {source:12s}  last sync: {ts_str}")
+        else:
+            print(f"  {source:12s}  (not synced)")
+
+    # File counts
+    print()
+    conv_dir = DATA_DIR / "conversations"
+    if conv_dir.exists():
+        files = list(conv_dir.glob("*.md"))
+        print(f"  conversations  {len(files)} files on disk")
+    print()
+
+    # Database info
+    if DB_PATH.exists():
+        try:
+            conn = _connect_db()
+            total = conn.execute("SELECT COUNT(*) FROM message").fetchone()[0]
+            chats = conn.execute("SELECT COUNT(*) FROM chat").fetchone()[0]
+            conn.close()
+            print(f"  Database: {total:,} messages in {chats:,} chats")
+        except Exception as e:
+            print(f"  Database: error reading ({e})")
+    else:
+        print(f"  Database: not found at {DB_PATH}")
+    print()
+
+
+# -- CLI -----------------------------------------------------------------------
+
+def main():
+    p   = argparse.ArgumentParser(description="Edwin iMessage Connector")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    # sync
+    s = sub.add_parser("sync", help="Sync to data/imessage/")
+    s.add_argument("source", choices=["all", "messages"])
+    s.add_argument("--since", type=int, default=DEFAULT_SINCE,
+                   help=f"Days back for initial/reset sync (default {DEFAULT_SINCE})")
+    s.add_argument("--reset", action="store_true",
+                   help="Clear saved state and re-fetch from --since days back")
+    s.add_argument("--verbose", action="store_true")
+    s.set_defaults(func=cmd_sync)
+
+    # status
+    st = sub.add_parser("status", help="Show last sync times and file counts")
+    st.set_defaults(func=cmd_status)
+
+    args = p.parse_args()
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        import traceback; traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

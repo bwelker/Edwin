@@ -1,0 +1,934 @@
+#!/usr/bin/env python3
+"""
+Edwin Google Connector — Gmail, Calendar
+Usage:
+  google auth
+  google sync all|mail|calendar [--since N] [--reset]
+  google status
+"""
+
+import argparse
+import base64
+import email as email_lib
+import fcntl
+import hashlib
+import html
+import json
+import logging
+import os
+import re
+import sys
+import tempfile
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+import tenacity
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+EDWIN_HOME = Path(os.environ.get("EDWIN_HOME", Path(__file__).resolve().parent.parent.parent))
+DATA_ROOT = EDWIN_HOME / "data" / "google"
+STATE_FILE = DATA_ROOT / ".sync-state.json"
+LOCK_FILE = DATA_ROOT / ".sync.lock"
+TOKEN_FILE = Path.home() / ".config" / "edwin" / "google-token.json"
+CREDS_FILE = Path.home() / "Library" / "Application Support" / "gogcli" / "credentials.json"
+
+# P3-14: Reduced scopes — gmail.readonly (was gmail.modify; we only read mail),
+# removed drive.readonly (unused). After changing scopes the cached token at
+# ~/.config/edwin/google-token.json will be invalid; re-run `google auth`.
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "openid",
+]
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+
+def get_credentials() -> Credentials:
+    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    creds = None
+    if TOKEN_FILE.exists():
+        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+    if creds and creds.valid:
+        return creds
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            _save_token(creds)
+            return creds
+        except Exception:
+            pass
+    # Fresh OAuth flow
+    if not CREDS_FILE.exists():
+        sys.exit(
+            f"No credentials file found at {CREDS_FILE}\n"
+            "Run: gog auth credentials /path/to/client_secret.json\n"
+            "Or place your OAuth client JSON at the path above."
+        )
+    raw = json.loads(CREDS_FILE.read_text())
+    client_config = {
+        "installed": {
+            "client_id": raw["client_id"],
+            "client_secret": raw["client_secret"],
+            "redirect_uris": ["http://localhost"],
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+    }
+    flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
+    creds = flow.run_local_server(port=0, open_browser=True)
+    _save_token(creds)
+    return creds
+
+
+def _build_service(api: str, version: str, creds: Credentials):
+    """Build a Google API service with 401-safe auto-refresh.
+
+    The google-auth-httplib2 AuthorizedHttp transport auto-refreshes tokens
+    when a request receives a 401. However, it needs a proper refresh request
+    object. We import google_auth_httplib2 to construct an AuthorizedHttp that
+    correctly refreshes expired tokens during long syncs, then pass that as
+    the http= parameter to build().
+    """
+    import google_auth_httplib2
+    import httplib2
+
+    # Ensure credentials are fresh before building
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        _save_token(creds)
+
+    # AuthorizedHttp handles automatic token refresh on 401 responses
+    authed_http = google_auth_httplib2.AuthorizedHttp(
+        creds, http=httplib2.Http(),
+        refresh_status_codes=(401,),
+    )
+    return build(api, version, http=authed_http)
+
+
+def _save_token(creds: Credentials):
+    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = TOKEN_FILE.with_suffix(".tmp")
+    tmp.write_text(creds.to_json())
+    os.replace(tmp, TOKEN_FILE)
+
+
+# ---------------------------------------------------------------------------
+# State helpers
+# ---------------------------------------------------------------------------
+
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def save_state(state: dict):
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    os.replace(tmp, STATE_FILE)
+
+
+# ---------------------------------------------------------------------------
+# ID hashing / dedup
+# ---------------------------------------------------------------------------
+
+def _id_hash(item_id: str) -> str:
+    return hashlib.sha1(item_id.encode()).hexdigest()[:16]
+
+
+def _already_written(path: Path, item_id: str) -> bool:
+    if not path.exists():
+        return False
+    return f"idhash: {_id_hash(item_id)}" in path.read_text()
+
+
+def _replace_existing_entry(path: Path, item_id: str) -> bool:
+    """Remove an existing entry block for item_id from the file.
+
+    Entry blocks are delimited by '---' lines (or '\\n---' patterns).
+    Returns True if an entry was found and removed.
+    """
+    if not path.exists():
+        return False
+    content = path.read_text()
+    idhash = _id_hash(item_id)
+    marker = f"idhash: {idhash}"
+    if marker not in content:
+        return False
+
+    # Split on entry boundaries. Calendar entries start with "\n---\n".
+    # Find the entry block containing our idhash and remove it.
+    # Entries are separated by "\n---\n" (the leading \n---\n of each entry).
+    parts = content.split("\n---\n")
+    new_parts = []
+    removed = False
+    for part in parts:
+        if marker in part and not removed:
+            removed = True
+            continue
+        new_parts.append(part)
+
+    if removed:
+        new_content = "\n---\n".join(new_parts)
+        # Clean up any leading/trailing whitespace artifacts
+        path.write_text(new_content)
+    return removed
+
+
+# ---------------------------------------------------------------------------
+# Retry decorator
+# ---------------------------------------------------------------------------
+
+# Rate-limit cooldown — shared across all API calls
+_last_throttle_time = 0.0   # epoch seconds of last retryable error
+_THROTTLE_COOLDOWN  = 2.0   # seconds to pause after a recent rate limit
+
+
+def _is_retryable(exc: Exception) -> bool:
+    global _last_throttle_time
+    if isinstance(exc, HttpError):
+        status = exc.resp.status
+        if status in (429, 403):
+            _last_throttle_time = time.time()
+        return status in (401, 403, 429, 500, 502, 503, 504)
+    return False
+
+
+def _throttle_aware_before(retry_state):
+    """Before each retry-decorated call, sleep briefly if recently throttled."""
+    if time.time() - _last_throttle_time < _THROTTLE_COOLDOWN:
+        time.sleep(_THROTTLE_COOLDOWN)
+
+
+retry_api = tenacity.retry(
+    retry=tenacity.retry_if_exception(_is_retryable),
+    wait=tenacity.wait_exponential(multiplier=1, min=2, max=60),
+    stop=tenacity.stop_after_attempt(6),
+    before=_throttle_aware_before,
+    reraise=True,
+)
+
+
+# ---------------------------------------------------------------------------
+# Atomic file append helper
+# ---------------------------------------------------------------------------
+
+def _atomic_append(path: Path, new_content: str):
+    """Atomically append new_content to path using write-to-temp + os.replace.
+
+    Reads existing content (if any), appends new_content, writes to a temp file
+    in the same directory, then does os.replace() back. This ensures that a
+    crash mid-write never leaves a partial entry on disk.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = ""
+    if path.exists():
+        existing = path.read_text(encoding="utf-8")
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(existing + new_content)
+        os.replace(tmp_path, str(path))
+    except BaseException:
+        # Clean up temp file on failure
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Gmail helpers
+# ---------------------------------------------------------------------------
+
+def _decode_body(payload: dict) -> str:
+    """Extract plain text or HTML body from message payload."""
+    parts = payload.get("parts", [])
+    # Prefer text/plain
+    for part in parts:
+        if part.get("mimeType") == "text/plain":
+            data = part.get("body", {}).get("data", "")
+            if data:
+                return base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="replace")
+    # Fallback to text/html, strip tags
+    for part in parts:
+        if part.get("mimeType") == "text/html":
+            data = part.get("body", {}).get("data", "")
+            if data:
+                raw_html = base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="replace")
+                return _strip_html(raw_html)
+    # Nested multipart
+    for part in parts:
+        sub = _decode_body(part)
+        if sub:
+            return sub
+    # Single-part message
+    data = payload.get("body", {}).get("data", "")
+    if data:
+        raw = base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="replace")
+        mime = payload.get("mimeType", "")
+        if "html" in mime:
+            return _strip_html(raw)
+        return raw
+    return ""
+
+
+def _strip_html(raw: str) -> str:
+    """Very simple HTML → plain text."""
+    raw = re.sub(r"<style[^>]*>.*?</style>", "", raw, flags=re.DOTALL | re.IGNORECASE)
+    raw = re.sub(r"<script[^>]*>.*?</script>", "", raw, flags=re.DOTALL | re.IGNORECASE)
+    raw = re.sub(r"<br\s*/?>", "\n", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"<p\s*/?>", "\n\n", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"</p>", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"<[^>]+>", "", raw)
+    raw = html.unescape(raw)
+    raw = re.sub(r"\n{3,}", "\n\n", raw)
+    return raw.strip()
+
+
+def _get_header(headers: list, name: str) -> str:
+    for h in headers:
+        if h.get("name", "").lower() == name.lower():
+            return h.get("value", "")
+    return ""
+
+
+def _parse_gmail_date(date_str: str) -> Optional[datetime]:
+    """Parse Gmail date header to datetime."""
+    import email.utils
+    try:
+        tup = email.utils.parsedate_tz(date_str)
+        if tup:
+            ts = email.utils.mktime_tz(tup)
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+    except Exception:
+        pass
+    return None
+
+
+def _mail_file_path(base_path: Path, msg_date: datetime, msg_id: str) -> Path:
+    """Generate individual file path for a single email message."""
+    month_key = msg_date.strftime("%Y-%m")
+    short_id = hashlib.sha1(msg_id.encode()).hexdigest()[:8]
+    out_dir = base_path / month_key
+    out_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{msg_date.strftime('%Y-%m-%d-%H%M%S')}-{short_id}.md"
+    return out_dir / filename
+
+
+def _write_mail_md(msg: dict, base_path: Path) -> bool:
+    """Write a Gmail message to an individual markdown file. Returns True if written."""
+    msg_id = msg.get("id", "")
+    payload = msg.get("payload", {})
+    headers = payload.get("headers", [])
+    snippet = msg.get("snippet", "")
+
+    subject = _get_header(headers, "Subject") or "(no subject)"
+    from_addr = _get_header(headers, "From") or ""
+    to_addr = _get_header(headers, "To") or ""
+    date_str = _get_header(headers, "Date") or ""
+    msg_date = _parse_gmail_date(date_str)
+
+    # Sanity check: if parsed date is >1 year in the future, the Date header
+    # is garbage (seen: 2611, 2612). Fall back to internalDate.
+    max_future = datetime.now(tz=timezone.utc) + timedelta(days=365)
+    if msg_date and msg_date > max_future:
+        msg_date = None
+
+    if not msg_date:
+        # Fall back to internalDate (milliseconds)
+        internal_ms = int(msg.get("internalDate", 0))
+        msg_date = datetime.fromtimestamp(internal_ms / 1000, tz=timezone.utc) if internal_ms else datetime.now(tz=timezone.utc)
+
+    out_file = _mail_file_path(base_path, msg_date, msg_id)
+
+    # Dedup: file exists = already written
+    if out_file.exists():
+        return False
+
+    body = _decode_body(payload)
+    if not body:
+        body = snippet
+
+    # Full body -- no truncation
+
+    label_ids = msg.get("labelIds", [])
+    is_read = "UNREAD" not in label_ids
+
+    entry = (
+        f"---\n"
+        f"source: google-mail\n"
+        f"idhash: {_id_hash(msg_id)}\n"
+        f"from: {from_addr}\n"
+        f"subject: {subject}\n"
+        f"date: {msg_date.isoformat()}\n"
+        f"to: {to_addr}\n"
+        f"read: {is_read}\n"
+        f"---\n\n"
+        f"## {subject}\n"
+        f"*From: {from_addr} | {msg_date.strftime('%Y-%m-%d %H:%M')}*\n\n"
+        f"**From:** {from_addr}\n"
+        f"**Date:** {msg_date.strftime('%Y-%m-%d %H:%M %Z')}\n\n"
+        f"{body.strip()}\n"
+    )
+
+    # Write individual file atomically
+    fd, tmp = tempfile.mkstemp(dir=out_file.parent, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(entry)
+        os.replace(tmp, out_file)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Gmail sync
+# ---------------------------------------------------------------------------
+
+def sync_mail(service, state: dict, since: datetime):
+    """Sync Gmail. Backfill uses date-range search; incremental uses history API."""
+    mail_path = DATA_ROOT / "mail"
+    history_id = state.get("mail_history_id")
+    last_sync = state.get("mail_last_sync")
+
+    if history_id and last_sync and not since:
+        print("  Incremental Gmail sync via history API...")
+        history_id, written = _mail_incremental(service, mail_path, history_id)
+        print(f"  Written: {written} new messages")
+    else:
+        print(f"  Backfilling Gmail since {since.strftime('%Y-%m-%d')}...")
+        history_id, written = _mail_backfill(service, mail_path, since)
+        print(f"  Written: {written} messages")
+
+    state["mail_history_id"] = history_id
+    state["mail_last_sync"] = datetime.now(tz=timezone.utc).isoformat()
+    save_state(state)
+
+
+@retry_api
+def _list_messages(service, query: str, page_token: str = None) -> dict:
+    kwargs = {"userId": "me", "q": query, "maxResults": 500}
+    if page_token:
+        kwargs["pageToken"] = page_token
+    return service.users().messages().list(**kwargs).execute()
+
+
+@retry_api
+def _get_single_message(service, msg_id: str) -> dict:
+    """Fetch a single message with retry. Used as fallback for batch failures."""
+    return service.users().messages().get(userId="me", id=msg_id, format="full").execute()
+
+
+def _batch_get_messages(service, msg_ids: list) -> list:
+    """Batch-fetch full messages. Gmail batch = up to 100 per request.
+
+    Tracks per-message failures in the batch callback. Failed messages are
+    retried individually with the @retry_api decorator. If individual retry
+    also fails, the error is logged and the failed IDs are reported.
+    """
+    results = []
+    all_failed_ids = []
+    for i in range(0, len(msg_ids), 100):
+        chunk = msg_ids[i:i+100]
+        batch = service.new_batch_http_request()
+        chunk_results = {}
+        chunk_failures = {}
+
+        def _cb(request_id, response, exception):
+            if exception is None:
+                chunk_results[request_id] = response
+            else:
+                chunk_failures[request_id] = exception
+
+        for mid in chunk:
+            batch.add(
+                service.users().messages().get(userId="me", id=mid, format="full"),
+                request_id=mid,
+                callback=_cb,
+            )
+        for attempt in tenacity.Retrying(
+            retry=tenacity.retry_if_exception(_is_retryable),
+            wait=tenacity.wait_exponential(multiplier=1, min=2, max=60),
+            stop=tenacity.stop_after_attempt(6),
+            reraise=True,
+        ):
+            with attempt:
+                batch.execute()
+        results.extend(chunk_results.values())
+
+        # Retry failed messages individually
+        for mid, exc in chunk_failures.items():
+            try:
+                msg = _get_single_message(service, mid)
+                results.append(msg)
+            except Exception as retry_exc:
+                logger.error("Failed to fetch message %s after individual retry: %s", mid, retry_exc)
+                all_failed_ids.append(mid)
+
+        time.sleep(0.1)  # gentle rate limiting
+
+    if all_failed_ids:
+        logger.error("Permanently failed to fetch %d message(s): %s", len(all_failed_ids), all_failed_ids)
+
+    return results
+
+
+def _mail_backfill(service, mail_path: Path, since: datetime):
+    """Backfill by month to avoid deep pagination timeouts."""
+    now = datetime.now(tz=timezone.utc)
+    cursor = since.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    written_total = 0
+    last_history_id = None
+
+    while cursor <= now:
+        next_month = (cursor.replace(day=28) + timedelta(days=4)).replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0
+        )
+        after = cursor.strftime("%Y/%m/%d")
+        before = min(next_month, now + timedelta(days=1)).strftime("%Y/%m/%d")
+        query = f"after:{after} before:{before}"
+        print(f"    Backfilling {cursor.strftime('%Y-%m')}...")
+
+        msg_ids = []
+        page_token = None
+        while True:
+            resp = _list_messages(service, query, page_token)
+            msgs = resp.get("messages", [])
+            msg_ids.extend(m["id"] for m in msgs)
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+
+        if msg_ids:
+            full_msgs = _batch_get_messages(service, msg_ids)
+            for msg in full_msgs:
+                if _write_mail_md(msg, mail_path):
+                    written_total += 1
+                hid = msg.get("historyId")
+                if hid and (last_history_id is None or int(hid) > int(last_history_id)):
+                    last_history_id = hid
+
+        cursor = next_month
+
+    return last_history_id, written_total
+
+
+@retry_api
+def _history_list(service, **kwargs) -> dict:
+    """Wrapper around history().list() with retry for transient errors."""
+    return service.users().history().list(**kwargs).execute()
+
+
+def _mail_incremental(service, mail_path: Path, history_id: str):
+    """Incremental sync via Gmail history API."""
+    written = 0
+    new_history_id = history_id
+    page_token = None
+
+    while True:
+        try:
+            kwargs = {
+                "userId": "me",
+                "startHistoryId": history_id,
+                "historyTypes": ["messageAdded"],
+                "maxResults": 500,
+            }
+            if page_token:
+                kwargs["pageToken"] = page_token
+            resp = _history_list(service, **kwargs)
+        except HttpError as e:
+            if e.resp.status == 404:
+                # historyId expired — fall back to last 7 days
+                print("  History ID expired, falling back to 7-day backfill...")
+                hid, written = _mail_backfill(
+                    service, mail_path, datetime.now(tz=timezone.utc) - timedelta(days=7)
+                )
+                return hid, written
+            raise
+
+        histories = resp.get("history", [])
+        msg_ids = []
+        for h in histories:
+            for added in h.get("messagesAdded", []):
+                msg_ids.append(added["message"]["id"])
+
+        if msg_ids:
+            full_msgs = _batch_get_messages(service, msg_ids)
+            for msg in full_msgs:
+                if _write_mail_md(msg, mail_path):
+                    written += 1
+
+        hid = resp.get("historyId")
+        if hid:
+            new_history_id = hid
+
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+
+    return new_history_id, written
+
+
+# ---------------------------------------------------------------------------
+# Calendar sync
+# ---------------------------------------------------------------------------
+
+def sync_calendar(service, state: dict, since: Optional[datetime]):
+    """Sync Google Calendar. Uses syncToken for incremental, date range for backfill.
+
+    If since is None, attempt incremental sync using stored syncToken.
+    If since is a datetime, force a full backfill from that date.
+    """
+    cal_path = DATA_ROOT / "calendar"
+    cal_state = state.get("calendar", {})
+
+    # Get all calendars
+    cals = _list_calendars(service)
+    print(f"  Found {len(cals)} calendars")
+
+    written_total = 0
+    new_cal_state = {}
+
+    for cal in cals:
+        cal_id = cal["id"]
+        cal_name = cal.get("summary", cal_id)
+        # Use stored syncToken only when no explicit --since was provided
+        sync_token = cal_state.get(cal_id, {}).get("syncToken") if since is None else None
+
+        if sync_token:
+            print(f"    Incremental: {cal_name}")
+            try:
+                token, written = _cal_incremental(service, cal_path, cal_id, cal_name, sync_token)
+                print(f"      Written: {written}")
+            except HttpError as e:
+                if e.resp.status in (410, 400):
+                    print(f"      Sync token expired, full sync...")
+                    fallback_since = since or (datetime.now(tz=timezone.utc) - timedelta(days=30))
+                    token, written = _cal_full_sync(service, cal_path, cal_id, cal_name, fallback_since)
+                    print(f"      Written: {written}")
+                else:
+                    raise
+        else:
+            # If since is None (no explicit --since and no syncToken), default to 30 days
+            backfill_since = since or (datetime.now(tz=timezone.utc) - timedelta(days=30))
+            print(f"    Full sync: {cal_name} since {backfill_since.strftime('%Y-%m-%d')}")
+            token, written = _cal_full_sync(service, cal_path, cal_id, cal_name, backfill_since)
+            print(f"      Written: {written}")
+            written_total += written
+
+        new_cal_state[cal_id] = {"syncToken": token, "summary": cal_name}
+
+    state["calendar"] = new_cal_state
+    state["calendar_last_sync"] = datetime.now(tz=timezone.utc).isoformat()
+    save_state(state)
+    print(f"  Calendar total written: {written_total}")
+
+
+@retry_api
+def _calendar_list_page(service, page_token=None) -> dict:
+    kwargs = {"maxResults": 250}
+    if page_token:
+        kwargs["pageToken"] = page_token
+    return service.calendarList().list(**kwargs).execute()
+
+
+def _list_calendars(service) -> list:
+    items = []
+    page_token = None
+    while True:
+        resp = _calendar_list_page(service, page_token)
+        items.extend(resp.get("items", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return items
+
+
+@retry_api
+def _events_list(service, **kwargs) -> dict:
+    return service.events().list(**kwargs).execute()
+
+
+def _cal_full_sync(service, cal_path: Path, cal_id: str, cal_name: str, since: datetime):
+    written = 0
+    sync_token = None
+    page_token = None
+    time_min = since.isoformat()
+
+    # Cap recurring event expansion at 90 days out to prevent
+    # far-future files (2032-2056+) from polluting the data.
+    time_max = (datetime.now(tz=timezone.utc) + timedelta(days=90)).isoformat()
+
+    while True:
+        kwargs = {
+            "calendarId": cal_id,
+            "timeMin": time_min,
+            "timeMax": time_max,
+            "singleEvents": True,
+            "maxResults": 250,
+        }
+        if page_token:
+            kwargs["pageToken"] = page_token
+
+        resp = _events_list(service, **kwargs)
+
+        for event in resp.get("items", []):
+            if _write_cal_md(event, cal_path, cal_name):
+                written += 1
+
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            sync_token = resp.get("nextSyncToken")
+            break
+
+    return sync_token, written
+
+
+def _cal_incremental(service, cal_path: Path, cal_id: str, cal_name: str, sync_token: str):
+    written = 0
+    new_sync_token = sync_token
+    page_token = None
+
+    while True:
+        kwargs = {
+            "calendarId": cal_id,
+            "syncToken": sync_token,
+            "maxResults": 250,
+            "showDeleted": True,
+        }
+        if page_token:
+            kwargs["pageToken"] = page_token
+
+        resp = _events_list(service, **kwargs)
+
+        for event in resp.get("items", []):
+            if event.get("status") == "cancelled":
+                continue
+            if _write_cal_md(event, cal_path, cal_name):
+                written += 1
+
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            new_sync_token = resp.get("nextSyncToken", new_sync_token)
+            break
+
+    return new_sync_token, written
+
+
+def _write_cal_md(event: dict, base_path: Path, cal_name: str) -> bool:
+    event_id = event.get("id", "")
+    summary = event.get("summary", "(no title)")
+    status = event.get("status", "confirmed")
+    if status == "cancelled":
+        return False
+
+    start = event.get("start", {})
+    end = event.get("end", {})
+    start_str = start.get("dateTime") or start.get("date") or ""
+    end_str = end.get("dateTime") or end.get("date") or ""
+
+    # Parse start date for file placement
+    try:
+        if "T" in start_str:
+            event_date = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+        else:
+            event_date = datetime.strptime(start_str[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        event_date = datetime.now(tz=timezone.utc)
+
+    date_key = event_date.strftime("%Y-%m-%d")
+    month_key = event_date.strftime("%Y-%m")
+    out_dir = base_path / month_key
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_file = out_dir / f"{date_key}.md"
+
+    # If the event already exists, remove the old entry so it can be replaced
+    # with the updated version (P2-9 fix: don't silently drop updates).
+    _replace_existing_entry(out_file, event_id)
+
+    location = event.get("location", "")
+    description = event.get("description", "")
+    organizer = event.get("organizer", {}).get("email", "")
+    attendees = event.get("attendees", [])
+    attendee_list = ", ".join(a.get("email", "") for a in attendees[:20])
+    hangout = event.get("hangoutLink", "")
+    recurrence = "yes" if event.get("recurrence") else ""
+
+    entry = (
+        f"\n---\n"
+        f"## {summary}\n"
+        f"idhash: {_id_hash(event_id)}\n"
+        f"calendar: {cal_name}\n"
+        f"date: {date_key}\n"
+        f"start: {start_str}\n"
+        f"end: {end_str}\n"
+    )
+    if location:
+        entry += f"location: {location}\n"
+    if organizer:
+        entry += f"organizer: {organizer}\n"
+    if attendee_list:
+        entry += f"attendees: {attendee_list}\n"
+    if hangout:
+        entry += f"meet: {hangout}\n"
+    if recurrence:
+        entry += f"recurring: {recurrence}\n"
+    if description:
+        desc = description.strip()
+        entry += f"\n{desc}\n"
+
+    _atomic_append(out_file, entry)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_auth(_args):
+    creds = get_credentials()
+    # Get user info to confirm
+    service = _build_service("oauth2", "v2", creds)
+    info = service.userinfo().get().execute()
+    print(f"Authenticated as: {info.get('email')}")
+
+
+def cmd_sync(args):
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    lock_fd = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("Another sync is already running. Exiting.")
+        sys.exit(1)
+
+    try:
+        creds = get_credentials()
+        state = load_state()
+
+        since_days = getattr(args, "since", 30) or 30
+        since = datetime.now(tz=timezone.utc) - timedelta(days=since_days)
+
+        sources = args.source
+        if sources == "all":
+            sources = ["mail", "calendar"]
+        else:
+            sources = [sources]
+
+        # Handle --reset
+        if getattr(args, "reset", False):
+            for src in sources:
+                print(f"  State cleared for: {src}")
+                if src == "mail":
+                    state.pop("mail_history_id", None)
+                    state.pop("mail_last_sync", None)
+                elif src == "calendar":
+                    state.pop("calendar", None)
+                    state.pop("calendar_last_sync", None)
+            save_state(state)
+
+        for src in sources:
+            # Check if incremental possible (no --since, has state)
+            force_since = None
+            if src == "mail" and (not state.get("mail_history_id") or getattr(args, "since", None)):
+                force_since = since
+            elif src == "calendar" and (not state.get("calendar") or getattr(args, "since", None)):
+                force_since = since
+
+            if src == "mail":
+                print("Syncing mail...")
+                gmail_svc = _build_service("gmail", "v1", creds)
+                sync_mail(gmail_svc, state, force_since)
+            elif src == "calendar":
+                print("Syncing calendar...")
+                cal_svc = _build_service("calendar", "v3", creds)
+                sync_calendar(cal_svc, state, force_since)
+            save_state(state)
+
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+        # P3-12: Don't delete the lock file — another process may have already
+        # acquired the flock between our LOCK_UN and an unlink(), which would
+        # break mutual exclusion. The lock file is safe to leave on disk.
+
+
+def cmd_status(_args):
+    state = load_state()
+    print("Google sync state:")
+    print(f"  Mail history ID: {state.get('mail_history_id', 'none')}")
+    print(f"  Mail last sync:  {state.get('mail_last_sync', 'never')}")
+    cal_state = state.get("calendar", {})
+    if cal_state:
+        print(f"  Calendars: {len(cal_state)} synced")
+        for cal_id, v in cal_state.items():
+            print(f"    {v.get('summary', cal_id)}: token={'yes' if v.get('syncToken') else 'no'}")
+    else:
+        print("  Calendar: never synced")
+
+    # Count files
+    for src in ("mail", "calendar"):
+        p = DATA_ROOT / src
+        if p.exists():
+            files = list(p.rglob("*.md"))
+            total_size = sum(f.stat().st_size for f in files)
+            print(f"  {src}: {len(files)} files, {total_size // 1024}KB")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Edwin Google Connector")
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("auth", help="Authenticate with Google")
+    sub.add_parser("status", help="Show sync state and file counts")
+
+    sync_p = sub.add_parser("sync", help="Sync Google data")
+    sync_p.add_argument("source", choices=["all", "mail", "calendar"])
+    sync_p.add_argument("--since", type=int, default=None, metavar="DAYS",
+                        help="Backfill N days (forces full sync for that source)")
+    sync_p.add_argument("--reset", action="store_true",
+                        help="Clear state for source before syncing")
+
+    args = parser.parse_args()
+
+    if args.command == "auth":
+        cmd_auth(args)
+    elif args.command == "sync":
+        cmd_sync(args)
+    elif args.command == "status":
+        cmd_status(args)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

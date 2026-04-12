@@ -1,0 +1,865 @@
+#!/usr/bin/env python3
+"""
+Edwin Limitless Connector — Pendant lifelogs & Ask AI chats
+
+Modes:
+  sync <source>   — incremental extraction to data/limitless/
+  status          — show last sync times
+
+Sources: lifelogs, chats, audio, all
+  "all" syncs lifelogs + chats (NOT audio — audio is on-demand only)
+
+API:
+  Lifelogs: https://api.limitless.ai/v1/lifelogs
+  Chats:    https://api.limitless.ai/v1/chats
+  Audio:    https://api.limitless.ai/v1/download-audio
+  Auth:     X-Api-Key header (from LIMITLESS_API_KEY env var)
+"""
+
+import os
+import sys
+import json
+import argparse
+import re
+import time
+import fcntl
+import tempfile
+import hashlib
+import html as html_mod
+import requests
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import pytz
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
+
+
+# -- Config --------------------------------------------------------------------
+
+EDWIN_HOME      = Path(os.environ.get("EDWIN_HOME", Path(__file__).resolve().parent.parent.parent))
+
+LIMITLESS_API   = "https://api.limitless.ai"
+TZ              = os.environ.get("EDWIN_TZ", "America/New_York")
+DATA_DIR        = EDWIN_HOME / "data" / "limitless"
+STATE_FILE      = DATA_DIR / ".sync-state.json"
+LOCK_FILE       = DATA_DIR / ".sync.lock"
+DEFAULT_SINCE   = 30  # days back for initial sync
+
+# Rate limiting: 180 req/min = 3/sec
+_MIN_REQUEST_INTERVAL = 0.34
+_last_request_time    = 0.0
+_last_throttle_time   = 0.0
+_THROTTLE_COOLDOWN    = 2.0
+
+
+# -- Lockfile ------------------------------------------------------------------
+
+class SyncLock:
+    """Prevents concurrent sync runs via exclusive file lock."""
+    def __init__(self):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self._f = None
+
+    def __enter__(self):
+        self._f = open(LOCK_FILE, "w")
+        try:
+            fcntl.flock(self._f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Another sync is already running — exiting.", file=sys.stderr)
+            sys.exit(0)
+        self._f.write(str(os.getpid()))
+        self._f.flush()
+        return self
+
+    def __exit__(self, *_):
+        if self._f:
+            fcntl.flock(self._f, fcntl.LOCK_UN)
+            self._f.close()
+        # Don't delete the lock file — another process may have already
+        # acquired the flock between our LOCK_UN and an unlink(), which would
+        # break mutual exclusion. The lock file is safe to leave on disk.
+
+
+# -- Auth ----------------------------------------------------------------------
+
+_ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
+_cached_api_key = None
+
+def _api_key():
+    global _cached_api_key
+    if _cached_api_key is None:
+        # Try ~/.edwin/credentials first, then .env, then shell environment
+        _cred_file = Path.home() / ".edwin" / "credentials" / "limitless" / "env"
+        for path in [_cred_file, _ENV_FILE]:
+            if path.exists():
+                for line in path.read_text().splitlines():
+                    if line.startswith("LIMITLESS_API_KEY="):
+                        _cached_api_key = line.split("=", 1)[1].strip().strip('"')
+                        break
+            if _cached_api_key:
+                break
+        if not _cached_api_key:
+            _cached_api_key = os.environ.get("LIMITLESS_API_KEY", "")
+    return _cached_api_key
+
+
+# -- HTTP helpers --------------------------------------------------------------
+
+def _wait_retry_after_or_exp(retry_state):
+    """Use Retry-After header or body retryAfter if available, otherwise exponential backoff."""
+    exc = retry_state.outcome.exception()
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        # Check Retry-After header
+        retry_after = exc.response.headers.get("Retry-After")
+        if retry_after is not None:
+            try:
+                return int(retry_after)
+            except (ValueError, TypeError):
+                pass
+        # Check body retryAfter field (Limitless returns this on 429)
+        try:
+            body = exc.response.json()
+            retry_after_body = body.get("retryAfter")
+            if isinstance(retry_after_body, (int, float)):
+                return max(1, int(retry_after_body))
+        except Exception:
+            pass
+    return wait_exponential(multiplier=2, min=2, max=60)(retry_state)
+
+
+def _is_retryable(exc):
+    """Retryable HTTP errors: 429, 500, 502, 503, 504."""
+    global _last_throttle_time
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        status = exc.response.status_code
+        if status == 429:
+            _last_throttle_time = time.time()
+        return status in (429, 500, 502, 503, 504)
+    if isinstance(exc, json.JSONDecodeError):
+        return True
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    return False
+
+
+@retry(retry=retry_if_exception(_is_retryable),
+       wait=_wait_retry_after_or_exp,
+       stop=stop_after_attempt(5))
+def _get(url, params=None):
+    """GET JSON with rate limiting, backoff on 429/5xx."""
+    global _last_request_time
+    # Enforce min interval
+    now = time.time()
+    wait = _MIN_REQUEST_INTERVAL - (now - _last_request_time)
+    if wait > 0:
+        time.sleep(wait)
+    # Proactive cooldown after recent throttle
+    if time.time() - _last_throttle_time < _THROTTLE_COOLDOWN:
+        time.sleep(_THROTTLE_COOLDOWN)
+    resp = requests.get(url, headers={"X-Api-Key": _api_key()},
+                        params=params, timeout=30)
+    _last_request_time = time.time()
+    resp.raise_for_status()
+    return resp.json()
+
+
+@retry(retry=retry_if_exception(_is_retryable),
+       wait=_wait_retry_after_or_exp,
+       stop=stop_after_attempt(5))
+def _get_binary(url, params=None):
+    """GET binary data (for audio) with rate limiting and retry."""
+    global _last_request_time
+    now = time.time()
+    wait = _MIN_REQUEST_INTERVAL - (now - _last_request_time)
+    if wait > 0:
+        time.sleep(wait)
+    if time.time() - _last_throttle_time < _THROTTLE_COOLDOWN:
+        time.sleep(_THROTTLE_COOLDOWN)
+    resp = requests.get(url, headers={"X-Api-Key": _api_key()},
+                        params=params, timeout=120, stream=True)
+    _last_request_time = time.time()
+    resp.raise_for_status()
+    return resp.content
+
+
+# -- Pagination ----------------------------------------------------------------
+
+def _paginate_lifelogs(params):
+    """Yield all lifelogs, following cursor pagination."""
+    data = _get(f"{LIMITLESS_API}/v1/lifelogs", params)
+    while True:
+        lifelogs = data.get("data", {}).get("lifelogs", [])
+        if not lifelogs:
+            break
+        yield from lifelogs
+        cursor = data.get("meta", {}).get("lifelogs", {}).get("nextCursor")
+        if not cursor:
+            break
+        # Cursor replaces all other params
+        data = _get(f"{LIMITLESS_API}/v1/lifelogs", {"cursor": cursor})
+
+
+def _paginate_chats(params):
+    """Yield all chats, following cursor pagination."""
+    data = _get(f"{LIMITLESS_API}/v1/chats", params)
+    while True:
+        chats = data.get("data", {}).get("chats", [])
+        if not chats:
+            break
+        yield from chats
+        cursor = data.get("meta", {}).get("chats", {}).get("nextCursor")
+        if not cursor:
+            break
+        data = _get(f"{LIMITLESS_API}/v1/chats", {"cursor": cursor})
+
+
+# -- State ---------------------------------------------------------------------
+
+def _load_state():
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except json.JSONDecodeError:
+            print("  State file corrupted — starting fresh.", file=sys.stderr)
+    return {}
+
+
+def _save_state(state):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write(STATE_FILE, json.dumps(state, indent=2))
+
+
+def _atomic_write(path: Path, content: str):
+    """Write to temp file then rename — prevents corruption on power loss."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# -- Markdown helpers ----------------------------------------------------------
+
+def _md_path(source, dt: datetime) -> Path:
+    """Daily rollup file path (legacy)."""
+    folder = DATA_DIR / source / dt.strftime("%Y-%m")
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / dt.strftime("%Y-%m-%d.md")
+
+
+def _conversation_path(dt: datetime, title: str, log_id: str) -> Path:
+    """Per-conversation file path for lifelogs.
+
+    Format: data/limitless/lifelogs/YYYY-MM/YYYY-MM-DD-HHMM-slug.md
+    """
+    folder = DATA_DIR / "lifelogs" / dt.strftime("%Y-%m")
+    folder.mkdir(parents=True, exist_ok=True)
+    # Create a filesystem-safe slug from the title
+    slug = re.sub(r'[^\w\s-]', '', title.lower())
+    slug = re.sub(r'[\s]+', '-', slug.strip())
+    slug = slug[:60] or log_id[:8]  # cap length, fallback to ID
+    return folder / f"{dt.strftime('%Y-%m-%d-%H%M')}-{slug}.md"
+
+
+def _id_hash(item_id: str) -> str:
+    return hashlib.sha1(item_id.encode()).hexdigest()[:16]
+
+
+def _already_written(path: Path, item_id: str) -> bool:
+    """Check if item ID hash exists in file — prevents duplicate writes."""
+    if not path.exists():
+        return False
+    return f"idhash: {_id_hash(item_id)}" in path.read_text()
+
+
+def _append_md(path: Path, content: str):
+    """Atomic append — read existing content, write everything to a temp file, then replace."""
+    existing = ""
+    if path.exists():
+        existing = path.read_text(encoding="utf-8")
+    new_content = existing + content + "\n\n"
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _replace_existing_entry(path: Path, item_id: str) -> bool:
+    """Remove an existing entry block for item_id from the file.
+
+    Entry blocks are delimited by '---' lines.
+    Returns True if an entry was found and removed.
+    """
+    if not path.exists():
+        return False
+    content = path.read_text()
+    idhash = _id_hash(item_id)
+    marker = f"idhash: {idhash}"
+    if marker not in content:
+        return False
+
+    parts = content.split("\n---\n")
+    new_parts = []
+    removed = False
+    for part in parts:
+        if marker in part and not removed:
+            removed = True
+            continue
+        new_parts.append(part)
+
+    if removed:
+        new_content = "\n---\n".join(new_parts)
+        _atomic_write(path, new_content)
+    return removed
+
+
+def _strip_html(html: str) -> str:
+    html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r'<br\s*/?>', '\n', html, flags=re.IGNORECASE)
+    html = re.sub(r'</?p[^>]*>', '\n', html, flags=re.IGNORECASE)
+    html = re.sub(r'</?div[^>]*>', '\n', html, flags=re.IGNORECASE)
+    html = re.sub(r'</?li[^>]*>', '\n- ', html, flags=re.IGNORECASE)
+    html = re.sub(r'<[^>]+>', '', html)
+    html = html_mod.unescape(html)
+    return re.sub(r'\n{3,}', '\n\n', html).strip()
+
+
+def _sanitize_filename(name: str) -> str:
+    name = re.sub(r'[/\\:*?"<>|]', '-', name)
+    name = re.sub(r'-{2,}', '-', name)
+    name = name.strip(' .-')
+    return name or "unnamed"
+
+
+def _since_dt(days: int) -> datetime:
+    return datetime.now(pytz.utc) - timedelta(days=days)
+
+
+def _try_parse_iso(ts: str) -> datetime:
+    """Parse an ISO 8601 timestamp, handling Z suffix. Returns epoch-zero on failure."""
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (ValueError, TypeError, AttributeError):
+        return datetime(1970, 1, 1, tzinfo=pytz.utc)
+
+
+# -- Formatters ----------------------------------------------------------------
+
+def _format_lifelog(log: dict, tz) -> str:
+    """Format a single lifelog entry as markdown with frontmatter."""
+    log_id     = log.get("id", "")
+    title      = log.get("title") or f"Lifelog {log_id[:8]}"
+    start_time = log.get("startTime", "")
+    end_time   = log.get("endTime", "")
+    starred    = log.get("isStarred", False)
+
+    start_dt = _try_parse_iso(start_time).astimezone(tz)
+    end_dt   = _try_parse_iso(end_time).astimezone(tz)
+
+    # Duration
+    dur_secs = max(0, int((end_dt - start_dt).total_seconds()))
+    hours, remainder = divmod(dur_secs, 3600)
+    minutes = remainder // 60
+    dur_str = f"{hours}h {minutes}m" if hours else f"{minutes}m"
+
+    lines = [
+        "---",
+        f"source: limitless-lifelog",
+        f"idhash: {_id_hash(log_id)}",
+        f"title: {title}",
+        f"start: {start_dt.isoformat()}",
+        f"end: {end_dt.isoformat()}",
+        f"duration: {dur_str}",
+        f"starred: {str(starred).lower()}",
+        "---",
+        "",
+        f"## {title}",
+        "",
+        f"**Time:** {start_dt.strftime('%I:%M %p')} \u2013 {end_dt.strftime('%I:%M %p')} ({dur_str})",
+    ]
+
+    # Context line for embedder chunk independence
+    ctx = f"*{title} ({start_dt.strftime('%Y-%m-%d %I:%M %p')}, {dur_str})*"
+
+    # AI Summary (markdown field)
+    markdown = log.get("markdown")
+    if markdown:
+        markdown = _strip_html(markdown)
+        lines.extend(["", "### Summary", ctx, "", markdown])
+
+    # Transcript (contents field)
+    contents = log.get("contents")
+    if contents and isinstance(contents, list):
+        transcript_lines = _format_contents(contents, tz)
+        if transcript_lines:
+            lines.extend(["", "### Transcript", ctx, ""])
+            lines.extend(transcript_lines)
+
+    return "\n".join(lines)
+
+
+def _format_contents(contents: list, tz) -> list:
+    """Format contents nodes into transcript lines."""
+    lines = []
+    for node in contents:
+        if not isinstance(node, dict):
+            continue
+        node_type = node.get("type", "")
+        content   = node.get("content", "")
+        if not content:
+            # Check children
+            children = node.get("children")
+            if children and isinstance(children, list):
+                lines.extend(_format_contents(children, tz))
+            continue
+
+        content = _strip_html(content)
+
+        if node_type in ("heading1", "heading2", "heading3"):
+            level = {"heading1": "#", "heading2": "##", "heading3": "###"}[node_type]
+            lines.append(f"{level} {content}")
+            lines.append("")
+        elif node_type == "blockquote":
+            speaker = node.get("speakerName", "Unknown")
+            if node.get("speakerIdentifier") == "user":
+                speaker = "You"
+            ts = node.get("startTime", "")
+            time_str = ""
+            if ts:
+                t = _try_parse_iso(ts).astimezone(tz)
+                time_str = f" ({t.strftime('%I:%M %p')})"
+            lines.append(f"**{speaker}**{time_str}: {content}")
+            lines.append("")
+        else:
+            # paragraph or other
+            lines.append(content)
+            lines.append("")
+
+        # Recurse into children
+        children = node.get("children")
+        if children and isinstance(children, list):
+            lines.extend(_format_contents(children, tz))
+
+    return lines
+
+
+def _format_chat(chat: dict, tz) -> str:
+    """Format a single chat entry as markdown with frontmatter."""
+    chat_id    = chat.get("id", "")
+    summary    = chat.get("summary") or "Ask AI Chat"
+    created_at = chat.get("createdAt", "")
+
+    dt = _try_parse_iso(created_at).astimezone(tz)
+
+    lines = [
+        "---",
+        f"source: limitless-chat",
+        f"idhash: {_id_hash(chat_id)}",
+        f"summary: {summary}",
+        f"date: {dt.isoformat()}",
+        "---",
+        "",
+        f"## {summary}",
+        "",
+    ]
+
+    messages = chat.get("messages", [])
+    if not isinstance(messages, list):
+        messages = []
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        user = msg.get("user", {})
+        if not isinstance(user, dict):
+            continue
+        role = user.get("role", "unknown").capitalize()
+        text = msg.get("text", "")
+        if not text:
+            continue
+        text = _strip_html(text)
+        lines.append(f"**{role}:** {text}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# -- Sync: Lifelogs -----------------------------------------------------------
+
+def sync_lifelogs(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = False) -> int:
+    tz = pytz.timezone(TZ)
+    last_sync = state.get("lifelogs", {}).get("lastSync")
+
+    if last_sync:
+        since = _try_parse_iso(last_sync)
+        print(f"  Syncing lifelogs since {last_sync}...", file=sys.stderr)
+    else:
+        since = _since_dt(since_days)
+        print(f"  Backfilling lifelogs {since_days} days...", file=sys.stderr)
+
+    now = datetime.now(pytz.utc)
+    count = 0
+
+    # Daily windows — API limit is 10/page, daily keeps pagination shallow
+    cursor = since.replace(hour=0, minute=0, second=0, microsecond=0)
+    while cursor <= now:
+        next_day = cursor + timedelta(days=1)
+        day_str = cursor.strftime("%Y-%m-%d")
+        next_day_str = next_day.strftime("%Y-%m-%d")
+
+        if verbose:
+            print(f"    Syncing lifelogs {day_str}...", file=sys.stderr)
+
+        try:
+            params = {
+                "start": day_str,
+                "end": next_day_str,
+                "timezone": TZ,
+                "limit": 10,
+                "direction": "asc",
+                "includeMarkdown": "true",
+                "includeContents": "true",
+            }
+            for log in _paginate_lifelogs(params):
+                log_id = log.get("id", "")
+                if not log_id:
+                    continue
+                start_time = log.get("startTime", "")
+                if not start_time:
+                    continue
+
+                dt = _try_parse_iso(start_time).astimezone(tz)
+                path = _md_path("lifelogs", dt)
+
+                # Handle updates: if updated since we last wrote it, replace
+                title = log.get("title") or f"Lifelog {log_id[:8]}"
+                conv_path = _conversation_path(dt, title, log_id)
+                updated_at = log.get("updatedAt", "")
+                if _already_written(path, log_id) or conv_path.exists():
+                    # If per-conversation file doesn't exist yet, generate it
+                    # even if the daily file already has the entry
+                    if not conv_path.exists():
+                        content = _format_lifelog(log, tz)
+                        _atomic_write(conv_path, content + "\n")
+                        count += 1
+                        if verbose:
+                            print(f"      Split: {title} -> {conv_path.name}", file=sys.stderr)
+                        continue
+                    if updated_at and last_sync and updated_at > last_sync:
+                        _replace_existing_entry(path, log_id)
+                        # Per-conversation file: just overwrite
+                        if verbose:
+                            print(f"      Updated: {title}", file=sys.stderr)
+                    else:
+                        if verbose:
+                            print(f"      Skipped: {title}", file=sys.stderr)
+                        continue
+
+                content = _format_lifelog(log, tz)
+                # Write per-conversation file (primary — one file per lifelog)
+                title = log.get("title") or f"Lifelog {log_id[:8]}"
+                conv_path = _conversation_path(dt, title, log_id)
+                _atomic_write(conv_path, content + "\n")
+                # Daily rollup discontinued -- per-conversation files are the primary output
+                count += 1
+                if verbose:
+                    print(f"      Written: {title} -> {conv_path.name}", file=sys.stderr)
+        except Exception as e:
+            print(f"    Error on {day_str}: {e}", file=sys.stderr)
+
+        cursor = next_day
+
+    state.setdefault("lifelogs", {})["lastSync"] = now.isoformat()
+    print(f"  Lifelogs: {count} new/updated items", file=sys.stderr)
+    return count
+
+
+# -- Sync: Chats --------------------------------------------------------------
+
+def sync_chats(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = False) -> int:
+    tz = pytz.timezone(TZ)
+    last_sync = state.get("chats", {}).get("lastSync")
+
+    if last_sync:
+        since = _try_parse_iso(last_sync)
+        print(f"  Syncing chats since {last_sync}...", file=sys.stderr)
+    else:
+        since = _since_dt(since_days)
+        print(f"  Backfilling chats {since_days} days...", file=sys.stderr)
+
+    count = 0
+    try:
+        params = {
+            "limit": 100,
+            "direction": "desc",
+            "timezone": TZ,
+        }
+        for chat in _paginate_chats(params):
+            chat_id = chat.get("id", "")
+            if not chat_id:
+                continue
+
+            created_at = chat.get("createdAt", "")
+            if not created_at:
+                continue
+
+            dt = _try_parse_iso(created_at)
+            # Early stop — chats are desc order, so once we're past our window, done
+            if dt < since:
+                break
+
+            dt_local = dt.astimezone(tz)
+            path = _md_path("chats", dt_local)
+
+            if _already_written(path, chat_id):
+                if verbose:
+                    print(f"    Skipped: {chat.get('summary', chat_id[:8])}", file=sys.stderr)
+                continue
+
+            content = _format_chat(chat, tz)
+            _append_md(path, content)
+            count += 1
+            if verbose:
+                print(f"    Written: {chat.get('summary', chat_id[:8])}", file=sys.stderr)
+
+    except Exception as e:
+        print(f"  Chats sync error: {e}", file=sys.stderr)
+
+    state.setdefault("chats", {})["lastSync"] = datetime.now(pytz.utc).isoformat()
+    print(f"  Chats: {count} new items", file=sys.stderr)
+    return count
+
+
+# -- Sync: Audio (on-demand) --------------------------------------------------
+
+def sync_audio(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = False) -> int:
+    tz = pytz.timezone(TZ)
+    last_sync = state.get("audio", {}).get("lastSync")
+
+    if last_sync:
+        since = _try_parse_iso(last_sync)
+        print(f"  Downloading audio since {last_sync}...", file=sys.stderr)
+    else:
+        since = _since_dt(since_days)
+        print(f"  Downloading audio {since_days} days...", file=sys.stderr)
+
+    now = datetime.now(pytz.utc)
+    count = 0
+    MAX_CHUNK_MS = 7_200_000  # 2 hours
+
+    # Fetch lifelog metadata to know what audio exists
+    cursor = since.replace(hour=0, minute=0, second=0, microsecond=0)
+    while cursor <= now:
+        next_day = cursor + timedelta(days=1)
+        day_str = cursor.strftime("%Y-%m-%d")
+        next_day_str = next_day.strftime("%Y-%m-%d")
+
+        if verbose:
+            print(f"    Checking audio for {day_str}...", file=sys.stderr)
+
+        try:
+            params = {
+                "start": day_str,
+                "end": next_day_str,
+                "timezone": TZ,
+                "limit": 10,
+                "direction": "asc",
+                "includeMarkdown": "false",
+                "includeContents": "false",
+            }
+            for log in _paginate_lifelogs(params):
+                log_id = log.get("id", "")
+                start_time = log.get("startTime", "")
+                end_time = log.get("endTime", "")
+                title = log.get("title") or log_id[:8]
+                if not start_time or not end_time:
+                    continue
+
+                start_dt = _try_parse_iso(start_time)
+                end_dt = _try_parse_iso(end_time)
+                start_ms = int(start_dt.timestamp() * 1000)
+                end_ms = int(end_dt.timestamp() * 1000)
+                duration_ms = end_ms - start_ms
+                if duration_ms <= 0:
+                    continue
+
+                local_dt = start_dt.astimezone(tz)
+                audio_dir = DATA_DIR / "audio" / local_dt.strftime("%Y-%m")
+                audio_dir.mkdir(parents=True, exist_ok=True)
+
+                safe_name = _sanitize_filename(title)[:50]
+
+                # Split into 2-hour chunks if needed
+                chunks = []
+                if duration_ms <= MAX_CHUNK_MS:
+                    chunks.append((start_ms, end_ms, ""))
+                else:
+                    chunk_start = start_ms
+                    chunk_num = 1
+                    while chunk_start < end_ms:
+                        chunk_end = min(chunk_start + MAX_CHUNK_MS, end_ms)
+                        chunks.append((chunk_start, chunk_end, f"-chunk{chunk_num}"))
+                        chunk_start = chunk_end
+                        chunk_num += 1
+
+                for c_start, c_end, chunk_suffix in chunks:
+                    filename = f"{local_dt.strftime('%Y-%m-%d')}-{safe_name}{chunk_suffix}.ogg"
+                    filepath = audio_dir / filename
+
+                    if filepath.exists():
+                        if verbose:
+                            print(f"      Skipped: {filename} (exists)", file=sys.stderr)
+                        continue
+
+                    if verbose:
+                        print(f"      Downloading: {filename}...", file=sys.stderr)
+
+                    try:
+                        audio_data = _get_binary(
+                            f"{LIMITLESS_API}/v1/download-audio",
+                            {"startMs": c_start, "endMs": c_end, "audioSource": "pendant"}
+                        )
+                        # Atomic write
+                        fd, tmp = tempfile.mkstemp(dir=audio_dir, prefix=".tmp-")
+                        try:
+                            with os.fdopen(fd, "wb") as f:
+                                f.write(audio_data)
+                            os.replace(tmp, filepath)
+                            count += 1
+                        except Exception:
+                            try:
+                                os.unlink(tmp)
+                            except OSError:
+                                pass
+                            raise
+                    except Exception as e:
+                        print(f"      Audio download failed for {filename}: {e}", file=sys.stderr)
+
+        except Exception as e:
+            print(f"    Error on {day_str}: {e}", file=sys.stderr)
+
+        cursor = next_day
+
+    state.setdefault("audio", {})["lastSync"] = now.isoformat()
+    print(f"  Audio: {count} files downloaded", file=sys.stderr)
+    return count
+
+
+# -- Commands ------------------------------------------------------------------
+
+def cmd_sync(args):
+    key = _api_key()
+    if not key:
+        print("LIMITLESS_API_KEY environment variable is not set.", file=sys.stderr)
+        sys.exit(1)
+
+    with SyncLock():
+        state = _load_state()
+        # "all" = lifelogs + chats (NOT audio — audio is on-demand)
+        sources = (["lifelogs", "chats"] if args.source == "all"
+                   else [args.source])
+
+        if args.reset:
+            for source in sources:
+                state.pop(source, None)
+            print(f"  State cleared for: {', '.join(sources)}", file=sys.stderr)
+
+        fns = {"lifelogs": sync_lifelogs, "chats": sync_chats,
+               "audio": sync_audio}
+        total = 0
+        for source in sources:
+            try:
+                total += fns[source](state, since_days=args.since, verbose=args.verbose)
+            except Exception as e:
+                print(f"  {source} sync failed: {e}", file=sys.stderr)
+                if args.verbose:
+                    import traceback; traceback.print_exc()
+            _save_state(state)
+        print(f"Sync complete \u2014 {total} total items.", file=sys.stderr)
+
+
+def cmd_status(args):
+    print("Limitless Sync Status")
+    print("=" * 40)
+    if not STATE_FILE.exists():
+        print("  No state file found")
+        return
+    try:
+        state = json.loads(STATE_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        print("  State file corrupted")
+        return
+    if not state:
+        print("  Empty state")
+        return
+
+    for source in ("lifelogs", "chats", "audio"):
+        info = state.get(source, {})
+        if isinstance(info, dict) and "lastSync" in info:
+            print(f"  {source:12s}  last sync: {info['lastSync']}")
+        else:
+            print(f"  {source:12s}  (not synced)")
+
+    # File counts
+    print()
+    for source in ("lifelogs", "chats"):
+        source_dir = DATA_DIR / source
+        if source_dir.exists():
+            files = list(source_dir.glob("**/*.md"))
+            print(f"  {source:12s}  {len(files)} files on disk")
+
+    audio_dir = DATA_DIR / "audio"
+    if audio_dir.exists():
+        files = list(audio_dir.glob("**/*.ogg"))
+        print(f"  {'audio':12s}  {len(files)} files on disk")
+    print()
+
+
+# -- CLI -----------------------------------------------------------------------
+
+def main():
+    p   = argparse.ArgumentParser(description="Edwin Limitless Connector")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    # sync
+    s = sub.add_parser("sync", help="Sync to data/limitless/")
+    s.add_argument("source", choices=["all", "lifelogs", "chats", "audio"])
+    s.add_argument("--since", type=int, default=DEFAULT_SINCE,
+                   help=f"Days back for initial/reset sync (default {DEFAULT_SINCE})")
+    s.add_argument("--reset", action="store_true",
+                   help="Clear saved state and re-fetch from --since days back")
+    s.add_argument("--verbose", action="store_true")
+    s.set_defaults(func=cmd_sync)
+
+    # status
+    st = sub.add_parser("status", help="Show last sync times and file counts")
+    st.set_defaults(func=cmd_status)
+
+    args = p.parse_args()
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        import traceback; traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

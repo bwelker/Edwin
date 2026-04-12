@@ -1,0 +1,427 @@
+#!/opt/homebrew/bin/python3.12
+"""Edwin Memory Indexer — contextual retrieval + hybrid search.
+
+Indexes Edwin markdown data files into Qdrant with:
+  - Dense embeddings (qwen3-embedding:8b via Ollama)
+  - Sparse embeddings (BM42 via fastembed)
+  - Contextual retrieval prefixes (Haiku via Anthropic API)
+  - Source-aware chunking (6 strategies)
+
+Usage:
+    indexer sync                    # Incremental index
+    indexer sync --force            # Full reindex
+    indexer sync --no-context       # Skip Haiku contextual retrieval
+    indexer sync --dry-run          # Show what would be indexed
+    indexer sync --source <name>    # Index one source only
+    indexer status                  # Show index stats
+    indexer verify                  # Spot-check search quality
+"""
+
+import argparse
+import atexit
+import fcntl
+import json
+import random
+import signal
+import sys
+import time
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Ensure lib is importable
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from lib.config import (DATA_DIR, LOCK_FILE, COLLECTION_NAME, EMBEDDING_DIM,
+                         OLLAMA_URL, EMBEDDING_MODEL, CHARS_PER_TOKEN)
+from lib.metadata import (detect_source, detect_connector, extract_frontmatter,
+                           extract_date, extract_channel, extract_payload_fields)
+from lib.scanner import FileScanner
+from lib.chunker import chunk_file
+from lib.embedder import DenseEmbedder, SparseEmbedder
+from lib.qdrant_store import QdrantStore
+from lib.context import ContextGenerator
+
+
+def log(msg: str):
+    print(msg, file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# sync command
+# ---------------------------------------------------------------------------
+
+def cmd_sync(args):
+    scanner = FileScanner()
+
+    # Check for model change
+    if scanner.check_model_change() and not args.force:
+        log("ERROR: Embedding model/dimension changed since last run.")
+        log("  Use --force to reindex everything.")
+        return 1
+
+    # Scan for changes
+    log(f"Scanning {DATA_DIR}...")
+    to_index, to_delete = scanner.scan(force=args.force, source_filter=args.source)
+    log(f"  {len(to_index)} files to index, {len(to_delete)} to delete")
+
+    # Backfill: pull in any files that were indexed without Haiku context.
+    # Bypasses hash check; only adds files that exist on disk and need context.
+    if getattr(args, "backfill_context", False):
+        if args.no_context:
+            log("ERROR: --backfill-context is incompatible with --no-context")
+            return 1
+        existing = {str(p.relative_to(DATA_DIR)): p
+                    for p in DATA_DIR.rglob("*.md")}
+        already = {str(p.relative_to(DATA_DIR)) for p in to_index}
+        added = 0
+        for key, info in scanner.state.get("files", {}).items():
+            if info.get("context_done", False):
+                continue
+            if args.source and not any(args.source in p for p in key.split("/")[:2]):
+                continue
+            if key in already:
+                continue
+            p = existing.get(key)
+            if p is None:
+                continue
+            to_index.append(p)
+            added += 1
+        log(f"  +{added} files queued for context backfill")
+
+    if not to_index and not to_delete:
+        log("Nothing to do.")
+        return 0
+
+    if args.dry_run:
+        _dry_run_report(to_index, to_delete)
+        return 0
+
+    # Initialize services
+    log("Initializing services...")
+    dense = DenseEmbedder()
+    sparse = SparseEmbedder()
+    store = QdrantStore()
+    store.ensure_collection(EMBEDDING_DIM)
+
+    context_gen = None
+    if not args.no_context:
+        context_gen = ContextGenerator()
+        if not context_gen.enabled:
+            log("  Continuing without contextual retrieval.")
+            context_gen = None
+
+    # Process deletions
+    if to_delete:
+        log(f"Deleting {len(to_delete)} removed files from index...")
+        for key in to_delete:
+            file_path = str(DATA_DIR / key)
+            store.delete_file_points(file_path)
+            scanner.remove_file(key)
+
+    # Process new/changed files
+    total_chunks = 0
+    errors = 0
+    start_time = time.time()
+
+    # Adaptive progress: every 10 files (< 200), 25 (< 500), 50 (< 2000), 100 (2000+)
+    n_total = len(to_index)
+    progress_interval = 10 if n_total < 200 else 25 if n_total < 500 else 50 if n_total < 2000 else 100
+    last_progress_time = start_time
+
+    for i, file_path in enumerate(to_index):
+        try:
+            # Skip Haiku calls for files that already have context
+            file_context_gen = context_gen
+            if context_gen and not scanner.needs_context(file_path):
+                file_context_gen = None
+
+            n_chunks = _index_file(file_path, dense, sparse, store, file_context_gen)
+            context_was_done = file_context_gen is not None
+            scanner.update_file(file_path, n_chunks, context_done=context_was_done)
+            total_chunks += n_chunks
+
+            now = time.time()
+            if (i + 1) % progress_interval == 0 or i == n_total - 1 or (now - last_progress_time) >= 30:
+                elapsed = now - start_time
+                rate = (i + 1) / elapsed if elapsed > 0 else 0
+                eta = (n_total - i - 1) / rate if rate > 0 else 0
+                log(f"  [{i + 1}/{n_total}] "
+                    f"{total_chunks} chunks, {rate:.1f} files/s, ~{eta:.0f}s remaining")
+                last_progress_time = now
+                # Checkpoint: save state periodically so kills don't lose all progress
+                scanner.save()
+
+        except Exception as e:
+            errors += 1
+            log(f"  ERROR indexing {file_path.name}: {e}")
+            if errors > 50:
+                log("Too many errors, stopping.")
+                break
+
+    # Save state
+    scanner.save()
+
+    elapsed = time.time() - start_time
+    log(f"\nDone: {len(to_index)} files, {total_chunks} chunks, "
+        f"{errors} errors, {elapsed:.1f}s")
+
+    return 0
+
+
+def _index_file(file_path: Path, dense: DenseEmbedder, sparse: SparseEmbedder,
+                store: QdrantStore, context_gen: ContextGenerator | None) -> int:
+    """Index a single file. Returns chunk count."""
+    content = file_path.read_text(errors="replace")
+    source = detect_source(file_path)
+    connector = detect_connector(file_path)
+    frontmatter = extract_frontmatter(content)
+    file_date = extract_date(file_path, frontmatter)
+    channel = extract_channel(file_path, source)
+    extra_fields = extract_payload_fields(frontmatter)
+
+    # Chunk
+    chunks = chunk_file(content, source, file_path)
+    if not chunks:
+        return 0
+
+    # Delete old points for this file before re-indexing
+    store.delete_file_points(str(file_path))
+
+    # Generate context prefixes
+    chunk_texts = [c.text for c in chunks]
+    if context_gen:
+        contexts = context_gen.contextualize_chunks(content, chunk_texts, source=source, file_path=file_path)
+    else:
+        contexts = [""] * len(chunks)
+
+    # Build text for embedding: context + chunk
+    embed_texts = []
+    for ctx, text in zip(contexts, chunk_texts):
+        if ctx:
+            embed_texts.append(f"{ctx}\n\n{text}")
+        else:
+            embed_texts.append(text)
+
+    # Embed
+    dense_vecs = dense.embed_batch(embed_texts)
+    sparse_results = sparse.embed_batch(embed_texts)
+
+    # Build points
+    points = []
+    file_hash = None  # scanner handles this
+    now = datetime.now(timezone.utc).isoformat()
+
+    for j, chunk in enumerate(chunks):
+        payload = {
+            "file_path": str(file_path),
+            "source": source,
+            "connector": connector,
+            "date": file_date,
+            "channel": channel,
+            "start_line": chunk.start_line,
+            "end_line": chunk.end_line,
+            "text": chunk.text,
+            "context": contexts[j],
+            "indexed_at": now,
+        }
+        payload.update(extra_fields)
+        # Remove None values
+        payload = {k: v for k, v in payload.items() if v is not None}
+
+        s_indices, s_values = sparse_results[j]
+        point = store.make_point(
+            point_id=store.new_id(),
+            dense_vec=dense_vecs[j],
+            sparse_indices=s_indices,
+            sparse_values=s_values,
+            payload=payload,
+        )
+        points.append(point)
+
+    store.upsert_chunks(points)
+    return len(points)
+
+
+def _dry_run_report(to_index: list[Path], to_delete: list[str]):
+    """Print what would be indexed."""
+    # Group by source
+    by_source = {}
+    for f in to_index:
+        source = detect_source(f)
+        by_source.setdefault(source, []).append(f)
+
+    log("\n  Would index:")
+    for source, files in sorted(by_source.items()):
+        log(f"    {source}: {len(files)} files")
+
+    if to_delete:
+        log(f"\n  Would delete: {len(to_delete)} file entries")
+
+
+# ---------------------------------------------------------------------------
+# status command
+# ---------------------------------------------------------------------------
+
+def cmd_status(args):
+    scanner = FileScanner()
+    stats = scanner.stats()
+
+    log(f"Index state:")
+    log(f"  Files tracked:    {stats['files_tracked']}")
+    log(f"  Total chunks:     {stats['total_chunks']}")
+    log(f"  Last run:         {stats['last_run'] or 'never'}")
+    log(f"  Embedding model:  {stats['embedding_model']}")
+    log(f"  Embedding dim:    {stats['embedding_dim']}")
+
+    try:
+        store = QdrantStore()
+        info = store.collection_info()
+        log(f"\n  Qdrant collection: {info['collection']}")
+        log(f"  Points:           {info.get('points_count', 'N/A')}")
+        log(f"  Status:           {info.get('status', 'N/A')}")
+    except SystemExit:
+        log("\n  Qdrant: not available")
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# verify command
+# ---------------------------------------------------------------------------
+
+def cmd_verify(args):
+    """Spot-check: pick random chunks, query with their own text, verify match."""
+    try:
+        store = QdrantStore()
+        info = store.collection_info()
+    except SystemExit:
+        log("ERROR: Qdrant not available")
+        return 1
+
+    if info.get("points_count", 0) == 0:
+        log("No points in collection to verify.")
+        return 0
+
+    dense = DenseEmbedder()
+
+    # Scroll for some random points
+    points, _ = store.client.scroll(
+        collection_name=COLLECTION_NAME,
+        limit=20,
+        with_payload=True,
+        with_vectors=False,
+    )
+
+    if not points:
+        log("No points found.")
+        return 0
+
+    sample = random.sample(points, min(5, len(points)))
+    passed = 0
+
+    for pt in sample:
+        text = pt.payload.get("text", "")[:200]
+        source = pt.payload.get("source", "?")
+        vec = dense.embed(text)
+
+        results = store.client.query_points(
+            collection_name=COLLECTION_NAME,
+            query=vec,
+            using="text-dense",
+            limit=3,
+            with_payload=["file_path", "source"],
+        ).points
+
+        found = any(r.id == pt.id for r in results)
+        status = "PASS" if found else "MISS"
+        if found:
+            passed += 1
+        log(f"  [{status}] {source}: {text[:60]}...")
+
+    log(f"\n  {passed}/{len(sample)} passed")
+    return 0 if passed == len(sample) else 1
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Edwin Memory Indexer",
+        prog="indexer",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    # sync
+    sync_p = sub.add_parser("sync", help="Index files into Qdrant")
+    sync_p.add_argument("--force", action="store_true", help="Reindex everything")
+    sync_p.add_argument("--no-context", action="store_true",
+                        help="Skip Haiku contextual retrieval")
+    sync_p.add_argument("--dry-run", action="store_true",
+                        help="Show what would be indexed")
+    sync_p.add_argument("--source", type=str, default=None,
+                        help="Only index one source type")
+    sync_p.add_argument("--backfill-context", action="store_true",
+                        help="Reindex files that were indexed without Haiku context. "
+                             "Bypasses hash check; only touches files where context_done=False.")
+
+    # status
+    sub.add_parser("status", help="Show index stats")
+
+    # verify
+    sub.add_parser("verify", help="Spot-check search quality")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return 1
+
+    # Lockfile (skip for status/verify/dry-run)
+    needs_lock = args.command == "sync" and not getattr(args, "dry_run", False)
+
+    if needs_lock:
+        # Per-source lock when --source is specified, global lock otherwise
+        source = getattr(args, "source", None)
+        if source:
+            lock_path = LOCK_FILE.parent / f".sync-{source}.lock"
+        else:
+            lock_path = LOCK_FILE
+        lock_fd = open(lock_path, "w")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            scope = f"source '{source}'" if source else "all sources"
+            log(f"ERROR: Another indexer instance is running for {scope}.")
+            return 1
+
+        # Register cleanup for lock file on exit/signal
+        def _cleanup_lock():
+            try:
+                lock_fd.close()
+                lock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        atexit.register(_cleanup_lock)
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, lambda s, f: (atexit._run_exitfuncs(), sys.exit(128 + s)))
+
+    try:
+        if args.command == "sync":
+            return cmd_sync(args)
+        elif args.command == "status":
+            return cmd_status(args)
+        elif args.command == "verify":
+            return cmd_verify(args)
+    finally:
+        if needs_lock:
+            _cleanup_lock()
+            atexit.unregister(_cleanup_lock)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

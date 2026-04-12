@@ -1,0 +1,555 @@
+#!/usr/bin/env python3
+"""
+Edwin Browser History Connector — Safari + Chrome history archiver
+
+Modes:
+  sync <source>   — incremental extraction to data/browser/
+  status          — show last sync times
+
+Sources: history, all
+  "all" = history (only source for now)
+
+Databases (read-only, temp-copied since browsers lock them):
+  Safari: ~/Library/Safari/History.db
+  Chrome:  ~/Library/Application Support/Google/Chrome/Default/History
+"""
+
+import os
+import sys
+import json
+import argparse
+import fcntl
+import tempfile
+import hashlib
+import shutil
+import sqlite3
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from collections import defaultdict
+import pytz
+
+
+# -- Config --------------------------------------------------------------------
+
+SAFARI_DB       = Path.home() / "Library" / "Safari" / "History.db"
+CHROME_DB       = Path.home() / "Library" / "Application Support" / "Google" / "Chrome" / "Default" / "History"
+EDWIN_HOME      = Path(os.environ.get("EDWIN_HOME", Path(__file__).resolve().parent.parent.parent))
+TZ              = os.environ.get("EDWIN_TZ", "America/New_York")
+DATA_DIR        = EDWIN_HOME / "data" / "browser"
+STATE_FILE      = DATA_DIR / ".sync-state.json"
+LOCK_FILE       = DATA_DIR / ".sync.lock"
+DEFAULT_SINCE   = 30  # days back for initial sync
+
+# Safari epoch: seconds since 2001-01-01 00:00:00 UTC
+SAFARI_EPOCH = datetime(2001, 1, 1, tzinfo=timezone.utc)
+# Chrome epoch: microseconds since 1601-01-01 00:00:00 UTC
+CHROME_EPOCH = datetime(1601, 1, 1, tzinfo=timezone.utc)
+
+# URL prefixes to filter out (noise)
+SKIP_PREFIXES = (
+    "chrome-extension://",
+    "chrome://",
+    "about:",
+    "data:",
+    "file://",
+    "safari-extension://",
+    "blob:",
+)
+
+# URL patterns to filter (OAuth flows, redirects, internal)
+SKIP_CONTAINS = (
+    "://localhost",
+    "://127.0.0.1",
+    "://0.0.0.0",
+    "/signin/oauth/",
+    "/oauth2/authorize",
+    "/oauth/callback",
+    "/auth/realms/",
+    "state=",  # OAuth state params make URLs huge and useless
+    "accounts.google.com/signin",
+    "login.microsoftonline.com",
+    "accounts.google.com/o/oauth2",
+)
+
+
+# -- Lockfile ------------------------------------------------------------------
+
+class SyncLock:
+    """Prevents concurrent sync runs via exclusive file lock."""
+    def __init__(self):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self._f = None
+
+    def __enter__(self):
+        self._f = open(LOCK_FILE, "w")
+        try:
+            fcntl.flock(self._f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Another sync is already running — exiting.", file=sys.stderr)
+            sys.exit(0)
+        self._f.write(str(os.getpid()))
+        self._f.flush()
+        return self
+
+    def __exit__(self, *_):
+        if self._f:
+            fcntl.flock(self._f, fcntl.LOCK_UN)
+            self._f.close()
+
+
+# -- State management ---------------------------------------------------------
+
+def _load_state():
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except json.JSONDecodeError:
+            print("  State file corrupted — starting fresh.", file=sys.stderr)
+    return {}
+
+
+def _save_state(state):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write(STATE_FILE, json.dumps(state, indent=2))
+
+
+def _atomic_write(path: Path, content: str):
+    """Write to temp file then rename — prevents corruption on power loss."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# -- Markdown helpers ----------------------------------------------------------
+
+def _id_hash(item_id: str) -> str:
+    return hashlib.sha1(item_id.encode()).hexdigest()[:16]
+
+
+def _day_path(day_str: str) -> Path:
+    """Path for a daily browser file: data/browser/history/YYYY-MM/YYYY-MM-DD.md"""
+    month = day_str[:7]
+    folder = DATA_DIR / "history" / month
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / f"{day_str}.md"
+
+
+# -- URL filtering -------------------------------------------------------------
+
+def _should_skip(url: str) -> bool:
+    """Filter out noise URLs."""
+    if not url:
+        return True
+    url_lower = url.lower()
+    for prefix in SKIP_PREFIXES:
+        if url_lower.startswith(prefix):
+            return True
+    for pattern in SKIP_CONTAINS:
+        if pattern in url_lower:
+            return True
+    # Skip URLs longer than 500 chars (usually OAuth/tracking garbage)
+    if len(url) > 500:
+        return True
+    return False
+
+
+def _clean_title(title: str, url: str) -> str:
+    """Clean up page title for display."""
+    if not title or title.strip() == "":
+        # Extract domain from URL as fallback title
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            return parsed.netloc or url[:80]
+        except Exception:
+            return url[:80]
+    # Truncate very long titles
+    if len(title) > 120:
+        title = title[:117] + "..."
+    # Escape markdown special chars in title
+    title = title.replace("|", "\\|").replace("[", "\\[").replace("]", "\\]")
+    return title
+
+
+# -- Database extraction -------------------------------------------------------
+
+def _copy_db(db_path: Path) -> str:
+    """Copy a locked database to a temp file for safe reading."""
+    fd, tmp_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    shutil.copy2(db_path, tmp_path)
+    return tmp_path
+
+
+def _extract_safari(cutoff_ts, tz, verbose=False):
+    """Extract Safari history entries since cutoff timestamp.
+    cutoff_ts: Safari timestamp (seconds since 2001-01-01 UTC)
+    Returns: (entries_by_day, max_timestamp)
+    """
+    if not SAFARI_DB.exists():
+        if verbose:
+            print("  Safari: database not found, skipping", file=sys.stderr)
+        return {}, cutoff_ts
+
+    entries_by_day = defaultdict(list)
+    max_ts = cutoff_ts
+    tmp_path = None
+
+    try:
+        tmp_path = _copy_db(SAFARI_DB)
+        conn = sqlite3.connect(tmp_path)
+        conn.row_factory = sqlite3.Row
+
+        rows = conn.execute("""
+            SELECT
+                hi.url,
+                hv.title,
+                hv.visit_time
+            FROM history_visits hv
+            JOIN history_items hi ON hv.history_item = hi.id
+            WHERE hv.visit_time > ?
+            ORDER BY hv.visit_time ASC
+        """, (cutoff_ts,)).fetchall()
+
+        conn.close()
+
+        for row in rows:
+            url = row["url"]
+            if _should_skip(url):
+                continue
+            visit_time = row["visit_time"]
+            dt = SAFARI_EPOCH + timedelta(seconds=visit_time)
+            dt = dt.astimezone(tz)
+            day_key = dt.strftime("%Y-%m-%d")
+            title = _clean_title(row["title"], url)
+
+            entries_by_day[day_key].append({
+                "url": url,
+                "title": title,
+                "dt": dt,
+                "browser": "Safari",
+            })
+            if visit_time > max_ts:
+                max_ts = visit_time
+
+        if verbose:
+            total = sum(len(v) for v in entries_by_day.values())
+            print(f"  Safari: {total} entries (after filtering)", file=sys.stderr)
+
+    except sqlite3.Error as e:
+        print(f"  Safari: error reading history: {e}", file=sys.stderr)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+    return entries_by_day, max_ts
+
+
+def _extract_chrome(cutoff_ts, tz, verbose=False):
+    """Extract Chrome history entries since cutoff timestamp.
+    cutoff_ts: Chrome timestamp (microseconds since 1601-01-01 UTC)
+    Returns: (entries_by_day, max_timestamp)
+    """
+    if not CHROME_DB.exists():
+        if verbose:
+            print("  Chrome: database not found, skipping", file=sys.stderr)
+        return {}, cutoff_ts
+
+    entries_by_day = defaultdict(list)
+    max_ts = cutoff_ts
+    tmp_path = None
+
+    try:
+        tmp_path = _copy_db(CHROME_DB)
+        conn = sqlite3.connect(tmp_path)
+        conn.row_factory = sqlite3.Row
+
+        rows = conn.execute("""
+            SELECT
+                u.url,
+                u.title,
+                v.visit_time,
+                v.visit_duration
+            FROM visits v
+            JOIN urls u ON v.url = u.id
+            WHERE v.visit_time > ?
+            ORDER BY v.visit_time ASC
+        """, (cutoff_ts,)).fetchall()
+
+        conn.close()
+
+        for row in rows:
+            url = row["url"]
+            if _should_skip(url):
+                continue
+            visit_time = row["visit_time"]
+            dt = CHROME_EPOCH + timedelta(microseconds=visit_time)
+            dt = dt.astimezone(tz)
+            day_key = dt.strftime("%Y-%m-%d")
+            title = _clean_title(row["title"], url)
+
+            entries_by_day[day_key].append({
+                "url": url,
+                "title": title,
+                "dt": dt,
+                "browser": "Chrome",
+            })
+            if visit_time > max_ts:
+                max_ts = visit_time
+
+        if verbose:
+            total = sum(len(v) for v in entries_by_day.values())
+            print(f"  Chrome: {total} entries (after filtering)", file=sys.stderr)
+
+    except sqlite3.Error as e:
+        print(f"  Chrome: error reading history: {e}", file=sys.stderr)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+    return entries_by_day, max_ts
+
+
+# -- Sync ----------------------------------------------------------------------
+
+def _datetime_to_safari_ts(dt):
+    """Convert datetime to Safari timestamp (seconds since 2001-01-01 UTC)."""
+    delta = dt - SAFARI_EPOCH
+    return delta.total_seconds()
+
+
+def _datetime_to_chrome_ts(dt):
+    """Convert datetime to Chrome timestamp (microseconds since 1601-01-01 UTC)."""
+    delta = dt - CHROME_EPOCH
+    return int(delta.total_seconds() * 1_000_000)
+
+
+def sync_history(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = False):
+    """Sync browser history from Safari + Chrome."""
+    tz = pytz.timezone(TZ)
+
+    # Determine date boundaries
+    hist_state = state.get("history", {})
+
+    # Safari cutoff
+    safari_last = hist_state.get("safariLastTimestamp")
+    if safari_last is not None:
+        safari_cutoff = float(safari_last)
+        print(f"  Safari: syncing since last sync...", file=sys.stderr)
+    else:
+        since_dt = datetime.now(timezone.utc) - timedelta(days=since_days)
+        safari_cutoff = _datetime_to_safari_ts(since_dt)
+        print(f"  Safari: backfilling {since_days} days...", file=sys.stderr)
+
+    # Chrome cutoff
+    chrome_last = hist_state.get("chromeLastTimestamp")
+    if chrome_last is not None:
+        chrome_cutoff = int(chrome_last)
+        print(f"  Chrome: syncing since last sync...", file=sys.stderr)
+    else:
+        since_dt = datetime.now(timezone.utc) - timedelta(days=since_days)
+        chrome_cutoff = _datetime_to_chrome_ts(since_dt)
+        print(f"  Chrome: backfilling {since_days} days...", file=sys.stderr)
+
+    # Extract from both browsers
+    safari_by_day, new_safari_ts = _extract_safari(safari_cutoff, tz, verbose)
+    chrome_by_day, new_chrome_ts = _extract_chrome(chrome_cutoff, tz, verbose)
+
+    # Merge by day
+    all_days = sorted(set(list(safari_by_day.keys()) + list(chrome_by_day.keys())))
+    written = 0
+    total_entries = 0
+
+    for day in all_days:
+        entries = []
+        entries.extend(safari_by_day.get(day, []))
+        entries.extend(chrome_by_day.get(day, []))
+
+        # Sort by time
+        entries.sort(key=lambda e: e["dt"])
+
+        # Dedup by URL within same day (keep first visit, count repeats)
+        seen_urls = {}
+        deduped = []
+        for entry in entries:
+            url = entry["url"]
+            if url in seen_urls:
+                seen_urls[url]["count"] += 1
+            else:
+                entry["count"] = 1
+                seen_urls[url] = entry
+                deduped.append(entry)
+
+        # Count by browser
+        safari_count = sum(1 for e in entries if e["browser"] == "Safari")
+        chrome_count = sum(1 for e in entries if e["browser"] == "Chrome")
+        total_count = len(deduped)
+        total_entries += total_count
+
+        # Group by hour
+        by_hour = defaultdict(list)
+        for entry in deduped:
+            hour = entry["dt"].hour
+            by_hour[hour].append(entry)
+
+        # Build markdown
+        id_str = f"browser-{day}"
+        lines = [
+            "---",
+            "source: browser-history",
+            f"date: {day}",
+            f"idhash: {_id_hash(id_str)}",
+            f"safari_count: {safari_count}",
+            f"chrome_count: {chrome_count}",
+            f"total: {total_count}",
+            "---",
+            "",
+            f"# Browser History — {day}",
+            "",
+        ]
+
+        for hour in sorted(by_hour.keys()):
+            hour_entries = by_hour[hour]
+            hour_label = f"{hour:02d}:00"
+            next_hour = f"{(hour + 1) % 24:02d}:00"
+            lines.append(f"### {hour_label} – {next_hour}")
+            lines.append(f"*Browser History ({day}, {hour_label} hour)*")
+            lines.append("")
+
+            for entry in hour_entries:
+                time_str = entry["dt"].strftime("%I:%M %p").lstrip("0")
+                browser = entry["browser"]
+                title = entry["title"]
+                url = entry["url"]
+                count_str = f" (x{entry['count']})" if entry["count"] > 1 else ""
+
+                lines.append(f"- [{title}]({url}) ({browser}, {time_str}){count_str}")
+
+            lines.append("")
+
+        content = "\n".join(lines)
+        filepath = _day_path(day)
+        _atomic_write(filepath, content)
+        written += 1
+        if verbose:
+            print(f"    {day}: {total_count} unique visits "
+                  f"({safari_count} Safari, {chrome_count} Chrome)", file=sys.stderr)
+
+    print(f"  History: {written} days written ({total_entries} unique visits)",
+          file=sys.stderr)
+
+    # Update state
+    state["history"] = {
+        "safariLastTimestamp": str(new_safari_ts),
+        "chromeLastTimestamp": str(new_chrome_ts),
+        "lastSync": datetime.now(timezone.utc).isoformat(),
+    }
+
+    return written
+
+
+# -- Commands ------------------------------------------------------------------
+
+def cmd_sync(args):
+    with SyncLock():
+        state = _load_state()
+        sources = ["history"] if args.source == "all" else [args.source]
+
+        if args.reset:
+            for source in sources:
+                state.pop(source, None)
+            print(f"  State cleared for: {', '.join(sources)}", file=sys.stderr)
+
+        fns = {"history": sync_history}
+        total = 0
+        for source in sources:
+            try:
+                total += fns[source](state, since_days=args.since, verbose=args.verbose)
+            except Exception as e:
+                print(f"  {source} sync failed: {e}", file=sys.stderr)
+                if args.verbose:
+                    import traceback; traceback.print_exc()
+            _save_state(state)
+        print(f"Sync complete — {total} total items.", file=sys.stderr)
+
+
+def cmd_status(args):
+    print("Browser History Sync Status")
+    print("=" * 40)
+    state = {}
+    if STATE_FILE.exists():
+        try:
+            state = json.loads(STATE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            print("  State file corrupted")
+
+    for source in ("history",):
+        info = state.get(source, {})
+        if isinstance(info, dict) and "lastSync" in info:
+            print(f"  {source:12s}  last sync: {info['lastSync']}")
+        else:
+            print(f"  {source:12s}  (not synced)")
+
+    # File counts
+    print()
+    hist_dir = DATA_DIR / "history"
+    if hist_dir.exists():
+        files = list(hist_dir.rglob("*.md"))
+        print(f"  daily files    {len(files)} on disk")
+
+    # Browser DB info
+    print()
+    if SAFARI_DB.exists():
+        print(f"  Safari DB: {SAFARI_DB} (exists)")
+    else:
+        print(f"  Safari DB: not found")
+    if CHROME_DB.exists():
+        print(f"  Chrome DB: {CHROME_DB} (exists)")
+    else:
+        print(f"  Chrome DB: not found")
+    print()
+
+
+# -- CLI -----------------------------------------------------------------------
+
+def main():
+    p   = argparse.ArgumentParser(description="Edwin Browser History Connector")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    # sync
+    s = sub.add_parser("sync", help="Sync browser history to data/browser/")
+    s.add_argument("source", choices=["all", "history"])
+    s.add_argument("--since", type=int, default=DEFAULT_SINCE,
+                   help=f"Days back for initial/reset sync (default {DEFAULT_SINCE})")
+    s.add_argument("--reset", action="store_true",
+                   help="Clear saved state and re-fetch from --since days back")
+    s.add_argument("--verbose", action="store_true")
+    s.set_defaults(func=cmd_sync)
+
+    # status
+    st = sub.add_parser("status", help="Show last sync times and file counts")
+    st.set_defaults(func=cmd_status)
+
+    args = p.parse_args()
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        import traceback; traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

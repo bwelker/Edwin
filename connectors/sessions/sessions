@@ -1,0 +1,634 @@
+#!/usr/bin/env python3
+"""
+Edwin Claude Code Session Connector — JSONL session log archiver
+
+Modes:
+  sync           — incremental extraction to data/sessions/claude-code/
+  status         — show last sync times and file counts
+
+Source: ~/.claude/projects/<your-project>/*.jsonl
+Output: data/sessions/claude-code/{session-id}.md — one file per session
+
+Each JSONL file contains one JSON object per line with types:
+  user, assistant, queue-operation, progress
+We extract user messages and assistant text/tool_use blocks.
+Thinking blocks are skipped. Tool results are skipped (they come
+back as user-type messages with tool_result content).
+"""
+
+import os
+import sys
+import json
+import argparse
+import re
+import fcntl
+import tempfile
+import hashlib
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import pytz
+
+
+# -- Config --------------------------------------------------------------------
+
+EDWIN_HOME      = Path(os.environ.get("EDWIN_HOME", Path(__file__).resolve().parent.parent.parent))
+
+SOURCE_DIR    = Path(os.environ.get("EDWIN_SESSION_DIR", str(Path.home() / ".claude" / "projects")))
+TZ            = "America/New_York"
+DATA_DIR      = EDWIN_HOME / "data" / "sessions"
+OUTPUT_DIR    = DATA_DIR / "claude-code"
+STATE_FILE    = DATA_DIR / ".sync-state.json"
+LOCK_FILE     = DATA_DIR / ".sync.lock"
+MIN_MESSAGES  = 3   # skip sessions with fewer real turns
+DEFAULT_SINCE = 90  # days back for initial sync
+
+# Skip sessions containing credentials/secrets
+SKIP_PATTERNS = re.compile(
+    r'access.?key|api.?secret|\.env\b|AKIA[A-Z0-9]|password.{0,5}[:=]|'
+    r'api.?token.{0,5}[:=]|service.?token|AWS.?Secret|cloudflare.?key|'
+    r'sk-ant-api|sk-[a-zA-Z0-9]{20,}',
+    re.IGNORECASE
+)
+
+
+# -- Lockfile ------------------------------------------------------------------
+
+class SyncLock:
+    def __init__(self):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self._f = None
+
+    def __enter__(self):
+        self._f = open(LOCK_FILE, "w")
+        try:
+            fcntl.flock(self._f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Another sync is already running — exiting.", file=sys.stderr)
+            sys.exit(0)
+        self._f.write(str(os.getpid()))
+        self._f.flush()
+        return self
+
+    def __exit__(self, *_):
+        if self._f:
+            fcntl.flock(self._f, fcntl.LOCK_UN)
+            self._f.close()
+
+
+# -- State management ---------------------------------------------------------
+
+def _load_state():
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except json.JSONDecodeError:
+            print("  State file corrupted — starting fresh.", file=sys.stderr)
+    return {}
+
+
+def _save_state(state):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write(STATE_FILE, json.dumps(state, indent=2))
+
+
+def _atomic_write(path: Path, content: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# -- Helpers -------------------------------------------------------------------
+
+def _id_hash(item_id: str) -> str:
+    return hashlib.sha1(item_id.encode()).hexdigest()[:16]
+
+
+def _format_ts(iso_str: str, tz) -> str:
+    """Convert ISO timestamp to 'HH:MM ET' display format."""
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        local = dt.astimezone(tz)
+        return local.strftime("%H:%M ET")
+    except (ValueError, AttributeError):
+        return ""
+
+
+def _format_date(iso_str: str, tz) -> str:
+    """Convert ISO timestamp to 'YYYY-MM-DD' display format."""
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        local = dt.astimezone(tz)
+        return local.strftime("%Y-%m-%d")
+    except (ValueError, AttributeError):
+        return ""
+
+
+def _tool_summary(block: dict) -> str:
+    """Format a tool_use block as a brief blockquote line."""
+    name = block.get("name", "Unknown")
+    inp = block.get("input", {})
+
+    if name == "Read":
+        path = inp.get("file_path", "")
+        # Shorten home dir
+        path = path.replace(str(Path.home()), "~")
+        return f"> Used tool: Read ({path})"
+    elif name == "Write":
+        path = inp.get("file_path", "")
+        path = path.replace(str(Path.home()), "~")
+        return f"> Used tool: Write ({path})"
+    elif name == "Edit":
+        path = inp.get("file_path", "")
+        path = path.replace(str(Path.home()), "~")
+        return f"> Used tool: Edit ({path})"
+    elif name == "Bash":
+        cmd = inp.get("command", "")
+        desc = inp.get("description", "")
+        preview = desc if desc else cmd[:80]
+        return f"> Used tool: Bash ({preview})"
+    elif name == "Grep":
+        pattern = inp.get("pattern", "")
+        return f"> Used tool: Grep (pattern: {pattern[:60]})"
+    elif name == "Glob":
+        pattern = inp.get("pattern", "")
+        return f"> Used tool: Glob ({pattern})"
+    elif name == "Agent":
+        desc = inp.get("description", "")
+        return f"> Used tool: Agent ({desc})"
+    elif name == "TodoWrite":
+        return "> Used tool: TodoWrite"
+    elif name == "ToolSearch":
+        query = inp.get("query", "")
+        return f"> Used tool: ToolSearch ({query})"
+    elif name == "ExitPlanMode":
+        return "> Used tool: ExitPlanMode"
+    else:
+        # Generic: show first input key value
+        if inp:
+            first_key = next(iter(inp))
+            val = str(inp[first_key])[:80]
+            return f"> Used tool: {name} ({first_key}: {val})"
+        return f"> Used tool: {name}"
+
+
+# -- JSONL Parsing -------------------------------------------------------------
+
+def _parse_session(path: Path, verbose: bool = False):
+    """Parse a JSONL session file into structured data.
+
+    Returns dict with keys: session_id, slug, model, project, date, date_end,
+    messages (list of turn dicts), tools_used (set), or None if invalid.
+    """
+    records = []
+    malformed = 0
+
+    with open(path, "r") as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                records.append(rec)
+            except json.JSONDecodeError:
+                malformed += 1
+                if verbose:
+                    print(f"    Malformed line {lineno} in {path.name}", file=sys.stderr)
+
+    if malformed and verbose:
+        print(f"    {malformed} malformed lines skipped in {path.name}", file=sys.stderr)
+
+    if not records:
+        return None
+
+    # Extract session_id from first record
+    session_id = records[0].get("sessionId", path.stem)
+
+    # Collect user and assistant messages, skip queue-operation/progress/tool_result
+    turns = []
+    slug = ""
+    models = Counter()
+    tools_used = set()
+    first_ts = None
+    last_ts = None
+
+    # Track which assistant message IDs we've already seen text for
+    # (assistant messages stream as multiple JSONL records with same message.id)
+    seen_text = {}  # msg_id -> list of text blocks
+    seen_tools = {}  # msg_id -> list of tool blocks
+
+    for rec in records:
+        ts = rec.get("timestamp", "")
+
+        # Track timestamps
+        if ts:
+            if first_ts is None:
+                first_ts = ts
+            last_ts = ts
+
+        rec_type = rec.get("type", "")
+        role = rec.get("message", {}).get("role", "")
+
+        # Extract slug from user messages
+        if not slug and rec.get("slug"):
+            slug = rec["slug"]
+
+        # Skip queue-operation, progress, system messages
+        if rec_type in ("queue-operation", "progress"):
+            continue
+
+        # User messages
+        if rec_type == "user" or role == "user":
+            content = rec.get("message", {}).get("content", "")
+
+            # Skip tool_result messages (they're user-type but contain tool results)
+            if isinstance(content, list):
+                # Check if all items are tool_result type
+                is_tool_result = all(
+                    isinstance(c, dict) and c.get("type") == "tool_result"
+                    for c in content if isinstance(c, dict)
+                )
+                if is_tool_result:
+                    continue
+                # Some user messages have mixed content — extract text parts
+                text_parts = []
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "text":
+                        text_parts.append(c.get("text", ""))
+                    elif isinstance(c, str):
+                        text_parts.append(c)
+                content = "\n".join(text_parts)
+                if not content.strip():
+                    continue
+
+            if isinstance(content, str) and content.strip():
+                # Credential check on user messages
+                if SKIP_PATTERNS.search(content):
+                    return None  # Skip entire session
+
+                turns.append({
+                    "role": "user",
+                    "timestamp": ts,
+                    "content": content.strip(),
+                    "tools": [],
+                })
+
+        # Assistant messages
+        elif role == "assistant":
+            msg = rec.get("message", {})
+            msg_id = msg.get("id", "")
+            model = msg.get("model", "")
+            content = msg.get("content", [])
+
+            if model:
+                models[model] += 1
+
+            if not isinstance(content, list):
+                continue
+
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type", "")
+
+                if btype == "text":
+                    text = block.get("text", "").strip()
+                    if text:
+                        if msg_id not in seen_text:
+                            seen_text[msg_id] = []
+                        seen_text[msg_id].append(text)
+
+                elif btype == "tool_use":
+                    tool_name = block.get("name", "")
+                    if tool_name:
+                        tools_used.add(tool_name)
+                    if msg_id not in seen_tools:
+                        seen_tools[msg_id] = []
+                    seen_tools[msg_id].append(block)
+
+                # Skip: thinking, tool_result, etc.
+
+    # Now build assistant turns from collected text/tools per message ID
+    # We need to interleave them with user turns by timestamp
+    # Approach: build a timeline of all events, then merge
+
+    # Build assistant turn entries keyed by msg_id with earliest timestamp
+    assistant_turns = {}
+    for rec in records:
+        role = rec.get("message", {}).get("role", "")
+        if role != "assistant":
+            continue
+        msg_id = rec.get("message", {}).get("id", "")
+        ts = rec.get("timestamp", "")
+        if msg_id and ts:
+            if msg_id not in assistant_turns:
+                assistant_turns[msg_id] = ts
+            # Keep the earliest timestamp for this message
+            if ts < assistant_turns[msg_id]:
+                assistant_turns[msg_id] = ts
+
+    # Create assistant turn objects
+    for msg_id, ts in sorted(assistant_turns.items(), key=lambda x: x[1]):
+        texts = seen_text.get(msg_id, [])
+        tools = seen_tools.get(msg_id, [])
+        if not texts and not tools:
+            continue
+        turns.append({
+            "role": "assistant",
+            "timestamp": ts,
+            "content": "\n\n".join(texts),
+            "tools": tools,
+        })
+
+    # Sort all turns by timestamp
+    turns.sort(key=lambda t: t.get("timestamp", ""))
+
+    if not turns:
+        return None
+
+    primary_model = models.most_common(1)[0][0] if models else "unknown"
+
+    return {
+        "session_id": session_id,
+        "slug": slug,
+        "model": primary_model,
+        "project": "Edwin",
+        "date": first_ts or "",
+        "date_end": last_ts or "",
+        "turns": turns,
+        "tools_used": tools_used,
+    }
+
+
+# -- Markdown Rendering --------------------------------------------------------
+
+def _render_session(session: dict, tz) -> str:
+    """Render parsed session data into markdown with YAML frontmatter."""
+    sid = session["session_id"]
+    slug = session["slug"] or _format_date(session["date"], tz)
+    date_display = _format_date(session["date"], tz)
+    model = session["model"]
+    tools_str = ",".join(sorted(session["tools_used"])) if session["tools_used"] else ""
+
+    # Count real user + assistant turns (not tool results)
+    user_msgs = sum(1 for t in session["turns"] if t["role"] == "user")
+    asst_msgs = sum(1 for t in session["turns"] if t["role"] == "assistant")
+    total_msgs = user_msgs + asst_msgs
+
+    lines = [
+        "---",
+        "source: sessions-claude-code",
+        f"session_id: {sid}",
+        f"idhash: {_id_hash(sid)}",
+        f"date: {session['date']}",
+        f"date_end: {session['date_end']}",
+        f"model: {model}",
+        f"messages: {total_msgs}",
+    ]
+    if slug:
+        lines.append(f"slug: {slug}")
+    lines.append(f"project: {session['project']}")
+    if tools_str:
+        lines.append(f"tools_used: {tools_str}")
+    lines.extend([
+        "---",
+        "",
+        f"# Session: {slug}",
+        f"*Claude Code session ({date_display}, {total_msgs} messages, {model})*",
+        "",
+    ])
+
+    turn_num = 0
+    for turn in session["turns"]:
+        turn_num += 1
+        role_display = "User" if turn["role"] == "user" else "Assistant"
+        ts_display = _format_ts(turn["timestamp"], tz)
+
+        lines.append(f"## Turn {turn_num}")
+        lines.append(f"**{role_display}** ({ts_display})")
+        lines.append("")
+
+        # Tool use summaries (before text content)
+        if turn["tools"]:
+            for tool_block in turn["tools"]:
+                lines.append(_tool_summary(tool_block))
+            lines.append("")
+
+        if turn["content"]:
+            lines.append(turn["content"])
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+# -- Sync ----------------------------------------------------------------------
+
+def _scan_sessions(state: dict, since_days: int, force: bool) -> list[Path]:
+    """Return JSONL files needing processing (new or changed)."""
+    if not SOURCE_DIR.exists():
+        print(f"  Source directory not found: {SOURCE_DIR}", file=sys.stderr)
+        return []
+
+    sessions_state = state.get("sessions", {})
+    cutoff = datetime.now(timezone.utc) - timedelta(days=since_days)
+    cutoff_ts = cutoff.timestamp()
+
+    files = []
+    for path in sorted(SOURCE_DIR.glob("*.jsonl")):
+        stat = path.stat()
+
+        if force:
+            files.append(path)
+            continue
+
+        # Check if file is newer than cutoff (for --since)
+        if stat.st_mtime < cutoff_ts:
+            continue
+
+        # Check if file has changed since last sync
+        sid = path.stem
+        prev = sessions_state.get(sid, {})
+        if prev.get("mtime") == stat.st_mtime and prev.get("size") == stat.st_size:
+            continue
+
+        files.append(path)
+
+    return files
+
+
+def sync_sessions(state: dict, since_days: int = DEFAULT_SINCE,
+                  force: bool = False, verbose: bool = False):
+    """Main sync loop. Returns count of sessions written."""
+    tz = pytz.timezone(TZ)
+    sessions_state = state.setdefault("sessions", {})
+
+    files = _scan_sessions(state, since_days, force)
+    if not files:
+        print("  No new or changed sessions to process.", file=sys.stderr)
+        return 0
+
+    print(f"  Processing {len(files)} session files...", file=sys.stderr)
+
+    written = 0
+    skipped_small = 0
+    skipped_creds = 0
+
+    for path in files:
+        sid = path.stem
+        stat = path.stat()
+
+        if verbose:
+            print(f"    Parsing {sid}...", file=sys.stderr)
+
+        session = _parse_session(path, verbose=verbose)
+
+        if session is None:
+            # Could be credentials skip or empty
+            if verbose:
+                print(f"    Skipped {sid} (credentials or empty)", file=sys.stderr)
+            skipped_creds += 1
+            # Still update state so we don't re-scan
+            sessions_state[sid] = {
+                "mtime": stat.st_mtime,
+                "size": stat.st_size,
+                "messages": 0,
+                "skipped": True,
+                "lastSync": datetime.now(timezone.utc).isoformat(),
+            }
+            continue
+
+        # Count real turns
+        total_msgs = sum(1 for t in session["turns"]
+                        if t["role"] in ("user", "assistant"))
+        if total_msgs < MIN_MESSAGES:
+            if verbose:
+                print(f"    Skipped {sid} ({total_msgs} messages < {MIN_MESSAGES})", file=sys.stderr)
+            skipped_small += 1
+            sessions_state[sid] = {
+                "mtime": stat.st_mtime,
+                "size": stat.st_size,
+                "messages": total_msgs,
+                "skipped": True,
+                "lastSync": datetime.now(timezone.utc).isoformat(),
+            }
+            continue
+
+        # Render and write
+        markdown = _render_session(session, tz)
+        out_path = OUTPUT_DIR / f"{sid}.md"
+        _atomic_write(out_path, markdown)
+        written += 1
+
+        sessions_state[sid] = {
+            "mtime": stat.st_mtime,
+            "size": stat.st_size,
+            "messages": total_msgs,
+            "lastSync": datetime.now(timezone.utc).isoformat(),
+        }
+
+        if verbose:
+            slug = session.get("slug", "")
+            print(f"    Wrote {sid} ({total_msgs} msgs, slug={slug})", file=sys.stderr)
+
+    print(f"  Sessions: {written} written, {skipped_small} skipped (too small), "
+          f"{skipped_creds} skipped (credentials/empty)", file=sys.stderr)
+
+    state["lastSync"] = datetime.now(timezone.utc).isoformat()
+    return written
+
+
+# -- Commands ------------------------------------------------------------------
+
+def cmd_sync(args):
+    with SyncLock():
+        state = _load_state()
+
+        if args.force:
+            state.pop("sessions", None)
+            print("  State cleared — reprocessing all sessions.", file=sys.stderr)
+
+        total = sync_sessions(
+            state,
+            since_days=args.since,
+            force=args.force,
+            verbose=args.verbose,
+        )
+        _save_state(state)
+        print(f"Sync complete — {total} sessions written.", file=sys.stderr)
+
+
+def cmd_status(args):
+    print("Claude Code Session Sync Status")
+    print("=" * 40)
+    state = {}
+    if STATE_FILE.exists():
+        try:
+            state = json.loads(STATE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            print("  State file corrupted")
+
+    sessions = state.get("sessions", {})
+    last_sync = state.get("lastSync", "(never)")
+    print(f"  Last sync: {last_sync}")
+    print(f"  Sessions tracked: {len(sessions)}")
+
+    active = sum(1 for s in sessions.values() if not s.get("skipped"))
+    skipped = sum(1 for s in sessions.values() if s.get("skipped"))
+    print(f"  Active (written): {active}")
+    print(f"  Skipped: {skipped}")
+
+    # Count output files
+    if OUTPUT_DIR.exists():
+        files = list(OUTPUT_DIR.glob("*.md"))
+        print(f"  Output files on disk: {len(files)}")
+
+    # Count source files
+    if SOURCE_DIR.exists():
+        sources = list(SOURCE_DIR.glob("*.jsonl"))
+        print(f"  Source JSONL files: {len(sources)}")
+    else:
+        print(f"  Source dir not found: {SOURCE_DIR}")
+    print()
+
+
+# -- CLI -----------------------------------------------------------------------
+
+def main():
+    p   = argparse.ArgumentParser(description="Edwin Claude Code Session Connector")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    s = sub.add_parser("sync", help="Sync session logs to data/sessions/claude-code/")
+    s.add_argument("--since", type=int, default=DEFAULT_SINCE,
+                   help=f"Days back for initial sync (default {DEFAULT_SINCE})")
+    s.add_argument("--force", action="store_true",
+                   help="Reprocess all sessions regardless of state")
+    s.add_argument("--verbose", action="store_true")
+    s.set_defaults(func=cmd_sync)
+
+    st = sub.add_parser("status", help="Show sync state and file counts")
+    st.set_defaults(func=cmd_status)
+
+    args = p.parse_args()
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        import traceback; traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

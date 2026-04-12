@@ -1,0 +1,1022 @@
+#!/usr/bin/env python3
+"""
+Edwin Fireflies Connector — Meeting transcripts, audio & video
+
+Modes:
+  sync <source>   — incremental extraction to data/fireflies/
+  status          — show last sync times
+
+Sources: transcripts, audio, video, all
+  "all" syncs transcripts only (audio/video are on-demand)
+
+API:
+  GraphQL: https://api.fireflies.ai/graphql
+  Auth:    Authorization: Bearer <FIREFLIES_API_KEY>
+  Rate:    60 requests/minute (Business plan)
+"""
+
+import os
+import sys
+import json
+import argparse
+import re
+import time
+import fcntl
+import tempfile
+import hashlib
+import html as html_mod
+import requests
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import pytz
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
+
+
+# -- Config --------------------------------------------------------------------
+
+EDWIN_HOME      = Path(os.environ.get("EDWIN_HOME", Path(__file__).resolve().parent.parent.parent))
+
+FIREFLIES_ENDPOINT = "https://api.fireflies.ai/graphql"
+TZ                 = os.environ.get("EDWIN_TZ", "America/New_York")
+DATA_DIR           = EDWIN_HOME / "data" / "fireflies"
+STATE_FILE         = DATA_DIR / ".sync-state.json"
+LOCK_FILE          = DATA_DIR / ".sync.lock"
+DEFAULT_SINCE      = 30  # days back for initial sync
+
+# Rate limiting: 60 req/min = 1/sec
+_MIN_REQUEST_INTERVAL = 1.05
+_last_request_time    = 0.0
+_last_throttle_time   = 0.0
+_THROTTLE_COOLDOWN    = 5.0  # longer cooldown — Fireflies rate limits are stricter
+
+
+# -- Lockfile ------------------------------------------------------------------
+
+class SyncLock:
+    """Prevents concurrent sync runs via exclusive file lock."""
+    def __init__(self):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self._f = None
+
+    def __enter__(self):
+        self._f = open(LOCK_FILE, "w")
+        try:
+            fcntl.flock(self._f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Another sync is already running — exiting.", file=sys.stderr)
+            sys.exit(0)
+        self._f.write(str(os.getpid()))
+        self._f.flush()
+        return self
+
+    def __exit__(self, *_):
+        if self._f:
+            fcntl.flock(self._f, fcntl.LOCK_UN)
+            self._f.close()
+
+
+# -- Auth ----------------------------------------------------------------------
+
+_ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
+_cached_api_key = None
+
+def _api_key():
+    global _cached_api_key
+    if _cached_api_key is None:
+        # Try ~/.edwin/credentials first, then .env, then shell environment
+        _cred_file = Path.home() / ".edwin" / "credentials" / "fireflies" / "env"
+        for path in [_cred_file, _ENV_FILE]:
+            if path.exists():
+                for line in path.read_text().splitlines():
+                    if line.startswith("FIREFLIES_API_KEY="):
+                        _cached_api_key = line.split("=", 1)[1].strip().strip('"')
+                        break
+            if _cached_api_key:
+                break
+        if not _cached_api_key:
+            _cached_api_key = os.environ.get("FIREFLIES_API_KEY", "")
+    return _cached_api_key
+
+
+# -- HTTP / GraphQL helpers ----------------------------------------------------
+
+def _wait_retry_after_or_exp(retry_state):
+    """Use Retry-After header if available, otherwise exponential backoff."""
+    exc = retry_state.outcome.exception()
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        retry_after = exc.response.headers.get("Retry-After")
+        if retry_after is not None:
+            try:
+                return int(retry_after)
+            except (ValueError, TypeError):
+                pass
+    return wait_exponential(multiplier=2, min=2, max=60)(retry_state)
+
+
+def _is_retryable(exc):
+    """Retryable errors: 429, 5xx, connection issues."""
+    global _last_throttle_time
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        status = exc.response.status_code
+        if status == 429:
+            _last_throttle_time = time.time()
+        return status in (429, 500, 502, 503, 504)
+    if isinstance(exc, json.JSONDecodeError):
+        return True
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    return False
+
+
+class FirefliesError(Exception):
+    """GraphQL-level error from Fireflies API."""
+    pass
+
+
+@retry(retry=retry_if_exception(_is_retryable),
+       wait=_wait_retry_after_or_exp,
+       stop=stop_after_attempt(5))
+def _graphql(query, variables=None):
+    """Execute a GraphQL query with rate limiting and retry."""
+    global _last_request_time
+    # Enforce min interval
+    now = time.time()
+    wait = _MIN_REQUEST_INTERVAL - (now - _last_request_time)
+    if wait > 0:
+        time.sleep(wait)
+    # Proactive cooldown after recent throttle
+    if time.time() - _last_throttle_time < _THROTTLE_COOLDOWN:
+        time.sleep(_THROTTLE_COOLDOWN)
+
+    payload = {"query": query}
+    if variables:
+        payload["variables"] = variables
+
+    resp = requests.post(
+        FIREFLIES_ENDPOINT,
+        json=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {_api_key()}",
+        },
+        timeout=30,
+    )
+    _last_request_time = time.time()
+    resp.raise_for_status()
+    data = resp.json()
+
+    if "errors" in data:
+        msgs = [e.get("message", "Unknown error") for e in data["errors"]]
+        raise FirefliesError(f"GraphQL errors: {'; '.join(msgs)}")
+
+    return data
+
+
+def _download_url(url, timeout=120):
+    """Download a URL and return bytes. For audio/video."""
+    global _last_request_time
+    now = time.time()
+    wait = _MIN_REQUEST_INTERVAL - (now - _last_request_time)
+    if wait > 0:
+        time.sleep(wait)
+
+    resp = requests.get(url, timeout=timeout, stream=True)
+    _last_request_time = time.time()
+    resp.raise_for_status()
+    return resp.content
+
+
+# -- GraphQL Queries -----------------------------------------------------------
+
+TRANSCRIPTS_LIST_QUERY = """
+query Transcripts($limit: Int, $skip: Int, $fromDate: DateTime, $toDate: DateTime) {
+    transcripts(limit: $limit, skip: $skip, fromDate: $fromDate, toDate: $toDate) {
+        id
+        title
+        date
+        duration
+    }
+}
+"""
+
+TRANSCRIPT_DETAIL_QUERY = """
+query Transcript($transcriptId: String!) {
+    transcript(id: $transcriptId) {
+        id
+        title
+        date
+        duration
+        organizer_email
+        participants
+        meeting_link
+        calendar_id
+        calendar_type
+        fireflies_users
+        is_live
+        speakers {
+            id
+            name
+        }
+        meeting_attendees {
+            displayName
+            email
+            phoneNumber
+            name
+        }
+        meeting_attendance {
+            name
+            join_time
+            leave_time
+        }
+        meeting_info {
+            fred_joined
+            silent_meeting
+            summary_status
+        }
+        sentences {
+            index
+            text
+            raw_text
+            start_time
+            end_time
+            speaker_id
+            speaker_name
+            ai_filters {
+                task
+                pricing
+                metric
+                question
+                date_and_time
+                text_cleanup
+                sentiment
+            }
+        }
+        summary {
+            action_items
+            keywords
+            outline
+            overview
+            shorthand_bullet
+            notes
+            gist
+            bullet_gist
+            short_summary
+            short_overview
+            meeting_type
+            topics_discussed
+            transcript_chapters
+        }
+        audio_url
+        video_url
+    }
+}
+"""
+
+# Separate query for analytics (Pro+ plan)
+TRANSCRIPT_ANALYTICS_QUERY = """
+query Transcript($transcriptId: String!) {
+    transcript(id: $transcriptId) {
+        id
+        analytics {
+            sentiments {
+                positive_pct
+                negative_pct
+                neutral_pct
+            }
+            speakers {
+                speaker_id
+                name
+                duration
+                word_count
+                longest_monologue
+                monologues_count
+                filler_words
+                questions
+                duration_pct
+                words_per_minute
+            }
+        }
+    }
+}
+"""
+
+BITES_QUERY = """
+query Bites($transcriptId: ID, $limit: Int, $skip: Int) {
+    bites(transcript_id: $transcriptId, limit: $limit, skip: $skip) {
+        bite_id
+        transcript_id
+        start_time
+        end_time
+        text
+        speaker_name
+        media_type
+        created_at
+        name
+    }
+}
+"""
+
+APPS_QUERY = """
+query Apps($transcriptId: String, $limit: Int, $skip: Int) {
+    apps(transcript_id: $transcriptId, limit: $limit, skip: $skip) {
+        transcript_id
+        app_id
+        title
+        prompt
+        response
+        created_at
+    }
+}
+"""
+
+
+# -- State ---------------------------------------------------------------------
+
+def _load_state():
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except json.JSONDecodeError:
+            print("  State file corrupted — starting fresh.", file=sys.stderr)
+    return {}
+
+
+def _save_state(state):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write(STATE_FILE, json.dumps(state, indent=2))
+
+
+def _atomic_write(path: Path, content: str):
+    """Write to temp file then rename — prevents corruption on power loss."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_write_binary(path: Path, data: bytes):
+    """Atomic binary write for audio/video files."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# -- Helpers -------------------------------------------------------------------
+
+def _id_hash(item_id: str) -> str:
+    return hashlib.sha1(item_id.encode()).hexdigest()[:16]
+
+
+def _sanitize_filename(name: str) -> str:
+    name = re.sub(r'[/\\:*?"<>|]', '-', name)
+    name = re.sub(r'-{2,}', '-', name)
+    name = name.strip(' .-')
+    return (name or "unnamed")[:50]
+
+
+def _since_dt(days: int) -> datetime:
+    return datetime.now(pytz.utc) - timedelta(days=days)
+
+
+def _try_parse_iso(ts: str) -> datetime:
+    """Parse ISO 8601 timestamp. Returns epoch-zero on failure."""
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (ValueError, TypeError, AttributeError):
+        return datetime(1970, 1, 1, tzinfo=pytz.utc)
+
+
+def _ts_to_dt(ts_ms) -> datetime:
+    """Convert Fireflies millisecond timestamp to datetime."""
+    if not ts_ms:
+        return datetime(1970, 1, 1, tzinfo=pytz.utc)
+    try:
+        return datetime.fromtimestamp(ts_ms / 1000, tz=pytz.utc)
+    except (ValueError, TypeError, OSError):
+        return datetime(1970, 1, 1, tzinfo=pytz.utc)
+
+
+def _format_duration(minutes):
+    """Format duration from minutes (float) to human readable."""
+    if not minutes:
+        return "0m"
+    try:
+        total_seconds = int(float(minutes) * 60)
+    except (ValueError, TypeError):
+        return "0m"
+    hours, remainder = divmod(total_seconds, 3600)
+    mins = remainder // 60
+    if hours:
+        return f"{hours}h {mins}m"
+    return f"{mins}m"
+
+
+def _format_timecode(seconds_str):
+    """Format a seconds value as MM:SS or HH:MM:SS."""
+    try:
+        total = int(float(seconds_str))
+    except (ValueError, TypeError):
+        return "00:00"
+    hours, remainder = divmod(total, 3600)
+    mins, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{mins:02d}:{secs:02d}"
+    return f"{mins:02d}:{secs:02d}"
+
+
+def _strip_html(html) -> str:
+    if not isinstance(html, str):
+        return str(html) if html else ""
+    html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r'<br\s*/?>', '\n', html, flags=re.IGNORECASE)
+    html = re.sub(r'</?p[^>]*>', '\n', html, flags=re.IGNORECASE)
+    html = re.sub(r'</?div[^>]*>', '\n', html, flags=re.IGNORECASE)
+    html = re.sub(r'</?li[^>]*>', '\n- ', html, flags=re.IGNORECASE)
+    html = re.sub(r'<[^>]+>', '', html)
+    html = html_mod.unescape(html)
+    return re.sub(r'\n{3,}', '\n\n', html).strip()
+
+
+def _transcript_path(dt: datetime, title: str) -> Path:
+    """Generate path for a transcript file: YYYY-MM/YYYY-MM-DD-<title>.md"""
+    tz = pytz.timezone(TZ)
+    local_dt = dt.astimezone(tz)
+    folder = DATA_DIR / "transcripts" / local_dt.strftime("%Y-%m")
+    folder.mkdir(parents=True, exist_ok=True)
+    safe_title = _sanitize_filename(title)
+    return folder / f"{local_dt.strftime('%Y-%m-%d')}-{safe_title}.md"
+
+
+def _transcript_exists(transcript_id: str) -> bool:
+    """Check if a transcript with this ID already exists anywhere in transcripts dir."""
+    transcripts_dir = DATA_DIR / "transcripts"
+    if not transcripts_dir.exists():
+        return False
+    marker = f"idhash: {_id_hash(transcript_id)}"
+    for md_file in transcripts_dir.glob("**/*.md"):
+        try:
+            if marker in md_file.read_text(encoding="utf-8"):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+# -- Formatter -----------------------------------------------------------------
+
+def _format_transcript(t: dict, analytics: dict = None) -> str:
+    """Format a full transcript as an embedder-friendly markdown file."""
+    tz = pytz.timezone(TZ)
+
+    # Metadata
+    t_id         = t.get("id", "")
+    title        = t.get("title") or "Untitled Meeting"
+    date_ms      = t.get("date")
+    duration     = t.get("duration")
+    organizer    = t.get("organizer_email", "")
+    participants = t.get("participants") or []
+    meeting_link = t.get("meeting_link", "")
+    speakers     = t.get("speakers") or []
+    summary      = t.get("summary") or {}
+    sentences    = t.get("sentences") or []
+    attendees    = t.get("meeting_attendees") or []
+    attendance   = t.get("meeting_attendance") or []
+    meeting_info = t.get("meeting_info") or {}
+
+    dt = _ts_to_dt(date_ms).astimezone(tz)
+    dur_str = _format_duration(duration)
+    date_str = dt.strftime("%Y-%m-%d %I:%M %p")
+    speaker_names = [s.get("name", "Unknown") for s in speakers]
+    attendee_names = [a.get("displayName") or a.get("name") or a.get("email", "Unknown") for a in attendees]
+    meeting_type = summary.get("meeting_type", "")
+    summary_status = meeting_info.get("summary_status", "")
+
+    # Context line repeated in each section for embedder chunk independence
+    ctx = f"*{title} ({dt.strftime('%Y-%m-%d')}, {dur_str})*"
+
+    lines = [
+        "---",
+        f"source: fireflies-transcript",
+        f"idhash: {_id_hash(t_id)}",
+        f"fireflies_id: {t_id}",
+        f"title: {title}",
+        f"date: {dt.isoformat()}",
+        f"duration: {dur_str}",
+        f"organizer: {organizer}",
+        f"participants: {', '.join(participants)}",
+        f"meeting_link: {meeting_link}",
+        f"meeting_type: {meeting_type}",
+        f"speakers: {', '.join(speaker_names)}",
+        f"summary_status: {summary_status}",
+        "---",
+        "",
+        f"# {title}",
+        "",
+        f"**Date:** {date_str} | **Duration:** {dur_str} | **Participants:** {', '.join(attendee_names) or ', '.join(participants) or 'Unknown'}",
+        "",
+    ]
+
+    # Attendance info
+    if attendance:
+        lines.append("**Attendance:**")
+        for a in attendance:
+            name = a.get("name", "Unknown")
+            join = a.get("join_time", "")
+            leave = a.get("leave_time", "")
+            leave_str = f" — left {leave}" if leave else ""
+            lines.append(f"- {name} (joined {join}{leave_str})")
+        lines.append("")
+
+    # Summary sections — each with context line
+    if summary.get("overview"):
+        lines.extend(["### Summary", ctx, "", _strip_html(summary["overview"]), ""])
+    if summary.get("bullet_gist"):
+        lines.extend(["### Key Points", ctx, "", _strip_html(summary["bullet_gist"]), ""])
+    if summary.get("action_items"):
+        lines.extend(["### Action Items", ctx, "", _strip_html(summary["action_items"]), ""])
+    if summary.get("outline"):
+        lines.extend(["### Outline", ctx, "", _strip_html(summary["outline"]), ""])
+    if summary.get("topics_discussed"):
+        topics = summary["topics_discussed"]
+        if isinstance(topics, list):
+            topic_str = "\n".join(f"- {t}" for t in topics)
+        else:
+            topic_str = str(topics)
+        lines.extend(["### Topics", ctx, "", topic_str, ""])
+    if summary.get("notes"):
+        lines.extend(["### Notes", ctx, "", _strip_html(summary["notes"]), ""])
+    if summary.get("short_summary"):
+        lines.extend(["### Short Summary", ctx, "", _strip_html(str(summary["short_summary"])), ""])
+    if summary.get("keywords"):
+        kw = summary["keywords"]
+        if isinstance(kw, list):
+            kw_str = ", ".join(str(k) for k in kw)
+        else:
+            kw_str = _strip_html(str(kw))
+        lines.extend(["### Keywords", ctx, "", kw_str, ""])
+    if summary.get("transcript_chapters"):
+        chapters = summary["transcript_chapters"]
+        if isinstance(chapters, list):
+            ch_str = "\n\n".join(str(c) for c in chapters)
+        else:
+            ch_str = str(chapters)
+        lines.extend(["### Chapters", ctx, "", ch_str, ""])
+
+    # Analytics
+    if analytics:
+        sentiments = analytics.get("sentiments") or {}
+        spk_stats = analytics.get("speakers") or []
+
+        lines.extend(["### Analytics", ctx, ""])
+
+        if sentiments:
+            pos = sentiments.get("positive_pct", 0)
+            neg = sentiments.get("negative_pct", 0)
+            neu = sentiments.get("neutral_pct", 0)
+            lines.append(f"**Sentiment:** {pos:.0f}% positive, {neg:.0f}% negative, {neu:.0f}% neutral")
+            lines.append("")
+
+        if spk_stats:
+            lines.append("| Speaker | Talk Time | Words | WPM | Filler Words | Questions |")
+            lines.append("|---------|-----------|-------|-----|-------------|-----------|")
+            for s in spk_stats:
+                name = s.get("name", "Unknown")
+                dur = f"{s.get('duration', 0):.0f}s"
+                words = s.get("word_count", 0)
+                wpm = f"{s.get('words_per_minute', 0):.0f}"
+                fillers = s.get("filler_words", 0)
+                questions = s.get("questions", 0)
+                lines.append(f"| {name} | {dur} | {words} | {wpm} | {fillers} | {questions} |")
+            lines.append("")
+
+    # Transcript — group by speaker turns
+    if sentences:
+        lines.extend(["### Transcript", ctx, ""])
+
+        current_speaker = None
+        current_text_parts = []
+        current_start = None
+
+        for sent in sentences:
+            speaker = sent.get("speaker_name", "Unknown")
+            text = sent.get("text", "")
+            if not text:
+                text = sent.get("raw_text", "")
+            if not text:
+                continue
+            text = _strip_html(text).strip()
+            start = sent.get("start_time", "")
+
+            if speaker != current_speaker:
+                # Flush previous speaker's turn
+                if current_speaker is not None and current_text_parts:
+                    tc = _format_timecode(current_start) if current_start else ""
+                    tc_str = f" ({tc})" if tc else ""
+                    lines.append(f"**{current_speaker}**{tc_str}: {' '.join(current_text_parts)}")
+                    lines.append("")
+                current_speaker = speaker
+                current_text_parts = [text]
+                current_start = start
+            else:
+                current_text_parts.append(text)
+
+        # Flush last turn
+        if current_speaker and current_text_parts:
+            tc = _format_timecode(current_start) if current_start else ""
+            tc_str = f" ({tc})" if tc else ""
+            lines.append(f"**{current_speaker}**{tc_str}: {' '.join(current_text_parts)}")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+def _build_sidecar(t: dict) -> dict:
+    """Build diarization sidecar data from transcript sentences."""
+    sentences = t.get("sentences") or []
+    sidecar = {
+        "transcript_id": t.get("id", ""),
+        "title": t.get("title", ""),
+        "speakers": [{"id": s.get("id"), "name": s.get("name")} for s in (t.get("speakers") or [])],
+        "sentences": [],
+    }
+    for sent in sentences:
+        sidecar["sentences"].append({
+            "index": sent.get("index"),
+            "speaker_id": sent.get("speaker_id"),
+            "speaker_name": sent.get("speaker_name", "Unknown"),
+            "start_time": sent.get("start_time"),
+            "end_time": sent.get("end_time"),
+            "text": sent.get("text", ""),
+            "raw_text": sent.get("raw_text", ""),
+        })
+    return sidecar
+
+
+# -- Sync: Transcripts --------------------------------------------------------
+
+def sync_transcripts(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = False) -> int:
+    tz = pytz.timezone(TZ)
+    last_sync = state.get("transcripts", {}).get("lastSync")
+
+    if last_sync:
+        since = _try_parse_iso(last_sync)
+        print(f"  Syncing transcripts since {last_sync}...", file=sys.stderr)
+    else:
+        since = _since_dt(since_days)
+        print(f"  Backfilling transcripts {since_days} days...", file=sys.stderr)
+
+    # Phase 1: List transcripts
+    from_date = since.isoformat()
+    all_ids = []
+    skip = 0
+
+    while True:
+        variables = {"limit": 50, "skip": skip, "fromDate": from_date}
+        data = _graphql(TRANSCRIPTS_LIST_QUERY, variables)
+        page = data.get("data", {}).get("transcripts") or []
+        if not page:
+            break
+        all_ids.extend(page)
+        if len(page) < 50:
+            break
+        skip += 50
+        if verbose:
+            print(f"    Listed {len(all_ids)} transcripts so far...", file=sys.stderr)
+
+    print(f"  Found {len(all_ids)} transcripts in range", file=sys.stderr)
+
+    # Phase 2: Fetch details and write
+    count = 0
+    for item in all_ids:
+        t_id = item.get("id", "")
+        title = item.get("title", "Untitled")
+        if not t_id:
+            continue
+
+        # Dedup check
+        if _transcript_exists(t_id):
+            if verbose:
+                print(f"    Skipped: {title} (exists)", file=sys.stderr)
+            continue
+
+        if verbose:
+            print(f"    Fetching: {title}...", file=sys.stderr)
+
+        try:
+            # Fetch full detail
+            data = _graphql(TRANSCRIPT_DETAIL_QUERY, {"transcriptId": t_id})
+            t = data.get("data", {}).get("transcript")
+            if not t:
+                print(f"    Warning: no detail for {t_id}", file=sys.stderr)
+                continue
+
+            # Fetch analytics (may fail on Free/Pro plans)
+            analytics = None
+            try:
+                adata = _graphql(TRANSCRIPT_ANALYTICS_QUERY, {"transcriptId": t_id})
+                analytics = (adata.get("data", {}).get("transcript") or {}).get("analytics")
+            except (FirefliesError, Exception):
+                pass  # Analytics not available on this plan
+
+            # Format and write
+            date_ms = t.get("date")
+            dt = _ts_to_dt(date_ms)
+            path = _transcript_path(dt, title)
+
+            content = _format_transcript(t, analytics)
+            _atomic_write(path, content)
+            count += 1
+
+            if verbose:
+                print(f"    Written: {path.name}", file=sys.stderr)
+
+        except Exception as e:
+            print(f"    Error on {title}: {e}", file=sys.stderr)
+
+    state.setdefault("transcripts", {})["lastSync"] = datetime.now(pytz.utc).isoformat()
+    print(f"  Transcripts: {count} new items", file=sys.stderr)
+    return count
+
+
+# -- Sync: Audio (on-demand) --------------------------------------------------
+
+def sync_audio(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = False) -> int:
+    tz = pytz.timezone(TZ)
+    last_sync = state.get("audio", {}).get("lastSync")
+
+    if last_sync:
+        since = _try_parse_iso(last_sync)
+        print(f"  Downloading audio since {last_sync}...", file=sys.stderr)
+    else:
+        since = _since_dt(since_days)
+        print(f"  Downloading audio {since_days} days...", file=sys.stderr)
+
+    from_date = since.isoformat()
+    count = 0
+
+    # List transcripts in range
+    skip = 0
+    while True:
+        variables = {"limit": 50, "skip": skip, "fromDate": from_date}
+        data = _graphql(TRANSCRIPTS_LIST_QUERY, variables)
+        page = data.get("data", {}).get("transcripts") or []
+        if not page:
+            break
+
+        for item in page:
+            t_id = item.get("id", "")
+            title = item.get("title", "Untitled")
+            date_ms = item.get("date")
+            if not t_id:
+                continue
+
+            dt = _ts_to_dt(date_ms).astimezone(tz)
+            safe_title = _sanitize_filename(title)
+            audio_dir = DATA_DIR / "audio" / dt.strftime("%Y-%m")
+            audio_dir.mkdir(parents=True, exist_ok=True)
+            audio_path = audio_dir / f"{dt.strftime('%Y-%m-%d')}-{safe_title}.mp3"
+            sidecar_path = audio_path.with_suffix(".json")
+
+            if audio_path.exists():
+                if verbose:
+                    print(f"    Skipped: {audio_path.name} (exists)", file=sys.stderr)
+                continue
+
+            if verbose:
+                print(f"    Fetching audio URL for: {title}...", file=sys.stderr)
+
+            try:
+                # Get fresh audio_url (expires in 24h)
+                detail = _graphql(TRANSCRIPT_DETAIL_QUERY, {"transcriptId": t_id})
+                t = detail.get("data", {}).get("transcript") or {}
+                audio_url = t.get("audio_url")
+
+                if not audio_url:
+                    if verbose:
+                        print(f"    No audio URL for: {title}", file=sys.stderr)
+                    continue
+
+                if verbose:
+                    print(f"    Downloading: {audio_path.name}...", file=sys.stderr)
+
+                audio_data = _download_url(audio_url, timeout=300)
+                _atomic_write_binary(audio_path, audio_data)
+
+                # Write diarization sidecar
+                sidecar = _build_sidecar(t)
+                _atomic_write(sidecar_path, json.dumps(sidecar, indent=2))
+
+                count += 1
+                if verbose:
+                    print(f"    Written: {audio_path.name} + sidecar", file=sys.stderr)
+
+            except Exception as e:
+                print(f"    Audio download failed for {title}: {e}", file=sys.stderr)
+
+        if len(page) < 50:
+            break
+        skip += 50
+
+    state.setdefault("audio", {})["lastSync"] = datetime.now(pytz.utc).isoformat()
+    print(f"  Audio: {count} files downloaded", file=sys.stderr)
+    return count
+
+
+# -- Sync: Video (on-demand) --------------------------------------------------
+
+def sync_video(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = False) -> int:
+    tz = pytz.timezone(TZ)
+    last_sync = state.get("video", {}).get("lastSync")
+
+    if last_sync:
+        since = _try_parse_iso(last_sync)
+        print(f"  Downloading video since {last_sync}...", file=sys.stderr)
+    else:
+        since = _since_dt(since_days)
+        print(f"  Downloading video {since_days} days...", file=sys.stderr)
+
+    from_date = since.isoformat()
+    count = 0
+
+    skip = 0
+    while True:
+        variables = {"limit": 50, "skip": skip, "fromDate": from_date}
+        data = _graphql(TRANSCRIPTS_LIST_QUERY, variables)
+        page = data.get("data", {}).get("transcripts") or []
+        if not page:
+            break
+
+        for item in page:
+            t_id = item.get("id", "")
+            title = item.get("title", "Untitled")
+            date_ms = item.get("date")
+            if not t_id:
+                continue
+
+            dt = _ts_to_dt(date_ms).astimezone(tz)
+            safe_title = _sanitize_filename(title)
+            video_dir = DATA_DIR / "video" / dt.strftime("%Y-%m")
+            video_dir.mkdir(parents=True, exist_ok=True)
+            video_path = video_dir / f"{dt.strftime('%Y-%m-%d')}-{safe_title}.mp4"
+
+            if video_path.exists():
+                if verbose:
+                    print(f"    Skipped: {video_path.name} (exists)", file=sys.stderr)
+                continue
+
+            if verbose:
+                print(f"    Fetching video URL for: {title}...", file=sys.stderr)
+
+            try:
+                detail = _graphql(TRANSCRIPT_DETAIL_QUERY, {"transcriptId": t_id})
+                t = detail.get("data", {}).get("transcript") or {}
+                video_url = t.get("video_url")
+
+                if not video_url:
+                    if verbose:
+                        print(f"    No video URL for: {title}", file=sys.stderr)
+                    continue
+
+                if verbose:
+                    print(f"    Downloading: {video_path.name}...", file=sys.stderr)
+
+                video_data = _download_url(video_url, timeout=600)
+                _atomic_write_binary(video_path, video_data)
+
+                count += 1
+                if verbose:
+                    print(f"    Written: {video_path.name}", file=sys.stderr)
+
+            except Exception as e:
+                print(f"    Video download failed for {title}: {e}", file=sys.stderr)
+
+        if len(page) < 50:
+            break
+        skip += 50
+
+    state.setdefault("video", {})["lastSync"] = datetime.now(pytz.utc).isoformat()
+    print(f"  Video: {count} files downloaded", file=sys.stderr)
+    return count
+
+
+# -- Commands ------------------------------------------------------------------
+
+def cmd_sync(args):
+    key = _api_key()
+    if not key:
+        print("FIREFLIES_API_KEY environment variable is not set.", file=sys.stderr)
+        sys.exit(1)
+
+    with SyncLock():
+        state = _load_state()
+        # "all" = transcripts only (NOT audio/video — on-demand)
+        sources = (["transcripts"] if args.source == "all"
+                   else [args.source])
+
+        if args.reset:
+            for source in sources:
+                state.pop(source, None)
+            print(f"  State cleared for: {', '.join(sources)}", file=sys.stderr)
+
+        fns = {"transcripts": sync_transcripts, "audio": sync_audio,
+               "video": sync_video}
+        total = 0
+        for source in sources:
+            try:
+                total += fns[source](state, since_days=args.since, verbose=args.verbose)
+            except Exception as e:
+                print(f"  {source} sync failed: {e}", file=sys.stderr)
+                if args.verbose:
+                    import traceback; traceback.print_exc()
+            _save_state(state)
+        print(f"Sync complete \u2014 {total} total items.", file=sys.stderr)
+
+
+def cmd_status(args):
+    print("Fireflies Sync Status")
+    print("=" * 40)
+    if not STATE_FILE.exists():
+        print("  No state file found")
+        return
+    try:
+        state = json.loads(STATE_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        print("  State file corrupted")
+        return
+    if not state:
+        print("  Empty state")
+        return
+
+    for source in ("transcripts", "audio", "video"):
+        info = state.get(source, {})
+        if isinstance(info, dict) and "lastSync" in info:
+            print(f"  {source:14s}  last sync: {info['lastSync']}")
+        else:
+            print(f"  {source:14s}  (not synced)")
+
+    print()
+    t_dir = DATA_DIR / "transcripts"
+    if t_dir.exists():
+        files = list(t_dir.glob("**/*.md"))
+        print(f"  {'transcripts':14s}  {len(files)} files on disk")
+    a_dir = DATA_DIR / "audio"
+    if a_dir.exists():
+        files = list(a_dir.glob("**/*.mp3"))
+        print(f"  {'audio':14s}  {len(files)} files on disk")
+    v_dir = DATA_DIR / "video"
+    if v_dir.exists():
+        files = list(v_dir.glob("**/*.mp4"))
+        print(f"  {'video':14s}  {len(files)} files on disk")
+    print()
+
+
+# -- CLI -----------------------------------------------------------------------
+
+def main():
+    p   = argparse.ArgumentParser(description="Edwin Fireflies Connector")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    s = sub.add_parser("sync", help="Sync to data/fireflies/")
+    s.add_argument("source", choices=["all", "transcripts", "audio", "video"])
+    s.add_argument("--since", type=int, default=DEFAULT_SINCE,
+                   help=f"Days back for initial/reset sync (default {DEFAULT_SINCE})")
+    s.add_argument("--reset", action="store_true",
+                   help="Clear saved state and re-fetch from --since days back")
+    s.add_argument("--verbose", action="store_true")
+    s.set_defaults(func=cmd_sync)
+
+    st = sub.add_parser("status", help="Show last sync times and file counts")
+    st.set_defaults(func=cmd_status)
+
+    args = p.parse_args()
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        import traceback; traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

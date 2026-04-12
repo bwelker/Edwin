@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""
+Plaud → Edwin Memory Sync
+
+Pulls recordings from Plaud API, writes transcripts + summaries to memory/plaud/.
+Tracks state to avoid re-processing. Designed to run on a cron (every 30 min).
+
+Usage:
+  plaud-sync              # Sync new recordings since last run
+  plaud-sync --all        # Re-sync everything
+  plaud-sync --list       # Just list recordings
+  plaud-sync --test       # Test API connection
+"""
+
+import os
+import sys
+import json
+import gzip
+import hashlib
+from datetime import datetime, timezone
+from pathlib import Path
+
+EDWIN_HOME = Path(os.environ.get("EDWIN_HOME", Path(__file__).resolve().parent.parent.parent))
+
+# Load credentials
+CREDS_FILE = Path.home() / ".edwin/credentials/plaud/env"
+STATE_FILE = EDWIN_HOME / "data" / "plaud" / ".sync-state.json"
+OUTPUT_DIR = EDWIN_HOME / "data" / "plaud" / "recordings"
+
+def load_creds():
+    """Load PLAUD_TOKEN and PLAUD_API_DOMAIN from .env file."""
+    creds = {}
+    if CREDS_FILE.exists():
+        for line in CREDS_FILE.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, val = line.split("=", 1)
+                creds[key.strip()] = val.strip()
+    
+    token = creds.get("PLAUD_TOKEN", os.environ.get("PLAUD_TOKEN", ""))
+    domain = creds.get("PLAUD_API_DOMAIN", os.environ.get("PLAUD_API_DOMAIN", "https://api.plaud.ai"))
+    
+    # Strip "bearer " prefix if present — we add it in headers
+    if token.lower().startswith("bearer "):
+        token = token[7:]
+    
+    return token, domain
+
+def load_state():
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text())
+    return {"synced": {}, "last_run": None}
+
+def save_state(state):
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    state["last_run"] = datetime.now(timezone.utc).isoformat()
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+
+def api_get(path, token, domain):
+    """Make a GET request to the Plaud API."""
+    import requests
+    headers = {"Authorization": f"bearer {token}"}
+    url = f"{domain}{path}"
+    r = requests.get(url, headers=headers, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def fetch_content(url):
+    """Fetch content from S3 presigned URL (may be gzipped or plain JSON)."""
+    import requests
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    try:
+        return json.loads(gzip.decompress(r.content))
+    except (gzip.BadGzipFile, OSError):
+        return json.loads(r.content)
+
+def list_recordings(token, domain):
+    """List all recordings from the API."""
+    data = api_get("/file/simple/web", token, domain)
+    files = data.get("data_file_list", [])
+    return files
+
+def get_recording_detail(file_id, token, domain):
+    """Get full details for a recording including transcript links."""
+    data = api_get(f"/file/detail/{file_id}", token, domain)
+    return data.get("data", {})
+
+def format_transcript(detail, transcript_segments):
+    """Format a recording into a markdown memory file."""
+    lines = []
+    
+    file_name = detail.get("file_name", "Untitled Recording")
+    duration_ms = detail.get("duration", 0)
+    start_time = detail.get("start_time", 0)
+    
+    # Parse timestamp
+    if start_time > 1e12:  # milliseconds
+        dt = datetime.fromtimestamp(start_time / 1000, tz=timezone.utc)
+    elif start_time > 0:
+        dt = datetime.fromtimestamp(start_time, tz=timezone.utc)
+    else:
+        dt = datetime.now(timezone.utc)
+    
+    duration_min = duration_ms / 60000
+    
+    lines.append(f"# {file_name}")
+    lines.append("")
+    lines.append(f"**Date:** {dt.strftime('%Y-%m-%d %I:%M %p')} UTC")
+    lines.append(f"**Duration:** {duration_min:.0f} minutes")
+    lines.append(f"**Source:** Plaud Note Pro")
+    lines.append("")
+    
+    # Collect unique speakers
+    speakers = set()
+    for seg in transcript_segments:
+        spk = seg.get("speaker", seg.get("original_speaker", "Unknown"))
+        if spk:
+            speakers.add(spk)
+    
+    if speakers:
+        lines.append(f"**Speakers:** {', '.join(sorted(speakers))}")
+        lines.append("")
+    
+    # AI Summary (from pre_download_content_list)
+    pdcl = detail.get("pre_download_content_list", [])
+    for item in pdcl:
+        content = item.get("data_content", "")
+        if content and "auto_sum" in item.get("data_id", ""):
+            lines.append("## AI Summary")
+            lines.append("")
+            lines.append(content)
+            lines.append("")
+            break
+    
+    # Full transcript
+    lines.append("## Transcript")
+    lines.append("")
+    
+    current_speaker = None
+    for seg in transcript_segments:
+        spk = seg.get("speaker", seg.get("original_speaker", "Unknown"))
+        text = seg.get("content", seg.get("text", "")).strip()
+        start_ms = seg.get("start_time", seg.get("start", 0))
+        
+        if not text:
+            continue
+        
+        # Format timestamp
+        minutes = start_ms // 60000
+        seconds = (start_ms % 60000) // 1000
+        ts = f"{minutes}:{seconds:02d}"
+        
+        if spk != current_speaker:
+            current_speaker = spk
+            lines.append(f"**{spk}** ({ts}):")
+        
+        lines.append(f"> {text}")
+        lines.append("")
+    
+    return "\n".join(lines)
+
+def sync_recording(file_id, detail, token, domain, force=False):
+    """Sync a single recording to memory."""
+    # Find transcript link in content_list
+    transcript_segments = []
+    content_list = detail.get("content_list", [])
+    
+    for item in content_list:
+        link = item.get("data_link", "")
+        if "trans_result" in link and link.startswith("http"):
+            try:
+                transcript_segments = fetch_content(link)
+            except Exception as e:
+                print(f"  WARNING: Failed to fetch transcript: {e}", file=sys.stderr)
+    
+    if not transcript_segments:
+        return None, "no transcript"
+    
+    # Format output
+    markdown = format_transcript(detail, transcript_segments)
+    
+    # Determine output path
+    start_time = detail.get("start_time", 0)
+    if start_time > 1e12:
+        dt = datetime.fromtimestamp(start_time / 1000, tz=timezone.utc)
+    elif start_time > 0:
+        dt = datetime.fromtimestamp(start_time, tz=timezone.utc)
+    else:
+        dt = datetime.now(timezone.utc)
+    
+    month_dir = OUTPUT_DIR / dt.strftime("%Y-%m")
+    month_dir.mkdir(parents=True, exist_ok=True)
+    
+    file_name = detail.get("file_name", "untitled").replace("/", "-").replace("\\", "-")
+    # Truncate long names
+    if len(file_name) > 60:
+        file_name = file_name[:60]
+    
+    out_name = f"{dt.strftime('%Y-%m-%d')}-{file_name}.md"
+    out_path = month_dir / out_name
+    out_path.write_text(markdown)
+    
+    return str(out_path), f"{len(transcript_segments)} segments"
+
+def main():
+    import requests  # Ensure available
+    
+    token, domain = load_creds()
+    if not token:
+        print("ERROR: No Plaud token found. Set PLAUD_TOKEN or create ~/.edwin/credentials/plaud/env", file=sys.stderr)
+        sys.exit(1)
+    
+    # Parse args
+    do_all = "--all" in sys.argv
+    do_list = "--list" in sys.argv
+    do_test = "--test" in sys.argv
+    
+    # Test connection
+    if do_test:
+        try:
+            files = list_recordings(token, domain)
+            print(f"✅ API connected. {len(files)} recordings found.")
+            for f in files[:5]:
+                dur = f.get("duration", 0) / 60000
+                print(f"  {f.get('id', '?')[:12]}... | {dur:.0f}m | {f.get('file_name', 'untitled')}")
+        except Exception as e:
+            print(f"❌ API error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+    
+    # List recordings
+    files = list_recordings(token, domain)
+    
+    if do_list:
+        print(f"{'ID':<34} {'Duration':>8}  {'Date':<12} Name")
+        print("-" * 90)
+        for f in files:
+            dur = f.get("duration", 0) / 60000
+            st = f.get("start_time", 0)
+            if st > 1e12:
+                dt = datetime.fromtimestamp(st / 1000, tz=timezone.utc)
+            else:
+                dt = datetime.now(timezone.utc)
+            print(f"{f.get('id', '?'):<34} {dur:>6.0f}m  {dt.strftime('%Y-%m-%d')}  {f.get('file_name', 'untitled')}")
+        return
+    
+    # Sync
+    state = load_state()
+    synced = 0
+    skipped = 0
+    errors = 0
+    
+    for f in files:
+        file_id = f.get("id", "")
+        file_name = f.get("file_name", "untitled")
+        file_version = str(f.get("file_version", ""))
+        
+        # Skip if already synced (unless --all)
+        if not do_all and file_id in state["synced"]:
+            if state["synced"][file_id].get("version") == file_version:
+                skipped += 1
+                continue
+        
+        print(f"Syncing: {file_name}...", end=" ", flush=True)
+        
+        try:
+            detail = get_recording_detail(file_id, token, domain)
+            out_path, status = sync_recording(file_id, detail, token, domain, force=do_all)
+            
+            if out_path:
+                state["synced"][file_id] = {
+                    "version": file_version,
+                    "name": file_name,
+                    "output": out_path,
+                    "synced_at": datetime.now(timezone.utc).isoformat()
+                }
+                print(f"✅ {status} → {out_path}")
+                synced += 1
+            else:
+                print(f"⏭️ {status}")
+                skipped += 1
+        except Exception as e:
+            print(f"❌ {e}", file=sys.stderr)
+            errors += 1
+    
+    save_state(state)
+    print(f"\nDone: {synced} synced | {skipped} skipped | {errors} errors")
+
+if __name__ == "__main__":
+    main()
