@@ -35,6 +35,39 @@ That's it. `setup.sh` installs the infrastructure (Qdrant, Neo4j, Ollama). `clau
 - **Ollama** (for local embeddings)
 - **Python 3.10+**
 
+## The Cognitive Model
+
+Edwin's architecture maps directly to how human cognition works:
+
+- **Ingestion = Sensory Input.** 15 ETL connectors perceive your digital world and translate raw data into a format the brain can process. Email, messages, meetings, browser history -- each connector is a sense tuned to a different source.
+- **Memory = Memory & Cognition.** The data lake feeds five memory systems that store, index, associate, and recall. The LLM reads and writes to all of them.
+- **LLM = Executive Function.** Perceive, decide, act, monitor, adjust. The prefrontal cortex. The main session talks to you and delegates all work to sub-agents.
+
+```mermaid
+graph LR
+    JH[Scheduler] -->|runs connectors| IG[Ingestion]
+    JH -->|runs indexer| MM[Memory]
+    JH -->|events / triggers| LLM[LLM<br/>Executive Function]
+    IG -->|data| MM
+    MM <-->|read / write| LLM
+    LLM <-->|channel| U[You]
+
+    style LLM fill:#6366f1,stroke:#8b5cf6,color:#fff
+    style MM fill:#059669,stroke:#10b981,color:#fff
+    style U fill:#3b82f6,stroke:#2563eb,color:#fff
+    style IG fill:#4b5563,stroke:#6b7280,color:#fff
+    style JH fill:#1e293b,stroke:#475569,color:#e2e8f0
+```
+
+## Design Principles
+
+1. **No vendor lock-in.** The LLM is swappable. The data is portable. Skills are plain markdown. Nothing depends on any single AI provider except the LLM API itself.
+2. **Atomic purposes.** Each component does one thing. Connectors extract. The indexer embeds. The PM tracks commitments. Nothing is overloaded.
+3. **Local-first.** All data lives on disk, in open formats (Markdown, SQLite, standard APIs). Nothing is cloud-only.
+4. **The LLM is the orchestrator.** The main session talks to you and makes decisions. All work is delegated to sub-agents. Edwin decides what work to do -- sub-agents do it.
+5. **The SKILL.md standard.** Procedural memory is portable markdown. Any LLM that can read text can execute a skill. No proprietary format.
+6. **Know what you have.** Every tool, every skill, every service is indexed and discoverable. Edwin never says "I can't do that" about something it can do.
+
 ## Architecture
 
 ```
@@ -91,12 +124,17 @@ Edwin/
 
 ## Memory Tiers
 
-| Tier | Implementation | Purpose |
-|------|---------------|---------|
-| Working memory | Claude Code context window | Active conversation |
-| Episodic memory | Briefing book + session summaries | What happened |
-| Semantic memory | Qdrant vectors + Neo4j knowledge graph | What you know |
-| Prospective memory | PM server | What you need to do |
+Five memory systems, modeled on human cognition:
+
+| Type | Purpose | System | How it works |
+|------|---------|--------|-------------|
+| **Semantic** | What things mean | Qdrant vectors + Ollama embeddings | Dense (+ optional sparse) vector search across all your data |
+| **Episodic** | What happened | Neo4j knowledge graph | Entity relationships, multi-hop reasoning, timeline queries |
+| **Procedural** | How to do things | SKILL.md files | Portable markdown instructions any LLM can execute |
+| **Prospective** | What needs to happen | PM server (SQLite) | Commitments, tasks, intentions with due dates and owners |
+| **Working** | What matters right now | Context window + session state | Boot sequence, session summaries, conversation-state.md, morning brief |
+
+Working memory is more than the LLM's context window. It's a full system: session state that survives crashes, session summaries for continuity across conversations, a boot sequence that reconstructs context on startup, and a morning brief that primes the most important information first.
 
 ## Embedding Options
 
