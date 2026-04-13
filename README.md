@@ -70,6 +70,8 @@ A human chief of staff is useful because they're in the room -- they hear the sa
 | Design Principles | Local-first, no vendor lock-in, atomic purposes | [Learn more ->](docs/design-principles.md) |
 | Skills (SKILL.md) | Portable markdown procedures any LLM can execute | [Learn more ->](docs/SKILLS.md) |
 | Connector Setup | Credential configuration for API-based connectors | [Learn more ->](docs/connector-setup.md) |
+| Tools & Capabilities | Every tool, MCP server, and pipeline Edwin can reach | [Learn more ->](docs/TOOLS.md) |
+| Day-to-Day Usage | How to actually use Edwin once it's running | [Learn more ->](docs/how-edwin-works.md) |
 
 ## The Cognitive Model
 
