@@ -101,15 +101,15 @@ A human chief of staff is useful because they're in the room -- they hear the sa
 ## The Cognitive Model
 
 ```mermaid
-graph LR
-    JH[Scheduler] -->|runs connectors| IG[Ingestion]
-    JH -->|runs indexer| MM[Memory]
-    JH -->|events / triggers| LLM[Orchestrator<br/>Executive Function]
-    IG -->|data| MM
-    MM <-->|read / write| LLM
-    LLM <-->|channel| U[You]
+graph TD
+    U[You] <-->|channel| LLM[Orchestrator<br/>Executive Function]
     LLM -->|spawns| SA[Subagents]
     SA -->|results| LLM
+    JH[Scheduler] -->|events / triggers| LLM
+    JH -->|runs connectors| IG[Ingestion]
+    JH -->|runs indexer| MM[Memory]
+    IG -->|data| MM
+    MM <-->|read / write| LLM
     SA <-->|read / write| MM
 
     style LLM fill:#6366f1,stroke:#8b5cf6,color:#fff
