@@ -17,6 +17,12 @@ Built on [Claude Code](https://claude.ai/claude-code) by Anthropic. Runs locally
 
 Used daily by the author to manage a 40-person engineering and operations org.
 
+<p align="center">
+  <img src="assets/demo-conversation.png" alt="Edwin morning check-in via iMessage -- calendar awareness, prioritization, proactive support" width="500" />
+  <br/>
+  <em>Edwin checks in every morning, knows your calendar, tracks your deliverables, and tells you what actually matters today.</em>
+</p>
+
 ## Why Edwin is different
 
 Most AI agent frameworks start with tools. Edwin starts with how your brain works.
