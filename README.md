@@ -2,6 +2,11 @@
   <img src="assets/Edwin-icon_whitebg.png" alt="Edwin" width="120" />
 </p>
 
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Python: 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
+[![Built with Claude Code](https://img.shields.io/badge/Built_with-Claude_Code-6366f1.svg?logo=anthropic&logoColor=white)](https://claude.ai/claude-code)
+[![Platform: macOS](https://img.shields.io/badge/Platform-macOS-000000.svg?logo=apple&logoColor=white)](https://www.apple.com/macos/)
+
 # Edwin
 
 **Personal AI Chief of Staff -- built on cognitive architecture principles.**
@@ -9,6 +14,8 @@
 Edwin is an AI assistant that runs your life. Not a chatbot. Not a framework. A persistent, memory-rich system designed around how your brain actually works -- with working memory, episodic memory, semantic memory, and prospective memory. It ingests your digital life, learns what matters to you, and handles the cognitive overhead that buries busy professionals.
 
 Built on [Claude Code](https://claude.ai/claude-code) by Anthropic. Runs locally on your Mac. Your data stays on your machine.
+
+Used daily by the author to manage a 40-person engineering and operations org.
 
 ## Why Edwin is different
 
