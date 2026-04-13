@@ -22,6 +22,9 @@ briefing-book/docs/9. 👥 People/*
 !briefing-book/docs/9. 👥 People/DEMO*
 briefing-book/docs/10. 📋 Daytime Log/*
 
+# Generated config (setup.sh creates per-machine)
+.mcp.json
+
 # Environment and credentials
 .env
 .env.*
