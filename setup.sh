@@ -352,6 +352,9 @@ ACCESSEOF
     echo "    4. You'll get a pairing code -- enter it in the terminal:"
     echo "         /telegram:access pair <CODE>"
     echo "    5. Lock down access:  /telegram:access policy allowlist"
+    echo ""
+    echo "  NOTE: Anthropic Team/Enterprise accounts require org admin to enable"
+    echo "  channel notifications and cloud MCP integrations."
 
 else
     echo -e "${GREEN}  Skipped.${NC}"

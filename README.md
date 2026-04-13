@@ -51,6 +51,8 @@ claude --dangerously-load-development-channels server:events
 - **Ollama** (for local embeddings)
 - **Python 3.10+**
 
+> **Note:** If you're on an Anthropic Team or Enterprise plan, your org admin may need to enable channel notifications and cloud MCP integrations in the organization settings before they'll work. Individual (Pro) accounts have these enabled by default.
+
 ## The Core Problem: An Assistant That Knows What You Know
 
 A human chief of staff is useful because they're in the room. They hear the same conversations, read the same emails, sit in the same meetings. They don't need to be told what happened -- they already know. That's what makes their judgment valuable: shared context.
@@ -133,6 +135,8 @@ Edwin ships with Telegram as the default communication channel. Telegram's BotFa
    /telegram:access policy allowlist
    ```
    This restricts the bot to only your approved Telegram account.
+
+> **Note:** Anthropic Team/Enterprise accounts require the org admin to enable channel notifications in the organization settings. Pro accounts have this enabled by default.
 
 ### Advanced: iMessage
 

@@ -231,6 +231,8 @@ Syncs meeting recordings and transcripts from Plaud Note Pro.
 
 ## Section 3: Cloud MCP Integrations
 
+> **Note:** If you're on an Anthropic Team or Enterprise plan, your org admin may need to enable cloud MCP integrations in the organization settings before they'll appear. Pro accounts have these enabled by default.
+
 Beyond local connectors, Claude Code has built-in cloud integrations that give Edwin richer real-time access to external services. These run as cloud MCP servers -- no API keys to manage, no credential files. You enable them in Claude Code and they just work.
 
 **How to enable:** In Claude Code, go to **Settings > Integrations** > search for the integration name > enable it. You'll authenticate via OAuth in your browser.
