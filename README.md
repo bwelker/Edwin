@@ -21,6 +21,18 @@ Most AI agent frameworks start with tools. Edwin starts with how your brain work
 - **Procedural memory via SKILL.md.** Skills are plain markdown -- portable, readable, editable. Any LLM that can read text can execute a skill. No vendor lock-in.
 - **Semantic search across your entire life.** Ask Edwin anything and it finds the answer across all your data.
 
+<p align="center">
+  <img src="assets/plombery-screenshot.png" alt="Plombery scheduler dashboard showing 15+ pipelines and run history" width="700" />
+  <br/>
+  <em>Plombery scheduler -- 15 connectors, memory indexer, skills, and system tasks running on autopilot.</em>
+</p>
+
+<p align="center">
+  <img src="assets/briefing-book-screenshot.png" alt="Briefing Book in Obsidian showing morning brief and folder structure" width="700" />
+  <br/>
+  <em>The Briefing Book -- your personal intelligence file, organized by cognitive domain.</em>
+</p>
+
 ## Quickstart
 
 ```bash
