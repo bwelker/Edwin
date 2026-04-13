@@ -4,7 +4,7 @@ Edwin is built by people who use AI agents to do real work. If that's you, you'r
 
 ## Philosophy
 
-Edwin exists because one person decided to build what they needed instead of waiting for someone else to build it. The best contributions come from the same place -- a real problem you solved, a connector you needed, a workflow you automated.
+I built Edwin to be an executive assistant. The biggest challenge was giving it enough context to work autonomously -- so I kept building connectors, memory systems, and skills until it could handle the mundane daily work that used to eat my time or someone else's. The best contributions come from the same place -- a real problem you solved, a connector you needed, a workflow you automated.
 
 You have an AI agent. It can read this codebase, understand the patterns, and help you build on top of them. I encourage you to use it.
 
