@@ -101,6 +101,9 @@ A human chief of staff is useful because they're in the room -- they hear the sa
 ## The Cognitive Model
 
 ```mermaid
+---
+title: How Edwin Works
+---
 graph LR
     JH[Scheduler] -->|runs connectors| IG[Ingestion]
     JH -->|runs indexer| MM[Memory]
