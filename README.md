@@ -114,6 +114,8 @@ graph LR
     LLM -->|spawns| SA[Subagents]
     SA -->|results| LLM
     SA <-->|read / write| MM
+    SA ~~~ PAD[ ]
+    U ~~~ PAD
 
     style LLM fill:#6366f1,stroke:#8b5cf6,color:#fff
     style SA fill:#818cf8,stroke:#6366f1,color:#fff
@@ -121,6 +123,7 @@ graph LR
     style U fill:#3b82f6,stroke:#2563eb,color:#fff
     style IG fill:#4b5563,stroke:#6b7280,color:#fff
     style JH fill:#1e293b,stroke:#475569,color:#e2e8f0
+    style PAD fill:none,stroke:none,color:none
 ```
 
 ## How it works
