@@ -104,12 +104,16 @@ A human chief of staff is useful because they're in the room -- they hear the sa
 graph LR
     JH[Scheduler] -->|runs connectors| IG[Ingestion]
     JH -->|runs indexer| MM[Memory]
-    JH -->|events / triggers| LLM[LLM<br/>Executive Function]
+    JH -->|events / triggers| LLM[Orchestrator<br/>Executive Function]
     IG -->|data| MM
     MM <-->|read / write| LLM
     LLM <-->|channel| U[You]
+    LLM -->|spawns| SA[Subagents]
+    SA -->|results| LLM
+    SA <-->|read / write| MM
 
     style LLM fill:#6366f1,stroke:#8b5cf6,color:#fff
+    style SA fill:#818cf8,stroke:#6366f1,color:#fff
     style MM fill:#059669,stroke:#10b981,color:#fff
     style U fill:#3b82f6,stroke:#2563eb,color:#fff
     style IG fill:#4b5563,stroke:#6b7280,color:#fff
