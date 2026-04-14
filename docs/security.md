@@ -17,6 +17,7 @@ Edwin ingests external data (email, messages, meeting transcripts) and stores it
 2. **System prompt identity** -- Edwin's CLAUDE.md explicitly defines identity, rules, and boundaries. The system prompt takes precedence over retrieved content.
 3. **Data vs instruction framing** -- Retrieved content comes through MCP tool calls, which are framed as data returns, not user messages. The LLM is trained to treat tool results as information, not instructions.
 4. **Claude's training** -- Claude includes built-in resistance to prompt injection attempts.
+5. **Content-guard scanner** -- A pre-indexing security scanner (`tools/content-guard/content-guard`) that detects prompt injection patterns in markdown files before they enter the vector store. Scans for role hijacking, data exfiltration attempts, prompt injection framing, and social engineering. Flags suspicious files and optionally quarantines copies for human review -- never deletes originals. See `tools/content-guard/README.md` for usage.
 
 ### Known Limitations
 

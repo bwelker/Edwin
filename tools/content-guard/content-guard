@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""content-guard -- Scan markdown files for prompt injection patterns.
+
+Detects role hijacking, data exfiltration, prompt injection framing,
+and social engineering attempts embedded in connector output or
+agent-generated content before it gets indexed into the vector store.
+
+Does NOT delete anything. Flags suspicious content and optionally
+quarantines copies for human review.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+__version__ = "0.1.0"
+
+# ---------------------------------------------------------------------------
+# Pattern definitions
+# ---------------------------------------------------------------------------
+# Each pattern: (compiled_regex, category, severity, description)
+# Severity: high = likely intentional injection, medium = suspicious,
+#           low = worth noting but often benign
+
+PATTERNS = [
+    # ── Role / identity hijacking ──────────────────────────────────────
+    (re.compile(r"ignore\s+all\s+previous\s+instructions", re.I),
+     "role_hijacking", "high", "Instruction override -- ignore previous"),
+    (re.compile(r"ignore\s+prior\s+prompts?", re.I),
+     "role_hijacking", "high", "Instruction override -- ignore prior prompts"),
+    (re.compile(r"you\s+are\s+now\b", re.I),
+     "role_hijacking", "high", "Identity reassignment -- 'you are now'"),
+    (re.compile(r"forget\s+your\s+instructions", re.I),
+     "role_hijacking", "high", "Instruction override -- forget instructions"),
+    (re.compile(r"disregard\s+all\s+prior", re.I),
+     "role_hijacking", "high", "Instruction override -- disregard prior"),
+    (re.compile(r"\[system\]", re.I),
+     "role_hijacking", "high", "Fake system tag -- [system]"),
+    (re.compile(r"\[admin\]", re.I),
+     "role_hijacking", "high", "Fake admin tag -- [admin]"),
+    (re.compile(r"begin_admin_session", re.I),
+     "role_hijacking", "high", "Fake admin session start"),
+    (re.compile(r"end_admin_session", re.I),
+     "role_hijacking", "medium", "Fake admin session end"),
+    (re.compile(r"new\s+instructions\s*:", re.I),
+     "role_hijacking", "high", "Instruction injection -- 'new instructions:'"),
+    (re.compile(r"override\s*:", re.I),
+     "role_hijacking", "high", "Instruction injection -- 'override:'"),
+    (re.compile(r"override\s+mode", re.I),
+     "role_hijacking", "high", "Instruction injection -- 'override mode'"),
+
+    # ── Data exfiltration attempts ─────────────────────────────────────
+    (re.compile(r"\bcurl\s+https?://", re.I),
+     "data_exfiltration", "high", "Embedded curl command to external URL"),
+    (re.compile(r"\bwget\s+https?://", re.I),
+     "data_exfiltration", "high", "Embedded wget command to external URL"),
+    (re.compile(r"(?:send|forward|email)\s+to\s+[\w.+-]+@[\w.-]+", re.I),
+     "data_exfiltration", "medium", "Data send instruction with email address"),
+    (re.compile(r"[A-Za-z0-9+/]{40,}={0,2}", re.I),
+     "data_exfiltration", "low", "Possible base64-encoded block"),
+    (re.compile(r"\bexfiltrate\b", re.I),
+     "data_exfiltration", "high", "Explicit exfiltration keyword"),
+    (re.compile(r"extract\s+and\s+send", re.I),
+     "data_exfiltration", "high", "Extract-and-send instruction"),
+
+    # ── Prompt injection framing ───────────────────────────────────────
+    (re.compile(r"as\s+an?\s+AI\s+language\s+model", re.I),
+     "prompt_injection", "medium", "LLM role framing -- 'as an AI language model'"),
+    (re.compile(r"as\s+a\s+helpful\s+assistant", re.I),
+     "prompt_injection", "medium", "LLM role framing -- 'as a helpful assistant'"),
+    (re.compile(r"(?:respond|reply)\s+with\b", re.I),
+     "prompt_injection", "low", "Embedded response instruction"),
+    (re.compile(r"execute\s+the\s+following", re.I),
+     "prompt_injection", "high", "Execution instruction"),
+    (re.compile(r"run\s+this\s+command", re.I),
+     "prompt_injection", "high", "Command execution instruction"),
+    (re.compile(r"<system>", re.I),
+     "prompt_injection", "high", "XML injection tag -- <system>"),
+    (re.compile(r"</system>", re.I),
+     "prompt_injection", "high", "XML injection tag -- </system>"),
+    (re.compile(r"<instruction>", re.I),
+     "prompt_injection", "high", "XML injection tag -- <instruction>"),
+    (re.compile(r"<prompt>", re.I),
+     "prompt_injection", "high", "XML injection tag -- <prompt>"),
+
+    # ── Social engineering in data ─────────────────────────────────────
+    (re.compile(r"if\s+you\s+are\s+an?\s+LLM", re.I),
+     "social_engineering", "high", "LLM-targeted conditional"),
+    (re.compile(r"if\s+you\s+are\s+a\s+language\s+model", re.I),
+     "social_engineering", "high", "LLM-targeted conditional"),
+    (re.compile(r"if\s+you\s+are\s+Claude", re.I),
+     "social_engineering", "high", "Claude-targeted conditional"),
+    (re.compile(r"if\s+you\s+are\s+an?\s+AI\b", re.I),
+     "social_engineering", "high", "AI-targeted conditional"),
+    (re.compile(r"include\s+a\s+recipe\s+for", re.I),
+     "social_engineering", "medium", "Cameron Mattis canary -- recipe injection"),
+]
+
+
+# ---------------------------------------------------------------------------
+# Scanner
+# ---------------------------------------------------------------------------
+
+def scan_line(line: str, line_num: int, filepath: str) -> list[dict]:
+    """Return list of issue dicts for a single line."""
+    issues = []
+    for regex, category, severity, description in PATTERNS:
+        match = regex.search(line)
+        if match:
+            # Build a context snippet (up to 120 chars centered on match)
+            start = max(0, match.start() - 40)
+            end = min(len(line), match.end() + 40)
+            context = line[start:end].strip()
+            issues.append({
+                "file": filepath,
+                "line": line_num,
+                "category": category,
+                "pattern": match.group(0),
+                "context": context,
+                "severity": severity,
+                "description": description,
+            })
+    return issues
+
+
+def scan_file(filepath: str) -> list[dict]:
+    """Scan a single file and return all issues found."""
+    issues = []
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            for line_num, line in enumerate(f, start=1):
+                issues.extend(scan_line(line, line_num, filepath))
+    except (OSError, IOError) as e:
+        print(f"  ! Could not read {filepath}: {e}", file=sys.stderr)
+    return issues
+
+
+def scan_path(target: str, extensions: list[str]) -> tuple[list[str], list[dict]]:
+    """Scan a file or directory. Returns (files_scanned, all_issues)."""
+    target_path = Path(target).resolve()
+    files_scanned = []
+    all_issues = []
+
+    if target_path.is_file():
+        files_scanned.append(str(target_path))
+        all_issues.extend(scan_file(str(target_path)))
+    elif target_path.is_dir():
+        for root, _dirs, files in os.walk(target_path):
+            for fname in sorted(files):
+                if any(fname.endswith(ext) for ext in extensions):
+                    fpath = os.path.join(root, fname)
+                    files_scanned.append(fpath)
+                    all_issues.extend(scan_file(fpath))
+    else:
+        print(f"Error: {target} is not a file or directory", file=sys.stderr)
+        sys.exit(2)
+
+    return files_scanned, all_issues
+
+
+# ---------------------------------------------------------------------------
+# Output formatters
+# ---------------------------------------------------------------------------
+
+def print_human(files_scanned: list[str], all_issues: list[dict], verbose: bool):
+    """Human-readable output."""
+    issues_by_file: dict[str, list[dict]] = {}
+    for issue in all_issues:
+        issues_by_file.setdefault(issue["file"], []).append(issue)
+
+    flagged_count = len(issues_by_file)
+
+    for fpath in files_scanned:
+        short = os.path.basename(fpath)
+        if fpath in issues_by_file:
+            file_issues = issues_by_file[fpath]
+            print(f"  \u26a0 {short} -- {len(file_issues)} issue(s) found")
+            for issue in file_issues:
+                sev = issue["severity"].upper()
+                print(f"    Line {issue['line']}: [{sev}] {issue['description']}")
+                if verbose:
+                    print(f"      Pattern: \"{issue['pattern']}\"")
+                    print(f"      Context: ...{issue['context']}...")
+        else:
+            print(f"  \u2713 {short} -- clean")
+
+    print()
+    print(
+        f"Summary: {len(files_scanned)} files scanned, "
+        f"{flagged_count} flagged, {len(all_issues)} issues found"
+    )
+
+
+def print_json(files_scanned: list[str], all_issues: list[dict]):
+    """JSON output."""
+    issues_by_file: dict[str, list[dict]] = {}
+    for issue in all_issues:
+        issues_by_file.setdefault(issue["file"], []).append(issue)
+
+    result = {
+        "scanned": len(files_scanned),
+        "flagged": len(issues_by_file),
+        "total_issues": len(all_issues),
+        "issues": all_issues,
+    }
+    print(json.dumps(result, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Quarantine
+# ---------------------------------------------------------------------------
+
+def quarantine_files(all_issues: list[dict], quarantine_dir: str):
+    """Copy flagged files to quarantine directory."""
+    qdir = Path(quarantine_dir)
+    qdir.mkdir(parents=True, exist_ok=True)
+
+    flagged_files = {}
+    for issue in all_issues:
+        fpath = issue["file"]
+        if fpath not in flagged_files:
+            flagged_files[fpath] = []
+        flagged_files[fpath].append(issue)
+
+    manifest = {
+        "quarantined_at": datetime.now(timezone.utc).isoformat(),
+        "files": [],
+    }
+
+    for fpath, file_issues in flagged_files.items():
+        basename = os.path.basename(fpath)
+        dest = qdir / (basename + ".quarantined")
+        # Handle name collisions
+        counter = 1
+        while dest.exists():
+            dest = qdir / f"{basename}.{counter}.quarantined"
+            counter += 1
+        shutil.copy2(fpath, dest)
+
+        manifest["files"].append({
+            "original": fpath,
+            "quarantined_as": str(dest),
+            "issue_count": len(file_issues),
+            "issues": [
+                {
+                    "line": i["line"],
+                    "category": i["category"],
+                    "severity": i["severity"],
+                    "description": i["description"],
+                    "pattern": i["pattern"],
+                }
+                for i in file_issues
+            ],
+        })
+
+    manifest_path = qdir / "manifest.json"
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
+    print(
+        f"\nQuarantined {len(flagged_files)} file(s) to {quarantine_dir}/",
+        file=sys.stderr,
+    )
+    print(f"Manifest written to {manifest_path}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def cmd_scan(args):
+    """Handle the 'scan' subcommand."""
+    extensions = [f".{e.lstrip('.')}" for e in args.ext.split(",")]
+
+    if not args.json:
+        print(f"Scanning: {args.path}")
+
+    files_scanned, all_issues = scan_path(args.path, extensions)
+
+    if not files_scanned:
+        if not args.json:
+            print("  No matching files found.")
+        else:
+            print(json.dumps({"scanned": 0, "flagged": 0, "total_issues": 0, "issues": []}))
+        return 0
+
+    if args.json:
+        print_json(files_scanned, all_issues)
+    else:
+        print_human(files_scanned, all_issues, args.verbose)
+
+    if args.quarantine and all_issues:
+        quarantine_files(all_issues, args.quarantine)
+
+    return 1 if all_issues else 0
+
+
+def cmd_patterns(_args):
+    """Handle the 'patterns' subcommand."""
+    categories: dict[str, list] = {}
+    for regex, category, severity, description in PATTERNS:
+        categories.setdefault(category, []).append(
+            (regex.pattern, severity, description)
+        )
+
+    for cat, pats in categories.items():
+        header = cat.replace("_", " ").title()
+        print(f"\n{header}:")
+        for pattern, severity, description in pats:
+            print(f"  [{severity.upper():6s}] {description}")
+            print(f"           Pattern: {pattern}")
+    print(f"\nTotal: {len(PATTERNS)} patterns across {len(categories)} categories")
+
+
+def cmd_version(_args):
+    """Handle the 'version' subcommand."""
+    print(f"content-guard {__version__}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="content-guard",
+        description="Scan markdown files for prompt injection patterns.",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    # scan
+    scan_parser = subparsers.add_parser("scan", help="Scan files for injection patterns")
+    scan_parser.add_argument("path", help="File or directory to scan")
+    scan_parser.add_argument("--json", action="store_true", help="Output as JSON")
+    scan_parser.add_argument(
+        "--quarantine", metavar="DIR",
+        help="Copy flagged files to this quarantine directory",
+    )
+    scan_parser.add_argument(
+        "--ext", default="md",
+        help="Comma-separated file extensions to scan (default: md)",
+    )
+    scan_parser.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="Show pattern details and context for each finding",
+    )
+
+    # patterns
+    subparsers.add_parser("patterns", help="List all detection patterns")
+
+    # version
+    subparsers.add_parser("version", help="Show version info")
+
+    args = parser.parse_args()
+
+    if args.command == "scan":
+        sys.exit(cmd_scan(args))
+    elif args.command == "patterns":
+        cmd_patterns(args)
+    elif args.command == "version":
+        cmd_version(args)
+    else:
+        parser.print_help()
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
