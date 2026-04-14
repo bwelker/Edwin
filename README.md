@@ -99,6 +99,7 @@ A human chief of staff is useful because they're in the room -- they hear the sa
 | Day-to-Day Usage | How to actually use Edwin once it's running | [Learn more ->](docs/how-edwin-works.md) |
 | Costs | What's free, what's optional, token usage | [Learn more ->](docs/costs.md) |
 | Security | Data privacy, prompt injection, credential storage | [Learn more ->](docs/security.md) |
+| Deployment | Run Edwin on a dedicated Mac for always-on operation | [Learn more ->](docs/deployment.md) |
 
 ## The Cognitive Model
 
