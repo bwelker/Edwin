@@ -97,6 +97,8 @@ A human chief of staff is useful because they're in the room -- they hear the sa
 | Connector Setup | Credential configuration for API-based connectors | [Learn more ->](docs/connector-setup.md) |
 | Tools & Capabilities | Every tool, MCP server, and pipeline Edwin can reach | [Learn more ->](docs/TOOLS.md) |
 | Day-to-Day Usage | How to actually use Edwin once it's running | [Learn more ->](docs/how-edwin-works.md) |
+| Costs | What's free, what's optional, token usage | [Learn more ->](docs/costs.md) |
+| Security | Data privacy, prompt injection, credential storage | [Learn more ->](docs/security.md) |
 
 ## The Cognitive Model
 
