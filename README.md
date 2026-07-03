@@ -49,7 +49,7 @@ Most AI agent frameworks start with tools. Edwin starts with how your brain work
 ## Quickstart
 
 ```bash
-git clone https://github.com/brandtwelker/Edwin.git
+git clone https://github.com/bwelker/Edwin.git
 cd Edwin
 ./setup.sh
 claude

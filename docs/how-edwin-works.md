@@ -121,7 +121,7 @@ Edwin can do anything a chief of staff who reads all your email would do. Some e
 - "What did Jason say about the deployment timeline in yesterday's standup?"
 - "Draft a reply to Sarah's email -- tell her we'll have the numbers by Thursday"
 - "What do we know about [company/person/topic]?"
-- "Remind me to follow up with Pete next Tuesday"
+- "Remind me to follow up with Alex next Tuesday"
 - "Research X and put a summary in my briefing book"
 - "What commitments did I make this week?"
 - "Prep me for my 2 PM meeting"
@@ -191,6 +191,12 @@ Utility scripts that run as CLI commands. Edwin invokes these when a task calls 
 - **session-watcher** -- monitors your sessions for idle/threshold and triggers auto-summarization
 - **systems-report** -- full health report (API costs, pipeline status, Qdrant, Neo4j)
 - **pm-wake** / **pm-dedup** / **pm-recurring** -- PM maintenance utilities
+- **calendar-steward** -- advisory analysis over your calendar (conflicts, prep gaps, load); read-only, never accepts/declines
+- **worklist** -- the living "what's yours vs what's Edwin's" split
+- **commitment-chaser** -- aging report for commitments others owe you
+- **content-guard** -- scans incoming markdown for prompt injection before it's indexed
+- **budget-watch** / **usage-check** -- subagent token-usage measurement and plan-usage polling
+- **skill-evals** / **skill-gepa** / **skill-retirement** -- the skill quality stack: deterministic checks, prompt optimization, and ablation testing
 
 These tools are what make Edwin operational rather than just conversational. They're the difference between "I can discuss your email" and "here are the 4 threads you haven't replied to, sorted by urgency."
 
@@ -208,7 +214,7 @@ Edwin tracks what needs to happen -- tasks, commitments, follow-ups, intentions.
 |------|--------------|
 | **task** | Something that needs to be done |
 | **intention** | Something Edwin plans to do (not yet formalized) |
-| **commitment_by_user** | A promise you made to someone ("I'll send Pete the plan by Friday") |
+| **commitment_by_user** | A promise you made to someone ("I'll send Alex the plan by Friday") |
 | **commitment_to_user** | A promise someone made to you ("Sam said they'd send the numbers") |
 | **recurring** | Something that repeats on a schedule |
 | **deferred** | Parked for later |
@@ -255,6 +261,15 @@ This is Edwin's procedural memory. The vector store knows *what happened*. Skill
 | **pre-1on1-brief** | Focused 1:1 meeting prep -- last meeting recap, commitments, talking points | On demand |
 | **morning-brief-daily-archive** | Archives old morning briefs | Daily 5:55 AM |
 | **weekly-archive** | Archives old weekly dispatches | Monday 5:50 AM |
+| **triage-pass** | "What needs you" sweep since the last pass -- surfaces only what needs your judgment | Every few hours (workday) |
+| **reply-drafts** | Ready-to-paste reply drafts for high-priority + key-contact threads (drafts only) | Weekday mornings |
+| **pre-decision-brief** | Decision radar -- dossiers for decisions approaching in the next few days | Weekdays |
+| **decision-ledger** | Tracks decisions actually made in meetings and their follow-through | Weekly |
+| **pm-weekly-triage** | Evidence-based grooming pass over the PM backlog | Weekly |
+| **kg-curation** | Knowledge-graph freshness sweep + org-chart maintenance | Weekly |
+| **self-study** | Distills one corpus into a synthesis file for retrieval | On demand / nightwatch |
+| **self-retro** | Grades Edwin's own performance and lands corrections | Weekly |
+| **devils-advocate** | Red-teams your active big bets -- the case against each | Monthly |
 
 See `docs/SKILLS.md` for detailed descriptions of each skill, including inputs, outputs, and scheduling.
 
@@ -379,7 +394,7 @@ If Telegram doesn't fit your workflow, build a channel for Slack, WhatsApp, Sign
 | `data/` | Raw synced data from connectors, organized by source and date |
 | `briefing-book/docs/` | The briefing book -- Edwin's organized output (open with Obsidian) |
 | `connectors/` | 15 data connectors (Python CLIs) |
-| `skills/` | 12 skill definitions (SKILL.md files) |
+| `skills/` | Skill definitions (SKILL.md files) -- one folder per skill |
 | `docs/TOOLS.md` | Full tool inventory -- every command Edwin can reach |
 | `docs/SKILLS.md` | Skill index -- every workflow Edwin knows how to execute |
 | `tools/indexer/` | Embeds markdown into Qdrant for semantic search |
@@ -388,6 +403,8 @@ If Telegram doesn't fit your workflow, build a channel for Slack, WhatsApp, Sign
 | `memory/` | Session summaries and memory index |
 | `CLAUDE.md` | Edwin's identity and operating instructions |
 | `.env` | Configuration (ports, timezone, credentials) |
+
+> **`EDWIN_HOME`.** Paths in this guide use `~/Edwin`, the default install location. Tools and connectors resolve their root from the `EDWIN_HOME` environment variable (falling back to `~/Edwin`), so you can install Edwin anywhere -- set `EDWIN_HOME` in your `.env` and everything follows.
 
 ### Running connectors manually
 
