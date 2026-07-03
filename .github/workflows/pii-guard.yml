@@ -1,0 +1,114 @@
+name: PII Guard
+
+# Leak gate for the PUBLIC Edwin repo. Runs pii-guard (content-based PII /
+# secret scanner) and FAILS the build on genuine PII.
+#
+# DESIGN (three layers -- see tools/pii-guard/README-ci.md):
+#   (a) STRUCTURAL detection -- emails, phones, /Users paths, private keys,
+#       AWS/GitHub/Slack/Anthropic/OpenAI/Google keys, JWTs. Needs NO seed and
+#       always runs.
+#   (b) GENERIC committed template (tools/pii-guard/denylist.public.json) --
+#       confidentiality tripwires + EDWIN_HOME convention; carries NO private
+#       entity seed, so nothing sensitive lives in this repo.
+#   (c) PRIVATE seed injected at CI time from the `PII_DENYLIST` secret (full
+#       person/family/staff recall) -- written OUTSIDE the repo, never committed.
+#
+# The blocking gate scans only the CHANGED files in the push/PR, so a build
+# fails when a change *introduces* PII -- pre-existing accepted baseline never
+# blocks every run. A separate non-blocking full-tree audit reports the total
+# noise floor. The documented noise floor (EDWIN_HOME, RFC-2606 example.*
+# domains, bare-variable credential heuristics, safe image/font/media binaries)
+# is subtracted by tools/pii-guard/ci_gate.py before gating.
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: pii-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pii-gate:
+    name: PII gate (changed files -- blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need history to diff the change
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve denylist (inject private seed if provided)
+        id: dl
+        env:
+          PII_DENYLIST: ${{ secrets.PII_DENYLIST }}
+        run: |
+          if [ -n "$PII_DENYLIST" ]; then
+            # Write outside the repo tree so the seed is never scanned/committed.
+            printf '%s' "$PII_DENYLIST" > "$RUNNER_TEMP/pii-denylist.json"
+            echo "path=$RUNNER_TEMP/pii-denylist.json" >> "$GITHUB_OUTPUT"
+            echo "Using injected private PII_DENYLIST seed (full-recall gate)."
+          else
+            echo "path=tools/pii-guard/denylist.public.json" >> "$GITHUB_OUTPUT"
+            echo "::notice::PII_DENYLIST secret not set -- running structural + generic template only (no private-name recall). Set the secret for full recall."
+          fi
+
+      - name: Compute changed files
+        id: changed
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="origin/${{ github.base_ref }}"
+            git fetch --no-tags --depth=1 origin "${{ github.base_ref }}" || true
+            git diff -z --name-only --diff-filter=d "$base"...HEAD > "$RUNNER_TEMP/changed.z" || \
+              git ls-files -z > "$RUNNER_TEMP/changed.z"
+          else
+            before="${{ github.event.before }}"
+            if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "${before}^{commit}" 2>/dev/null; then
+              # New branch / no usable baseline -> scan all tracked files.
+              git ls-files -z > "$RUNNER_TEMP/changed.z"
+            else
+              git diff -z --name-only --diff-filter=d "$before" "${{ github.sha }}" > "$RUNNER_TEMP/changed.z"
+            fi
+          fi
+          echo "Changed files:"; tr '\0' '\n' < "$RUNNER_TEMP/changed.z"
+
+      - name: pii-guard gate on changed files
+        run: |
+          xargs -0 -a "$RUNNER_TEMP/changed.z" \
+            python tools/pii-guard/ci_gate.py \
+            --denylist "${{ steps.dl.outputs.path }}" --files
+
+  pii-audit:
+    name: PII audit (full tree -- non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve denylist
+        id: dl
+        env:
+          PII_DENYLIST: ${{ secrets.PII_DENYLIST }}
+        run: |
+          if [ -n "$PII_DENYLIST" ]; then
+            printf '%s' "$PII_DENYLIST" > "$RUNNER_TEMP/pii-denylist.json"
+            echo "path=$RUNNER_TEMP/pii-denylist.json" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=tools/pii-guard/denylist.public.json" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Full-tree audit (report only)
+        run: |
+          python tools/pii-guard/ci_gate.py \
+            --tree . --denylist "${{ steps.dl.outputs.path }}" --audit
