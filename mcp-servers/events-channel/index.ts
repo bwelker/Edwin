@@ -2,19 +2,30 @@
 /**
  * Edwin Events Channel -- pushes job events, alerts, and webhooks into Claude Code sessions.
  *
- * One-way channel: receives HTTP POSTs from Plombery, the job handler, monitoring
- * scripts, or any system that can send an HTTP request. Forwards them into the
- * active Claude Code session as <channel source="events" ...> tags.
+ * One-way channel: the events daemon (daemon.ts, launchd-managed) owns port
+ * 8788, receives HTTP POSTs from Plombery, the job handler, monitoring
+ * scripts, or any system that can send an HTTP request, filters no-ops, and
+ * appends deliverable events to data/events-channel/queue.jsonl. This MCP
+ * server is the session-side READER: it tails that queue and forwards events
+ * into the active Claude Code session as <channel source="events" ...> tags.
+ *
+ * It binds NO ports. Every session may run its own copy safely; a consumer
+ * lock (tailer.ts) ensures exactly one session receives the feed, with
+ * automatic failover within ~2 minutes if that session dies. This is the fix
+ * for the class of bug where per-session port contention causes long,
+ * silent outages in the events feed.
  *
  * Following the Anthropic Channels Reference:
  * https://code.claude.com/docs/en/channels-reference
  */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { QueueTailer } from "./tailer.ts";
 
 // --- Configuration -----------------------------------------------------------
 
-const PORT = parseInt(process.env.EVENTS_PORT || "8790", 10);
+const EDWIN_HOME = process.env.EDWIN_HOME || `${process.env.HOME}/Edwin`;
+const QUEUE_PATH = process.env.QUEUE_PATH || `${EDWIN_HOME}/data/events-channel/queue.jsonl`;
 
 // --- Logging (stderr so it doesn't pollute MCP stdio) ------------------------
 
@@ -25,7 +36,7 @@ function log(msg: string): void {
 // --- MCP Server Setup --------------------------------------------------------
 
 const mcp = new Server(
-  { name: "events", version: "1.0.0" },
+  { name: "events", version: "2.0.0" },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
@@ -34,9 +45,10 @@ const mcp = new Server(
       'Events from external systems arrive as <channel source="events" ...>.',
       "They are one-way: read them and act, no reply expected.",
       "Each event has an event_type attribute (e.g. job_complete, run_skill, alert, webhook).",
+      "Routine no-op job completions are filtered server-side and never reach you -- any job_complete you see is an error or did meaningful work, so it deserves attention.",
       "For job_complete events: check the status and log/report as needed.",
-      "For run_skill events: read the skill attribute to get the skill name, then spawn a background subagent to execute it. The subagent should read and follow ~/Edwin/skills/{skill}/SKILL.md. When the subagent returns, relay any items needing the user's attention via iMessage.",
-      "For nightwatch_heartbeat events: check if a nightwatch task subagent is currently running. If not, read the plan file at ~/Edwin/data/nightwatch/YYYY-MM-DD-plan.md, find the next uncompleted task, and spawn a subagent to execute it. Check the time first -- if after 3:30 AM ET, don't spawn, just log wind-down.",
+      "For run_skill events: run `~/Edwin/tools/dispatch/dispatch run_skill --skill NAME` (NAME from the event's skill attribute) and execute the returned JSON instruction verbatim -- do not re-derive the decision. Ack outcomes with `dispatch ack`. When the subagent returns, relay any items needing the user's attention via iMessage.",
+      "For nightwatch_heartbeat events: run `~/Edwin/tools/dispatch/dispatch nightwatch_heartbeat` and execute the returned JSON instruction verbatim (noop, log_winddown, spawn_planner, spawn_replanner, spawn_tasks, or surface_to_user) -- do not re-derive the decision. Ack every dispatch_id: spawned after spawning, completed/failed when it returns.",
       "For alert events: assess severity and notify the user if critical.",
       "For webhook events: process based on the source and payload.",
     ].join(" "),
@@ -48,64 +60,23 @@ const mcp = new Server(
 await mcp.connect(new StdioServerTransport());
 log("MCP connected");
 
-// --- HTTP Server: receives events and pushes to session ----------------------
+// --- Queue reader: tails the daemon's queue and pushes to session -------------
+//
+// Starts at the CURRENT head -- a fresh session never replays old events.
+// Only the consumer-lock holder emits; everyone else tails silently and
+// stands by for failover (see tailer.ts for the lock protocol).
 
-Bun.serve({
-  port: PORT,
-  hostname: "127.0.0.1",
-  async fetch(req) {
-    const url = new URL(req.url);
-
-    // Health check
-    if (req.method === "GET" && url.pathname === "/health") {
-      return new Response(JSON.stringify({ status: "ok", port: PORT }), {
-        headers: { "Content-Type": "application/json" },
-      });
-    }
-
-    if (req.method !== "POST") {
-      return new Response("Method not allowed", { status: 405 });
-    }
-
-    try {
-      const body = await req.text();
-      let content: string;
-      let meta: Record<string, string> = {};
-
-      // Try to parse as JSON for structured events
-      try {
-        const json = JSON.parse(body);
-        content = json.message || json.content || json.text || body;
-        meta = {
-          event_type: json.event_type || json.type || json.event || "unknown",
-          source: json.source || url.pathname.replace(/^\//, "") || "unknown",
-          ...(json.job ? { job: json.job } : {}),
-          ...(json.status ? { status: json.status } : {}),
-          ...(json.severity ? { severity: json.severity } : {}),
-          ...(json.pipeline_id ? { pipeline_id: json.pipeline_id } : {}),
-          ...(json.skill ? { skill: json.skill } : {}),
-        };
-      } catch {
-        // Plain text
-        content = body;
-        meta = {
-          event_type: "webhook",
-          source: url.pathname.replace(/^\//, "") || "unknown",
-        };
-      }
-
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: { content, meta },
-      });
-
-      log(`Event pushed: ${meta.event_type} from ${meta.source}`);
-      return new Response("ok");
-    } catch (e: any) {
-      log(`Error: ${e.message}`);
-      return new Response(`Error: ${e.message}`, { status: 500 });
-    }
+const tailer = new QueueTailer({
+  queuePath: QUEUE_PATH,
+  log,
+  emit: async ({ content, meta }) => {
+    await mcp.notification({
+      method: "notifications/claude/channel",
+      params: { content, meta },
+    });
+    log(`Event pushed: ${meta.event_type} from ${meta.source}`);
   },
 });
 
-log(`Listening on localhost:${PORT}`);
+await tailer.start();
+log(`Tailing ${QUEUE_PATH} (lock holder: ${tailer.isHolder})`);

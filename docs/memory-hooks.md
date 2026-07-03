@@ -168,6 +168,6 @@ Check `~/.edwin/memory/captured/` for the output file.
 
 ## Why this exists
 
-The stock Claude Code boot sequence retrieves memory exactly once: on the first user prompt of a session. Subsequent messages are answered from whatever made it into the context window. If your setup involves a rich personal knowledge base, this is the difference between an assistant that knows you and one that asks "who's Pete?" three turns in.
+The stock Claude Code boot sequence retrieves memory exactly once: on the first user prompt of a session. Subsequent messages are answered from whatever made it into the context window. If your setup involves a rich personal knowledge base, this is the difference between an assistant that knows you and one that asks "who's Alex?" three turns in.
 
-OpenClaw solves the same problem via its `before_agent_start` and `agent_end` extension hooks. Claude Code's `UserPromptSubmit` and `PreCompact` are the equivalent surface area. These two scripts are the minimum viable wiring.
+Some agent frameworks solve the same problem via `before_agent_start` and `agent_end` extension hooks. Claude Code's `UserPromptSubmit` and `PreCompact` are the equivalent surface area. These two scripts are the minimum viable wiring.

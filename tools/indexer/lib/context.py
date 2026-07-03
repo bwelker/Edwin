@@ -12,7 +12,14 @@ import time
 from .config import (ANTHROPIC_MODEL, ANTHROPIC_RETRIES,
                      CONTEXT_MIN_DOC_TOKENS, CONTEXT_SOURCE_THRESHOLDS,
                      CONTEXT_SLIDING_WINDOW, CONTEXT_SEGMENT_SOURCES,
-                     CONTEXT_PROMPT, CHARS_PER_TOKEN, CREDENTIALS_FILE)
+                     CONTEXT_PROMPT, CHARS_PER_TOKEN, CREDENTIALS_FILE,
+                     CONTEXT_RATE_LIMIT_BUDGET, CONTEXT_RATE_LIMIT_SLEEP,
+                     CONTEXT_RATE_LIMIT_SLEEP_LONG, CONTEXT_OVERLOAD_SLEEP)
+from .bulkmail import is_bulk_mail
+
+# Mail sources gated by the bulk-mail classifier (skip paid Haiku context
+# for marketing/broadcast mail; still chunked + embedded).
+BULK_MAIL_SOURCES = ("o365-mail", "google-mail")
 
 
 def _load_api_key() -> str | None:
@@ -39,6 +46,15 @@ class ContextGenerator:
         self.api_key = _load_api_key()
         self._client = None
         self.enabled = self.api_key is not None
+        # Per-file rate-limit sleep budget (seconds). Reset for each file in
+        # contextualize_chunks(). When exhausted, remaining chunks in the file
+        # get empty context and last_file_context_complete is set False so the
+        # caller records context_done=False (picked up by --backfill-context).
+        self._budget_remaining = CONTEXT_RATE_LIMIT_BUDGET
+        self.last_file_context_complete = True
+        # Bulk-mail gating counters (reported by the sync loop at the end)
+        self.bulk_skipped = 0
+        self.mail_seen = 0
 
         if not self.enabled:
             print("WARNING: No Anthropic API key found. "
@@ -250,13 +266,33 @@ class ContextGenerator:
         Returns:
             List of context strings (one per chunk). Empty string if generation fails.
         """
+        # Fresh rate-limit budget and completion flag for each file.
+        self._budget_remaining = CONTEXT_RATE_LIMIT_BUDGET
+        self.last_file_context_complete = True
+
         if not self.enabled:
             return [""] * len(chunk_texts)
+
+        # Bulk-mail gate: marketing/broadcast email gets no paid Haiku
+        # context (still chunked + embedded, stays searchable). Counts as
+        # an intentional skip -- context_done stays True so backfill never
+        # re-queues it. Conservative classifier: see lib/bulkmail.py.
+        if source in BULK_MAIL_SOURCES:
+            self.mail_seen += 1
+            from .metadata import extract_frontmatter
+            fm = extract_frontmatter(document)
+            if is_bulk_mail(fm, document):
+                self.bulk_skipped += 1
+                sender = str(fm.get("from", ""))[:60]
+                print(f"  Bulk mail, context skipped "
+                      f"[{self.bulk_skipped}/{self.mail_seen} mail]: {sender}",
+                      file=sys.stderr)
+                return [""] * len(chunk_texts)
 
         # Per-source threshold (0 = context everything for this source)
         threshold = CONTEXT_SOURCE_THRESHOLDS.get(source, CONTEXT_MIN_DOC_TOKENS)
 
-        # Skip documents below threshold
+        # Skip documents below threshold (intentional skip, counts as done)
         if threshold > 0 and len(document) < threshold * CHARS_PER_TOKEN:
             return [""] * len(chunk_texts)
 
@@ -275,20 +311,41 @@ class ContextGenerator:
                 print(f"  Segment context: {len(segments)} segments for {source}",
                       file=sys.stderr)
 
-        # Guard: truncate document if it exceeds Haiku's context window (~200K tokens)
-        # Leave room for the chunk + prompt (~1K tokens)
-        MAX_DOC_CHARS = 180_000 * CHARS_PER_TOKEN  # ~720K chars = ~180K tokens
-        if len(document) > MAX_DOC_CHARS:
-            document = document[:MAX_DOC_CHARS]
+        # Guard: documents must fit Haiku's 200K-token context window.
+        # CHARS_PER_TOKEN (4) is too optimistic for dense markdown -- measured
+        # ratio on real archive files is ~3.0-3.3 chars/token, so size the cap
+        # at 3 chars/token (~165K real tokens for a 540K-char doc, safe margin).
+        #
+        # Oversized documents are NOT truncated-and-contextualized: chunks past
+        # the truncation point would be "situated" in a document that doesn't
+        # contain them, producing garbage context (and, before 2026-06-12, a
+        # deterministic 400 "prompt is too long" retry storm that stalled the
+        # sync for hours per file -- the chatgpt/ archive poison-pill loop).
+        # Instead, skip context for the whole file as an intentional skip
+        # (counts as context_done, same as the below-threshold path), so the
+        # file embeds immediately and never re-enters a backfill loop.
+        MAX_DOC_CHARS = 180_000 * 3  # 540K chars ~= 165K real tokens
+        if len(document) > MAX_DOC_CHARS and not (segments and len(segments) > 1):
+            print(f"  Context skipped: document too large "
+                  f"({len(document):,} chars > {MAX_DOC_CHARS:,}); "
+                  f"embedding without context", file=sys.stderr)
+            return [""] * len(chunk_texts)
 
         self._ensure_client()
         contexts = []
 
         for chunk_text in chunk_texts:
+            # Budget exhausted earlier in this file: skip remaining chunks
+            # immediately -- they're covered by the same backfill pass.
+            if not self.last_file_context_complete:
+                contexts.append("")
+                continue
+
             # Use segment-level context if available
             if segments and len(segments) > 1:
                 ctx_doc = self._find_chunk_segment(segments, chunk_text)
-                # Truncate segment if needed
+                # Truncate segment if needed (segments contain their chunk by
+                # construction, so truncation here is a size guard, not a lie)
                 if len(ctx_doc) > MAX_DOC_CHARS:
                     ctx_doc = ctx_doc[:MAX_DOC_CHARS]
             else:
@@ -299,6 +356,28 @@ class ContextGenerator:
 
         return contexts
 
+    def _sleep_within_budget(self, wait: int, reason: str) -> bool:
+        """Sleep up to `wait` seconds, bounded by the per-file budget.
+
+        Returns True if the caller may retry, False if the budget is
+        exhausted (caller should skip context for the rest of the file).
+        Never sleeps unboundedly: every wait is capped by what remains.
+        """
+        if self._budget_remaining <= 0:
+            print(f"  Rate-limit budget exhausted ({CONTEXT_RATE_LIMIT_BUDGET}s); "
+                  f"skipping context for rest of file ({reason}). "
+                  f"Will be picked up by --backfill-context.", file=sys.stderr)
+            self.last_file_context_complete = False
+            return False
+
+        wait = min(wait, self._budget_remaining)
+        print(f"  {reason}, waiting {wait}s "
+              f"(budget remaining: {self._budget_remaining - wait}s)",
+              file=sys.stderr)
+        time.sleep(wait)
+        self._budget_remaining -= wait
+        return True
+
     def _generate_one(self, document: str, chunk_text: str) -> str:
         """Generate context for a single chunk with retry.
 
@@ -306,8 +385,11 @@ class ContextGenerator:
         from the same document reuse the cached input tokens. Only the
         chunk text (user message) changes per call.
 
-        Rate limits are NOT errors -- they're flow control. We wait and
-        retry indefinitely on rate limits. Real errors get limited retries.
+        Rate limits are flow control, not errors -- but retries are bounded
+        by a per-file sleep budget (CONTEXT_RATE_LIMIT_BUDGET seconds). When
+        the budget runs out, we return "" and flag the file incomplete so the
+        embed pipeline continues and --backfill-context fills the gap later.
+        Real errors get limited retries.
         """
         error_retries = 0
         rate_limit_hits = 0
@@ -346,23 +428,35 @@ class ContextGenerator:
                 error_str = str(e)
 
                 if "rate_limit" in error_str.lower() or "429" in error_str:
-                    # Rate limits: wait and retry forever. These are flow control.
+                    # Rate limits: wait and retry within the per-file budget.
                     rate_limit_hits += 1
                     if rate_limit_hits <= 3:
-                        wait = 60
+                        wait = CONTEXT_RATE_LIMIT_SLEEP
                     else:
-                        wait = 300  # After 3 consecutive, wait 5 min
-                    print(f"  Rate limit #{rate_limit_hits}, waiting {wait}s",
-                          file=sys.stderr)
-                    time.sleep(wait)
+                        wait = CONTEXT_RATE_LIMIT_SLEEP_LONG
+                    if not self._sleep_within_budget(
+                            wait, f"Rate limit #{rate_limit_hits}"):
+                        return ""
                     continue  # Never count against error retries
 
                 elif "overloaded" in error_str.lower() or "529" in error_str:
-                    # Server overloaded: similar to rate limit, wait and retry
-                    wait = 120
-                    print(f"  Anthropic overloaded, waiting {wait}s", file=sys.stderr)
-                    time.sleep(wait)
+                    # Server overloaded: same budget-bounded wait as rate limits
+                    if not self._sleep_within_budget(
+                            CONTEXT_OVERLOAD_SLEEP, "Anthropic overloaded"):
+                        return ""
                     continue
+
+                elif ("prompt is too long" in error_str.lower()
+                        or "invalid_request_error" in error_str):
+                    # Deterministic 4xx: the same payload will fail every time.
+                    # Retrying with backoff turned one oversized file into a
+                    # multi-hour stall (611 chunks x 30s of sleeps, 2026-06-12).
+                    # Skip context for the rest of this file; backfill retries
+                    # later once the document-size guard or chunking changes.
+                    print(f"  Non-retryable API error, skipping context for "
+                          f"rest of file: {e}", file=sys.stderr)
+                    self.last_file_context_complete = False
+                    return ""
 
                 else:
                     # Real error: limited retries

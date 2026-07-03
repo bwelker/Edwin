@@ -153,7 +153,7 @@ Examples:
 - `connectors/o365/o365 mail --query "budget" --max 10` -- search Outlook inbox right now
 - `connectors/o365/o365 calendar --today` -- pull today's calendar live
 - `connectors/o365/o365 teams --max 20` -- recent Teams messages
-- `connectors/o365/o365 availability --email "jason@company.com" --date "2026-04-14"` -- check someone's free/busy
+- `connectors/o365/o365 availability --email "jane@example.com" --date "2026-04-14"` -- check someone's free/busy
 - `connectors/google/google sync mail` -- force a Gmail sync
 - `connectors/limitless/limitless sync lifelogs` -- pull latest Limitless recordings
 
@@ -209,7 +209,7 @@ Edwin tracks what needs to happen -- tasks, commitments, follow-ups, intentions.
 | **task** | Something that needs to be done |
 | **intention** | Something Edwin plans to do (not yet formalized) |
 | **commitment_by_user** | A promise you made to someone ("I'll send Pete the plan by Friday") |
-| **commitment_to_user** | A promise someone made to you ("Rob said he'd send the numbers") |
+| **commitment_to_user** | A promise someone made to you ("Sam said they'd send the numbers") |
 | **recurring** | Something that repeats on a schedule |
 | **deferred** | Parked for later |
 

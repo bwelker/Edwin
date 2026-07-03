@@ -1,191 +1,164 @@
 #!/usr/bin/env python3
-"""PM Dedup -- detect and clean near-duplicate prospective memory items.
+"""PM Dedup -- detect near-duplicate prospective memory items.
 
 Usage:
-  pm-dedup scan          # Report duplicates (dry run)
-  pm-dedup clean         # Cancel duplicates, keeping the oldest in each group
-  pm-dedup clean --dry   # Show what clean would do without acting
+  pm-dedup scan            # Report duplicate groups among OPEN items (dry run)
+  pm-dedup scan --all      # Include done/cancelled history in the scan
+  pm-dedup sweep           # Emit a JSON review list (for nightwatch/weekly)
+  pm-dedup clean --confirm # Cancel dupes, keeping oldest in each group (HUMAN-ONLY)
+  pm-dedup clean --dry     # Show what clean WOULD do without acting
 
-Detection method:
-  1. Normalize descriptions (lowercase, strip whitespace, collapse punctuation)
-  2. Group by (owner, counterparty, normalized description similarity)
-  3. Within each group, keep the oldest item, mark rest as cancelled
+Detection lives in dedup_core.py (shared with the pm_add add-time guard) so the
+two never diverge. Normalized fuzzy + token-overlap similarity catches reworded
+restatements that literal pm_search (SQL LIKE) misses.
 
-Only operates on non-terminal items (status not in done/cancelled).
+SAFETY: scan and sweep are FLAG-ONLY -- they only report candidate pairs, they
+never mutate anything. `clean` is the ONLY mutating command; it cancels (never
+deletes) items and refuses to run without an explicit --confirm, so it cannot be
+invoked by automation. Automation (nightwatch/weekly) must use `sweep` and route
+its output to a human for approval.
 """
 
+import json
 import os
 import sqlite3
 import sys
-from collections import defaultdict
-from difflib import SequenceMatcher
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from dedup_core import DEFAULT_THRESHOLD, find_duplicate_groups  # noqa: E402
+
 DB_PATH = Path(os.environ.get("PM_DB_PATH", Path.home() / "Edwin" / "data" / "pm" / "prospective.db"))
+
 
 def get_conn():
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     return conn
 
-def normalize(text):
-    """Normalize description for comparison."""
-    import re
-    t = text.lower().strip()
-    # Remove dates and date-like patterns
-    t = re.sub(r'\b\d{4}-\d{2}-\d{2}\b', '', t)
-    t = re.sub(r'\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{1,2}\b', '', t, flags=re.I)
-    t = re.sub(r'\bmar(?:ch)?\s+\d{1,2}\b', '', t, flags=re.I)
-    # Remove PM IDs
-    t = re.sub(r'pm-[a-f0-9]+', '', t)
-    # Collapse whitespace
-    t = re.sub(r'\s+', ' ', t).strip()
-    # Remove trailing punctuation
-    t = re.sub(r'[\s\-\-\-.]+$', '', t)
-    return t
 
-def similarity(a, b):
-    """Return similarity ratio between two strings (0-1)."""
-    return SequenceMatcher(None, a, b).ratio()
-
-def find_duplicates(items, threshold=0.80):
-    """Find groups of near-duplicate items.
-
-    Returns list of groups, each group is a list of items sorted by created_at.
-    """
-    # Group by owner + counterparty first (reduces comparison space)
-    buckets = defaultdict(list)
-    for item in items:
-        key = (item['owner'] or '', item['counterparty'] or '')
-        buckets[key].append(item)
-
-    all_groups = []
-
-    for key, bucket in buckets.items():
-        if len(bucket) < 2:
-            continue
-
-        # Normalize descriptions
-        normalized = [(item, normalize(item['description'])) for item in bucket]
-
-        # Find clusters using greedy matching
-        used = set()
-        for i, (item_a, norm_a) in enumerate(normalized):
-            if i in used:
-                continue
-            group = [item_a]
-            used.add(i)
-
-            for j, (item_b, norm_b) in enumerate(normalized):
-                if j in used:
-                    continue
-                if similarity(norm_a, norm_b) >= threshold:
-                    group.append(item_b)
-                    used.add(j)
-
-            if len(group) > 1:
-                # Sort by created_at -- keep oldest
-                group.sort(key=lambda x: x['created_at'])
-                all_groups.append(group)
-
-    return all_groups
-
-def scan():
-    """Report duplicate groups."""
+def _load_items(include_all=False):
     conn = get_conn()
-    cursor = conn.cursor()
-
-    # Get all non-terminal items
-    cursor.execute("""
-        SELECT * FROM items
-        WHERE status NOT IN ('done', 'cancelled')
-        ORDER BY created_at
-    """)
-    active = [dict(row) for row in cursor.fetchall()]
-
-    # Also check cancelled/done items for historical clusters
-    cursor.execute("SELECT * FROM items ORDER BY created_at")
-    all_items = [dict(row) for row in cursor.fetchall()]
-
+    cur = conn.cursor()
+    if include_all:
+        rows = cur.execute("SELECT * FROM items ORDER BY created_at").fetchall()
+    else:
+        rows = cur.execute(
+            "SELECT * FROM items WHERE status NOT IN ('done','cancelled') "
+            "ORDER BY created_at"
+        ).fetchall()
     conn.close()
+    return [dict(r) for r in rows]
 
-    print(f"Total items: {len(all_items)}")
-    print(f"Active items: {len(active)}")
+
+def scan(include_all=False):
+    """Report duplicate groups (dry run, flag-only)."""
+    items = _load_items(include_all=include_all)
+    groups = find_duplicate_groups(items, threshold=DEFAULT_THRESHOLD)
+
+    scope = "all items (incl. done/cancelled)" if include_all else "open items"
+    print(f"Scanned {len(items)} {scope} at threshold {DEFAULT_THRESHOLD}")
     print()
 
-    # Find dupes in active items
-    groups = find_duplicates(active)
-
     if not groups:
-        print("No duplicates found in active items.")
-    else:
-        total_dupes = sum(len(g) - 1 for g in groups)
-        print(f"Found {len(groups)} duplicate groups ({total_dupes} items to remove):")
+        print("No near-duplicate groups found.")
+        return groups
+
+    total_dupes = sum(len(g) - 1 for g in groups)
+    print(f"Found {len(groups)} near-duplicate group(s) "
+          f"({total_dupes} candidates to review):")
+    print()
+    for i, group in enumerate(groups, 1):
+        keep = group[0]
+        print(f"  Group {i}: {len(group)} items "
+              f"(oldest / likely-canonical: {keep['id']})")
+        for item in group:
+            marker = "KEEP" if item is keep else "DUP "
+            print(f"    [{marker}] {item['id']} | {item['status']:9} | "
+                  f"{item['description'][:80]}")
         print()
-
-        for i, group in enumerate(groups, 1):
-            keep = group[0]
-            print(f"  Group {i}: {len(group)} items (keep {keep['id']})")
-            for item in group:
-                marker = "KEEP" if item == keep else "DUP "
-                print(f"    [{marker}] {item['id']} | {item['status']} | {item['description'][:80]}")
-            print()
-
-    # Also scan all items for historical dup clusters
-    all_groups = find_duplicates(all_items)
-    cancelled_groups = [g for g in all_groups if len(g) > 3]
-
-    if cancelled_groups:
-        print(f"\n--- Historical dup clusters (>3 items, including done/cancelled) ---")
-        for i, group in enumerate(cancelled_groups, 1):
-            statuses = defaultdict(int)
-            for item in group:
-                statuses[item['status']] += 1
-            status_str = ", ".join(f"{s}: {c}" for s, c in statuses.items())
-            print(f"  Cluster {i}: {len(group)} items ({status_str})")
-            print(f"    Example: {group[0]['description'][:100]}")
-            print()
-
+    print("Review-only. To act, a human runs `pm-dedup clean --confirm` "
+          "(or updates/cancels items individually).")
     return groups
 
-def clean(dry_run=False):
-    """Cancel duplicates, keeping the oldest in each group."""
-    conn = get_conn()
-    cursor = conn.cursor()
 
-    cursor.execute("""
-        SELECT * FROM items
-        WHERE status NOT IN ('done', 'cancelled')
-        ORDER BY created_at
-    """)
-    active = [dict(row) for row in cursor.fetchall()]
+def sweep():
+    """Emit a machine-readable review list. FLAG-ONLY -- never mutates.
 
-    groups = find_duplicates(active)
+    Intended for nightwatch/weekly automation: pipe this to a human for approval.
+    """
+    items = _load_items(include_all=False)
+    groups = find_duplicate_groups(items, threshold=DEFAULT_THRESHOLD)
+    payload = {
+        "threshold": DEFAULT_THRESHOLD,
+        "open_items_scanned": len(items),
+        "group_count": len(groups),
+        "review_candidates": sum(len(g) - 1 for g in groups),
+        "groups": [
+            {
+                "keep": g[0]["id"],
+                "items": [
+                    {
+                        "id": it["id"],
+                        "status": it["status"],
+                        "counterparty": it.get("counterparty"),
+                        "due_date": it.get("due_date"),
+                        "description": it["description"],
+                    }
+                    for it in g
+                ],
+            }
+            for g in groups
+        ],
+        "note": "flag-only review list; no items were modified. Human approval "
+                "required before cancelling any item.",
+    }
+    print(json.dumps(payload, indent=2))
+    return payload
+
+
+def clean(dry_run=False, confirmed=False):
+    """Cancel duplicates, keeping the oldest in each group. HUMAN-ONLY.
+
+    Refuses to run without --confirm (or --dry) so automation cannot trip it.
+    Cancels (status='cancelled'); never hard-deletes.
+    """
+    if not dry_run and not confirmed:
+        print("REFUSING TO RUN: `clean` mutates the PM store (cancels items).")
+        print("This is a human-approval action -- it must never be automated.")
+        print("Re-run with --confirm once you have reviewed `pm-dedup scan`, "
+              "or use --dry to preview.")
+        sys.exit(2)
+
+    items = _load_items(include_all=False)
+    groups = find_duplicate_groups(items, threshold=DEFAULT_THRESHOLD)
 
     if not groups:
         print("No duplicates found. Nothing to clean.")
-        conn.close()
         return
 
-    total_cancelled = 0
+    conn = get_conn()
+    cur = conn.cursor()
+    total = 0
     for group in groups:
         keep = group[0]
         for item in group[1:]:
             if dry_run:
                 print(f"  Would cancel: {item['id']} | {item['description'][:60]}")
             else:
-                cursor.execute(
-                    "UPDATE items SET status = 'cancelled', updated_at = datetime('now', 'localtime') WHERE id = ?",
-                    (item['id'],)
+                cur.execute(
+                    "UPDATE items SET status='cancelled', "
+                    "updated_at=datetime('now','localtime') WHERE id=?",
+                    (item["id"],),
                 )
                 print(f"  Cancelled: {item['id']} (dup of {keep['id']})")
-            total_cancelled += 1
-
+            total += 1
     if not dry_run:
         conn.commit()
-
     conn.close()
-    print(f"\n{'Would cancel' if dry_run else 'Cancelled'}: {total_cancelled} duplicates across {len(groups)} groups")
+    verb = "Would cancel" if dry_run else "Cancelled"
+    print(f"\n{verb}: {total} duplicates across {len(groups)} groups")
+
 
 def main():
     if len(sys.argv) < 2:
@@ -193,16 +166,19 @@ def main():
         sys.exit(1)
 
     cmd = sys.argv[1]
+    args = sys.argv[2:]
 
-    if cmd == 'scan':
-        scan()
-    elif cmd == 'clean':
-        dry = '--dry' in sys.argv
-        clean(dry_run=dry)
+    if cmd == "scan":
+        scan(include_all="--all" in args)
+    elif cmd == "sweep":
+        sweep()
+    elif cmd == "clean":
+        clean(dry_run="--dry" in args, confirmed="--confirm" in args)
     else:
         print(f"Unknown command: {cmd}")
         print(__doc__)
         sys.exit(1)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

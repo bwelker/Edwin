@@ -4,11 +4,13 @@ Edwin Systems Health Report -- nightly diagnostics + cost tracking.
 
 Generates a markdown report covering:
   1. API costs (daily + MTD)
-  2. Pipeline health (connector freshness)
-  3. Vector store health (Qdrant)
-  4. Knowledge graph health (Neo4j)
-  5. Indexer status (context coverage)
-  6. Job handler status (if available)
+  2. Pipeline health (connector freshness + job failure streaks)
+  3. Commitment aging
+  4. Memory validity (bi-temporal audit)
+  5. Vector store health (Qdrant) + retrieval-quality eval
+  6. Knowledge graph health (Neo4j)
+  7. Indexer status (context coverage)
+  8. Infrastructure (Docker / Ollama)
 
 Usage:
     report                    # Generate and publish to briefing book
@@ -91,6 +93,45 @@ def _check_service(url, timeout=5):
         return True
     except Exception:
         return False
+
+
+def _neo4j_auth_header():
+    """Basic-auth header for Neo4j, resolved from env vars or the shared
+    credentials file -- never hardcoded (matches ~/.edwin/credentials/*
+    convention used elsewhere in this tool). Returns None if no password is
+    configured (caller then makes an unauthenticated request, which the
+    surrounding try/except degrades gracefully on)."""
+    import base64
+
+    neo4j_user = os.environ.get("NEO4J_USER", "neo4j")
+    neo4j_pass = os.environ.get("NEO4J_PASSWORD", "")
+    if not neo4j_pass:
+        neo4j_creds = Path.home() / ".edwin" / "credentials" / "neo4j" / "env"
+        if neo4j_creds.exists():
+            for line in neo4j_creds.read_text().splitlines():
+                if line.startswith("NEO4J_PASSWORD="):
+                    neo4j_pass = line.split("=", 1)[1].strip()
+                    break
+    if not neo4j_pass:
+        return None
+    return base64.b64encode(f"{neo4j_user}:{neo4j_pass}".encode()).decode()
+
+
+def _neo4j_cypher(statement):
+    headers = {"Content-Type": "application/json"}
+    auth = _neo4j_auth_header()
+    if auth:
+        headers["Authorization"] = f"Basic {auth}"
+    req = Request(
+        f"{NEO4J_URL}/db/neo4j/tx/commit",
+        data=json.dumps({"statements": [{"statement": statement}]}).encode(),
+        headers=headers,
+    )
+    with urlopen(req, timeout=10) as resp:
+        result = json.loads(resp.read())
+    if result.get("errors"):
+        raise RuntimeError(result["errors"])
+    return result["results"][0]["data"]
 
 
 # -- Report Sections ----------------------------------------------------------
@@ -205,18 +246,24 @@ def section_pipeline(report_date):
 
     stale = []
     healthy = []
+    alerts = []
     for line in output.split("\n"):
         # Extract just the connector info after the last ]
         parts = line.split("] ")
         info = parts[-1].strip() if parts else line.strip()
         if not info:
             continue
-        if "[STALE]" in line:
+        if "[ALERT]" in line:
+            alerts.append(info)
+        elif "[STALE]" in line:
             stale.append(info)
         elif "[OK]" in line:
             healthy.append(info)
 
     lines.append("")
+    for a in alerts:
+        # expired staleness dismissals (librarian's dismissed-as-non-bug registry)
+        lines.append(f"- **ALERT: {a}**")
     if stale:
         lines.append(f"**Stale ({len(stale)}):**")
         for s in stale:
@@ -225,6 +272,141 @@ def section_pipeline(report_date):
     for h in healthy:
         lines.append(f"- {h}")
 
+    lines.extend(_job_failure_streaks())
+    return lines
+
+
+def _job_failure_streaks():
+    """Consecutive-failure streak detection over Plombery run history.
+
+    Any scheduled job whose most recent runs are 2+ consecutive failures gets
+    an ALERT line here -- streaks, not just today's reds. A single red run
+    that's easy to miss can otherwise persist unnoticed for a long time.
+    'cancelled' runs are transparent (they neither break nor extend a
+    streak). Pipelines whose latest failure is >7 days old are excluded -- a
+    retired pipeline's dead history is not a live red (the librarian skills
+    watchdog owns missing-run detection)."""
+    import sqlite3
+
+    db = TOOLS_DIR / "plombery" / "plombery.db"
+    lines = ["", "**Job failure streaks (2+ consecutive = investigate or triage in writing):**"]
+    if not db.exists():
+        lines.append("- *plombery.db not found -- streak check skipped*")
+        return lines
+
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        rows = conn.execute(
+            "SELECT pipeline_id, status, start_time FROM ("
+            "  SELECT pipeline_id, status, start_time,"
+            "         ROW_NUMBER() OVER (PARTITION BY pipeline_id ORDER BY start_time DESC) rn"
+            "  FROM pipeline_runs) WHERE rn <= 20 ORDER BY pipeline_id, rn"
+        ).fetchall()
+        conn.close()
+    except Exception as e:
+        lines.append(f"- **ALERT: streak check failed to read plombery.db: {e}**")
+        return lines
+
+    by_pipeline = {}
+    for pid, status, start in rows:
+        by_pipeline.setdefault(pid, []).append((status, start))
+
+    week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M")
+    streaks = []
+    for pid, runs in sorted(by_pipeline.items()):
+        streak = 0
+        streak_start = None
+        latest_fail = None
+        for status, start in runs:  # newest first
+            if status == "cancelled":
+                continue
+            if status == "failed":
+                if latest_fail is None:
+                    latest_fail = start
+                streak += 1
+                streak_start = start
+            else:
+                break
+        if streak >= 2 and latest_fail and str(latest_fail)[:16] >= week_ago:
+            streaks.append((pid, streak, streak_start, latest_fail))
+
+    if not streaks:
+        lines.append("- none")
+        return lines
+    for pid, streak, since, latest in streaks:
+        plus = "+" if streak >= 20 else ""
+        lines.append(
+            f"- **ALERT: {pid} failed {streak}{plus} consecutive runs "
+            f"(since {str(since)[:16]}, latest fail {str(latest)[:16]}) -- "
+            f"read run_*/logs.jsonl, fix or write a triage note today**"
+        )
+    return lines
+
+
+def section_memory_audit():
+    """Bi-temporal memory validity -- one-liner from librarian memory-audit.
+
+    EXPIRED facts (review_after in the past) get ALERT lines: they must be
+    re-verified before being trusted or repeated. Conventions:
+    tools/librarian/MEMORY-CONVENTIONS.md."""
+    lines = ["## Memory Validity (Bi-Temporal Audit)"]
+
+    try:
+        result = subprocess.run(
+            ["python3", str(TOOLS_DIR / "librarian" / "librarian"), "memory-audit"],
+            capture_output=True, text=True, timeout=60
+        )
+        output = result.stdout + result.stderr
+    except Exception as e:
+        lines.append(f"*Librarian error: {e}*")
+        return lines
+
+    summary = None
+    expired_lines = []
+    for line in output.split("\n"):
+        parts = line.split("] ")
+        info = parts[-1].strip() if parts else line.strip()
+        if "memory-audit:" in line:
+            summary = info
+        elif "[EXPIRED]" in line:
+            expired_lines.append(info)
+
+    lines.append("")
+    lines.append(f"- {summary or '*memory-audit produced no summary line*'}")
+    for e in expired_lines:
+        lines.append(f"- **ALERT: {e} -- nightwatch drift re-verification target**")
+    return lines
+
+
+def section_commitments():
+    """Commitment aging one-liner from commitment-chaser (if installed).
+
+    Full detail lives wherever your commitment-chaser pipeline publishes it
+    (e.g. an "Action Tracker" doc); this just embeds the bucket counts. If
+    tools/commitment-chaser isn't present in this deployment, this degrades
+    to a one-line notice rather than failing the report.
+    """
+    lines = ["## Commitment Aging"]
+
+    chaser = TOOLS_DIR / "commitment-chaser" / "commitment-chaser"
+    if not chaser.exists():
+        lines.append("")
+        lines.append("- *commitment-chaser not installed -- skipping*")
+        return lines
+
+    try:
+        result = subprocess.run(
+            ["python3", str(chaser), "status"],
+            capture_output=True, text=True, timeout=60
+        )
+        summary = (result.stdout or "").strip()
+        if result.returncode != 0 or not summary:
+            summary = f"*commitment-chaser status failed: {(result.stderr or '').strip()[:200]}*"
+    except Exception as e:
+        summary = f"*commitment-chaser error: {e}*"
+
+    lines.append("")
+    lines.append(f"- {summary}")
     return lines
 
 
@@ -298,51 +480,134 @@ def section_qdrant():
     return lines
 
 
+EVAL_HISTORY_FILE = TOOLS_DIR / "librarian" / ".eval-history.jsonl"
+
+
+def section_retrieval_eval():
+    """Retrieval-quality eval (latest run from librarian's eval history).
+
+    Run `librarian eval` on whatever schedule fits (e.g. weekly) -- this
+    section just surfaces the latest aggregate + any regression ALERTs.
+    """
+    lines = ["## Retrieval Quality (Eval)"]
+
+    if not EVAL_HISTORY_FILE.exists():
+        lines.append("")
+        lines.append("*No eval history yet -- run `librarian eval` to baseline.*")
+        return lines
+
+    try:
+        raw = [l for l in EVAL_HISTORY_FILE.read_text().splitlines() if l.strip()]
+        last = json.loads(raw[-1])
+    except (json.JSONDecodeError, IndexError, IOError) as e:
+        lines.append("")
+        lines.append(f"*Eval history unreadable: {e}*")
+        return lines
+
+    lines.append("")
+    lines.append(f"- Last run: {last.get('ts', 'unknown')} ({len(raw)} runs in history)")
+    lines.append(f"- hit@3: **{last['hit3']}/{last['positives']}**  |  "
+                 f"hit@8: **{last['hit8']}/{last['positives']}**  |  "
+                 f"negative probes: {last['negatives_passed']}/{last['negatives']}")
+    lines.append(f"- Latency p50: {last.get('latency_p50_ms', 'n/a')} ms  |  "
+                 f"search mode: {', '.join(last.get('search_modes', []))}")
+
+    misses = [q["id"] for q in last.get("queries", [])
+              if not (q.get("negative_pass") if q.get("negative") else q.get("pass8"))]
+    if misses:
+        lines.append(f"- Failing queries: {', '.join(misses)}")
+
+    for alert in last.get("alerts", []):
+        lines.append(f"- **{alert}**")
+
+    return lines
+
+
+KG_STATE_FILE = Path(__file__).resolve().parent / ".kg-state.json"
+
+
 def section_neo4j():
-    """Neo4j knowledge graph health."""
+    """Neo4j knowledge graph health (curated entity/relationship graph, BM25 fulltext search)."""
     lines = ["## Knowledge Graph (Neo4j)"]
 
     if not _check_service(f"{NEO4J_URL}"):
-        lines.append(f"*Neo4j not responding at {NEO4J_URL}*")
+        lines.append("")
+        lines.append(f"- **ALERT: Neo4j not responding at {NEO4J_URL} -- kg_* tools are down**")
         return lines
 
-    # Use the MCP server stats if available, otherwise just report up/down
     lines.append("")
     lines.append("- Status: **online**")
 
-    # Try to get stats via cypher
     try:
-        import base64
-        neo4j_user = os.environ.get("NEO4J_USER", "neo4j")
-        neo4j_pass = os.environ.get("NEO4J_PASSWORD", "")
-        if not neo4j_pass:
-            # Try credentials file
-            neo4j_creds = Path.home() / ".edwin" / "credentials" / "neo4j" / "env"
-            if neo4j_creds.exists():
-                for line in neo4j_creds.read_text().splitlines():
-                    if line.startswith("NEO4J_PASSWORD="):
-                        neo4j_pass = line.split("=", 1)[1].strip()
-                        break
-        if neo4j_pass:
-            auth = base64.b64encode(f"{neo4j_user}:{neo4j_pass}".encode()).decode()
-            req = Request(
-                f"{NEO4J_URL}/db/neo4j/tx/commit",
-                data=json.dumps({"statements": [
-                    {"statement": "MATCH (n:Entity) RETURN count(n) as entities"},
-                ]}).encode(),
-                headers={
-                    "Authorization": f"Basic {auth}",
-                    "Content-Type": "application/json",
-                },
+        entities = _neo4j_cypher("MATCH (n:Entity) RETURN count(n)")[0]["row"][0]
+        rels = _neo4j_cypher("MATCH ()-[r]->() RETURN count(r)")[0]["row"][0]
+        label_rows = _neo4j_cypher(
+            "MATCH (n) UNWIND labels(n) AS l WITH l, count(*) AS c "
+            "WHERE l <> 'Entity' RETURN l, c ORDER BY c DESC"
+        )
+        lines.append(f"- Entities: {entities:,}")
+        lines.append(f"- Relationships: {rels:,}")
+        if label_rows:
+            breakdown = ", ".join(f"{r['row'][0]} {r['row'][1]}" for r in label_rows)
+            lines.append(f"- By label: {breakdown}")
+
+        # Provenance coverage: every edge should carry source_ref
+        prov = _neo4j_cypher(
+            "MATCH ()-[r]->() RETURN count(r), count(r.source_ref), count(r.invalid_at)"
+        )[0]["row"]
+        total_edges, with_ref, invalidated = prov
+        missing_ref = total_edges - with_ref
+        prov_line = f"- Provenance: {with_ref:,}/{total_edges:,} edges carry source_ref"
+        if missing_ref:
+            prov_line += f" -- **{missing_ref:,} missing (writes bypassing kg_add_fact?)**"
+        lines.append(prov_line)
+        lines.append(f"- Invalidated edges retained (superseded/corrected, never deleted): {invalidated:,}")
+
+        # Drop detection: alert if entity count fell >20% since last run
+        prev = None
+        if KG_STATE_FILE.exists():
+            try:
+                prev = json.loads(KG_STATE_FILE.read_text()).get("entity_count")
+            except (json.JSONDecodeError, IOError):
+                prev = None
+        if prev and entities < prev * 0.8:
+            lines.append(
+                f"- **ALERT: entity count dropped {prev:,} -> {entities:,} "
+                f"({100 * (prev - entities) / prev:.0f}% loss) since last report -- investigate**"
             )
-            with urlopen(req, timeout=10) as resp:
-                result = json.loads(resp.read())
-                entities = result["results"][0]["data"][0]["row"][0]
-                lines.append(f"- Entities: {entities:,}")
-        else:
-            lines.append("- Entity count: unavailable (no credentials configured)")
-    except Exception:
-        lines.append("- Entity count: unavailable")
+        KG_STATE_FILE.write_text(json.dumps({
+            "entity_count": entities,
+            "relationship_count": rels,
+            "checked_at": datetime.now(ET).isoformat(),
+        }) + "\n")
+    except Exception as e:
+        lines.append(f"- **ALERT: Neo4j reachable but stats query failed: {e}**")
+
+    # Pending entity merges (ambiguous kg_add_entity candidates awaiting review)
+    pending_file = PROJECT_DIR / "data" / "kg" / "pending-merges.jsonl"
+    entries = []
+    if pending_file.exists():
+        for line in pending_file.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    if entries:
+        lines.append(f"- **Pending entity merges: {len(entries)} awaiting review** (data/kg/pending-merges.jsonl)")
+        for e in entries:
+            lines.append(
+                f"  - {e.get('candidate_name')!r} vs existing {e.get('existing_name')!r} "
+                f"(similarity {e.get('similarity_signal')}, {e.get('date')}, src {e.get('source_ref')})"
+            )
+        lines.append(
+            "  - To resolve: merge or create by hand (kg_write/kg_add_entity), "
+            "then move the line to data/kg/pending-merges-resolved.jsonl"
+        )
+    else:
+        lines.append("- Pending entity merges: 0")
 
     return lines
 
@@ -408,7 +673,13 @@ def generate_report(report_date=None):
     lines.append("")
     lines.extend(section_pipeline(report_date))
     lines.append("")
+    lines.extend(section_commitments())
+    lines.append("")
+    lines.extend(section_memory_audit())
+    lines.append("")
     lines.extend(section_qdrant())
+    lines.append("")
+    lines.extend(section_retrieval_eval())
     lines.append("")
     lines.extend(section_neo4j())
     lines.append("")
