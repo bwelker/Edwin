@@ -14,7 +14,7 @@
  *   - Leading/trailing phrases ONLY. Mid-sentence temporal words are never
  *     rewritten ("what did we decide last week about the tunnel" -> untouched).
  *     Leading phrases additionally require an explicit comma/colon
- *     ("Yesterday, what did I promise Pete") — a leading temporal word
+ *     ("Yesterday, what did I promise Alex") — a leading temporal word
  *     followed by a bare space is usually adverbial ("recently updated
  *     files list") and stays untouched.
  *   - Possessives never match ("last week's plan file" -> untouched): the
@@ -228,7 +228,7 @@ export function parseTemporal(query, now = new Date(), tz = DEFAULT_TZ) {
     // query that IS the phrase never matches — nothing would remain).
     const trail = new RegExp(`[\\s,;:(](${rule.frag})[\\s?!.)]*$`, 'i');
     // Leading: phrase at the very start, followed by an EXPLICIT comma/
-    // colon/semicolon ("Yesterday, what did I promise Pete"). Space alone is
+    // colon/semicolon ("Yesterday, what did I promise Alex"). Space alone is
     // not enough — leading temporal words followed directly by a verb are
     // usually adverbial ("recently updated files list") and must not rewrite.
     const lead = new RegExp(`^(${rule.frag})[,:;]\\s*`, 'i');
