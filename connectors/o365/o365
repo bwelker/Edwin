@@ -1091,7 +1091,7 @@ def sync_teams(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = Fal
         #   tools/teams-unanswered/teams-unanswered  (scheduled weekdays)
         #   tools/ambient-poll/ambient-poll          (scheduled every 30 min)
         #   tools/relationship-report/relationship-report
-        #   tools/judgment/pete-drive-by-monitor
+        #   tools/judgment/contact-drive-by-monitor
         #   tools/dev-daily-reminder/dev-daily-reminder (pipeline disabled)
         # Port those to data/o365/teams/{named,oneOnOne,group}/ (per-message
         # `date:` frontmatter) first, THEN delete this block. Never delete the
