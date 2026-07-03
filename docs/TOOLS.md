@@ -160,6 +160,10 @@ All at `~/Edwin/connectors/{name}/{name} sync [source]`
 | contacts | Apple Contacts | identity registry sync |
 | plaud | Plaud Note Pro recordings | per-meeting transcripts |
 
+**Sync orchestration** (not data sources -- they run the connectors above):
+- `connectors/sync/sync` -- unified sync runner; runs O365/Google (and other sources) in sequence with file-based logging. Supports `--since N` backfill and per-source flags (`--o365-only`, `--google-only`, ...).
+- `connectors/scheduler/scheduler` -- time-aware connector orchestration; checks last-sync times and time-of-day rules, then runs only the connectors that are due. `--dry-run`, `--status`, `--force-all`. An alternative to per-connector Plombery pipelines.
+
 ### Plombery Scheduler
 **URL:** `http://localhost:${PLOMBERY_PORT:-8899}`
 **What it does:** Web GUI for all scheduled jobs. Built on APScheduler + FastAPI + React.
@@ -221,6 +225,15 @@ These run via Plombery triggers or on-demand. They invoke Claude to execute a SK
 | **weekly-archive** | Monday 5:50 AM | Archive old weekly dispatches |
 | **intent-check** | Weekdays 7:30 AM | Scan recent data for decision/expectation violations |
 | **pre-1on1-brief** | On-demand | Focused 1:1 meeting prep |
+| **triage-pass** | Every few hours (workday) | "What needs you" sweep since the last pass -- pushed via messaging channel |
+| **reply-drafts** | Weekday mornings | Ready-to-paste reply drafts for high-priority + key-contact threads (drafts only) |
+| **pre-decision-brief** | Weekdays | Decision radar + dossiers for decisions approaching in the next few days |
+| **decision-ledger** | Weekly | Track decisions actually made in meetings and their follow-through |
+| **pm-weekly-triage** | Weekly | Evidence-based grooming pass over the PM backlog |
+| **kg-curation** | Weekly | Knowledge-graph freshness sweep + org-chart maintenance |
+| **self-study** | On-demand / nightwatch | Distill one corpus into a synthesis study file for retrieval |
+| **self-retro** | Weekly | Grade Edwin's own performance; land corrections as checks/harness edits |
+| **devils-advocate** | Monthly (first Saturday) | Red-team your active big bets -- the case against each |
 
 **IMPORTANT:** These produce the Daily Agenda, pre-briefs, and Morning Brief in the Briefing Book. If the output is wrong, the fix is in the SKILL.md. Skills are triggered by Plombery via `run_skill` events to the events channel.
 
@@ -240,6 +253,23 @@ These run via Plombery triggers or on-demand. They invoke Claude to execute a SK
 | **deep-research** | `tools/deep-research/deep-research` | Iterative checkpointed research agent CLI | Manual (subagent) |
 | **contacts** | `connectors/contacts/contacts` | Apple Contacts -> identity registry sync | Weekly |
 | **plaud** | `connectors/plaud/plaud` | Plaud Note Pro meeting recordings + transcripts | Daily 9 PM |
+| **calendar-steward** | `tools/calendar-steward/calendar-steward` | Advisory analysis over your calendar (conflicts, prep gaps, load, meeting-worthiness). Read-only -- never accepts/declines. Commands: `audit`, `status` | Weekdays AM |
+| **worklist** | `tools/worklist/worklist` | Generate the living assistant-does vs principal-does split. Commands: `generate`, `status` | Weekdays AM |
+| **commitment-chaser** | `tools/commitment-chaser/commitment-chaser` | Commitment Aging Report -- chases outstanding commitments people owe. Commands: `report`, `status` | Scheduled |
+| **bb-archiver** | `tools/bb-archiver/bb-archiver` | Policy-driven briefing-book retention sweeps (working copy + Obsidian mirror). Commands: `sweep` | Scheduled |
+| **content-guard** | `tools/content-guard/content-guard` | Prompt-injection scanner for markdown before it is indexed. Flags/quarantines, never deletes. Commands: `scan` | On ingest |
+| **budget-watch** | `tools/budget-watch/budget-watch` | Subagent token-usage measurement + runaway detection (per-label p50/p99). Commands: `scan`, `report` | Scheduled |
+| **usage-check** | `tools/usage-check/usage-check` | Poll the Claude plan usage gauges; writes `memory/usage-status.json` | Polling |
+| **plaud-cloud** | `tools/plaud-cloud/plaud-cloud` | Pull recordings/transcripts/summaries from the Plaud cloud API | Daily |
+| **dispatch** | `tools/dispatch/dispatch` | Deterministic event dispatch -- reads state and prints ONE JSON instruction for `run_skill` / nightwatch events; ack outcomes with `dispatch ack` | Event-driven |
+| **skill-evals** | `tools/skill-evals/skill-evals` | Deterministic eval fixtures + checks run against skills' actual outputs; catches regressions when a skill or model changes | On change |
+| **skill-gepa** | `tools/skill-gepa/` | Reflective prompt evolution (GEPA) applied to SKILL.md bodies; optimizes against the skill-evals suite on frozen fixtures | Manual |
+| **skill-retirement** | `tools/skill-retirement/skill-retirement` | Ablation test -- run evals with a skill unloaded; if pass rates hold, the skill isn't earning its keep | Manual |
+
+### Hooks (`tools/hooks/`)
+Claude Code lifecycle hooks, wired in `.claude/settings.json`:
+- **channel-reply-guard** -- Stop hook. If the last genuine user message arrived via a channel and no reply was sent, blocks the stop so Edwin actually replies.
+- **precompact-memory-flush** -- PreCompact hook. Before Claude Code compacts a session, spawns a detached headless summarizer that writes a session summary to `memory/sessions/`.
 
 ---
 

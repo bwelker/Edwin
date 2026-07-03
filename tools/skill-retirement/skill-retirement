@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""skill-retirement -- ablation test for whether a skill earns its keep.
+
+Backlog item A11 #3: "run evals with the skill UNLOADED; if pass rates hold,
+the skill made no difference -- flag it for retirement."
+
+This is an A/B ablation built ON the existing skill-evals + skill-gepa
+infrastructure, not a reinvention:
+
+  * BASELINE  = run the skill's SKILL.md against a frozen fixture day
+                (tools/skill-gepa/run_skill_on_fixtures.py) and score the
+                artifact with the skill's skill-evals suite (metric.py).
+                A prior baseline run can be reused via --baseline-result to
+                avoid paying for it twice (e.g. runs/baseline-02.json,
+                ~$0.28 for morning-brief).
+  * ABLATED   = same runner + same fixture day, but the SKILL.md BODY is
+                replaced with a check-agnostic stub that states only the
+                goal (from the skill's `description` frontmatter) and none of
+                the skill's playbook -- sections, caps, formatting, procedure.
+                The frontmatter (name + description = the always-loaded
+                trigger) is preserved, modelling "the skill fires but its
+                body is gone."
+  * VERDICT   = compare pass fractions. If the ablated run holds the baseline
+                pass rate (within --tolerance), the body is dead weight ->
+                RETIREMENT_CANDIDATE. If the pass rate drops, the body carries
+                load -> KEEP. If the ablated run can't even produce the
+                artifact, the skill is load-bearing -> KEEP.
+
+The stub is deliberately check-agnostic: it never mentions anything the
+skill-evals checks look for (no "no em dashes", no required sections). Baking
+check-satisfying hints into the ablation would bias the test toward false
+retirement. The stub only names the goal and the universal Completion-Report
+convention.
+
+Caveat (same as skill-gepa's): one fixture day on Haiku is proof-of-life thin.
+A real retirement decision wants >=3 fixture days and/or multiple seeds so the
+verdict is not an artifact of one day's data. This harness reports the
+evidence; retiring a skill is the operator's/orchestrator's call.
+
+Nothing here mutates the live skill. The stub is written to a throwaway file;
+run_skill_on_fixtures.py sandboxes every execution.
+
+Usage:
+  skill-retirement test <skill> [--baseline-result PATH] [--fixture-date D]
+        [--tolerance 0.05] [--model M] [--max-turns N] [--stub PATH]
+        [--ledger PATH] [--json]
+  skill-retirement show-stub <skill>      # print the ablation stub, don't run
+
+Exit 0 = ran clean (verdict printed). Exit 2 = a run hard-failed in a way that
+prevents a verdict (e.g. no fixtures, runner crash on the baseline).
+"""
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+# Canonical checkout: fixtures, runs, live skills, and suites are machine
+# state that lives under $EDWIN_HOME (gitignored), NOT in a git worktree. Resolve
+# there regardless of where this file is checked out.
+EDWIN_HOME = Path(os.environ.get("EDWIN_HOME", Path.home() / "Edwin"))
+SKILL_GEPA = EDWIN_HOME / "tools" / "skill-gepa"
+RUNNER = SKILL_GEPA / "run_skill_on_fixtures.py"
+METRIC = SKILL_GEPA / "metric.py"
+SKILL_EVALS = EDWIN_HOME / "tools" / "skill-evals" / "skill-evals"
+FIXTURES = EDWIN_HOME / "tools" / "skill-evals" / "fixtures"
+SKILLS_DIR = EDWIN_HOME / "skills"
+RUNS = SKILL_GEPA / "runs" / "retirement"
+DEFAULT_LEDGER = EDWIN_HOME / "tools" / "skill-retirement" / "retirement-history.jsonl"
+
+DEFAULT_TOLERANCE = 0.05
+
+
+def _load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def load_metric():
+    return _load("gepa_metric", METRIC)
+
+
+def load_skill_evals():
+    return _load("skill_evals", SKILL_EVALS)
+
+
+def newest_fixture_date(skill):
+    root = FIXTURES / skill
+    dates = sorted(d.name for d in root.iterdir() if d.is_dir()) if root.exists() else []
+    return dates[-1] if dates else None
+
+
+def read_frontmatter(skill_md_text):
+    """Return (name, description) from YAML frontmatter, best-effort."""
+    name, desc = None, None
+    if skill_md_text.startswith("---"):
+        end = skill_md_text.find("\n---", 3)
+        block = skill_md_text[3:end] if end != -1 else ""
+        for line in block.splitlines():
+            if line.strip().startswith("name:"):
+                name = line.split(":", 1)[1].strip()
+            elif line.strip().startswith("description:"):
+                desc = line.split(":", 1)[1].strip()
+    return name, desc
+
+
+def build_stub(skill):
+    """The 'unloaded' skill: frontmatter preserved, body replaced by a
+    check-agnostic one-goal directive. Models the skill firing with no
+    playbook behind it."""
+    live = SKILLS_DIR / skill / "SKILL.md"
+    text = live.read_text() if live.exists() else ""
+    name, desc = read_frontmatter(text)
+    name = name or skill
+    goal = desc or skill.replace("-", " ")
+    frontmatter = f"---\nname: {name}\ndescription: {desc or goal}\n---\n"
+    body = (
+        f"\nProduce the \"{goal}\" deliverable for the fixture date, acting as "
+        "Edwin (a chief of staff). Use only the data available "
+        "under this sandbox and your general knowledge. Publish it wherever "
+        "this kind of artifact normally lives in the briefing book, and finish "
+        "with a Completion Report (STATUS plus anything needing attention).\n"
+        "\n"
+        "(This is an ablation stub: the skill's own playbook has been removed "
+        "on purpose to measure whether it changes the result.)\n"
+    )
+    return frontmatter + body
+
+
+def resolve_artifact_from_suite(skill, sandbox):
+    """The skill-gepa runner only natively resolves morning-brief's artifact.
+    For any other skill, resolve the produced artifact from the skill-evals
+    suite's artifact_globs, relative to the sandbox."""
+    se = load_skill_evals()
+    suite = se.load_suite(skill)
+    if not suite:
+        return None
+    globs = suite.get("artifact_globs", [])
+    matches = []
+    for g in globs:
+        matches.extend(Path(sandbox).glob(g))
+    matches = [m for m in matches if m.is_file()]
+    if not matches:
+        return None
+    return str(sorted(matches, key=lambda p: p.stat().st_mtime)[-1])
+
+
+def run_runner(skill, candidate_path, fixture_date, sandbox_dir, model, max_turns, timeout):
+    cmd = [sys.executable, str(RUNNER), "--skill", skill,
+           "--candidate", str(candidate_path),
+           "--sandbox-dir", str(sandbox_dir),
+           "--model", model, "--max-turns", str(max_turns),
+           "--timeout", str(timeout)]
+    if fixture_date:
+        cmd += ["--fixture-date", fixture_date]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    # runner prints result JSON on stdout and also writes <sandbox>/result.json
+    result_file = Path(sandbox_dir) / "result.json"
+    if result_file.exists():
+        return json.loads(result_file.read_text())
+    try:
+        return json.loads(proc.stdout.strip())
+    except Exception:
+        return {"skill": skill, "artifact": None, "sandbox": str(sandbox_dir),
+                "error": (proc.stderr or proc.stdout or "runner produced no result")[-2000:]}
+
+
+def score_run(skill, result):
+    """Score a runner result with the skill-evals suite. Resolve the artifact
+    generically if the runner didn't (non-morning-brief skills)."""
+    metric = load_metric()
+    artifact = result.get("artifact")
+    if not artifact:
+        artifact = resolve_artifact_from_suite(skill, result.get("sandbox"))
+    if not artifact:
+        m = metric.hard_fail(
+            f"no artifact at the skill's contract path "
+            f"(runner error: {result.get('error')})")
+    else:
+        m = metric.score_artifact(skill, artifact)
+        if result.get("error"):
+            m.setdefault("side_info", []).append(
+                f"runner error (artifact still produced): {result['error']}")
+    m["run_error"] = result.get("error")
+    m["cost_usd"] = result.get("cost_usd")
+    m["duration_s"] = result.get("duration_s")
+    return m
+
+
+def verdict(baseline, ablated, tolerance):
+    b = baseline["score"]
+    a = ablated["score"]
+    delta = round(a - b, 4)
+    # Ablated produced nothing the suite can grade at the skill's contract
+    # path -> load-bearing. (The agent may have written *something* elsewhere;
+    # what matters is that the skill body encodes the publish location/naming
+    # the suite -- and the real briefing book -- depend on.)
+    if ablated.get("passed", 0) + ablated.get("failed", 0) == 0:
+        return "KEEP", delta, ("ablated run produced no artifact at the skill's "
+                               "contract location -- the skill body is "
+                               "load-bearing (it encodes the publish "
+                               "path/naming/date the eval suite grades)")
+    if a >= b - tolerance:
+        return "RETIREMENT_CANDIDATE", delta, (
+            f"pass rate held with the skill body removed "
+            f"(baseline {b:.2%} -> ablated {a:.2%}, delta {delta:+.2%}, "
+            f"within tolerance {tolerance:.0%}) -- the body did not change the "
+            f"graded outcome on this fixture day")
+    return "KEEP", delta, (
+        f"pass rate dropped without the skill body "
+        f"(baseline {b:.2%} -> ablated {a:.2%}, delta {delta:+.2%}, "
+        f"exceeds tolerance {tolerance:.0%}) -- the body carries load")
+
+
+def cmd_test(args):
+    skill = args.skill
+    fixture_date = args.fixture_date or newest_fixture_date(skill)
+    if not fixture_date:
+        print(f"HARD FAIL: no frozen fixtures for {skill} under {FIXTURES/skill}",
+              file=sys.stderr)
+        return 2
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    RUNS.mkdir(parents=True, exist_ok=True)
+
+    # 1. Baseline.
+    if args.baseline_result:
+        base_result = json.loads(Path(args.baseline_result).read_text())
+        print(f"[baseline] reusing {args.baseline_result} "
+              f"(artifact: {base_result.get('artifact')})", file=sys.stderr)
+    else:
+        live = SKILLS_DIR / skill / "SKILL.md"
+        sb = RUNS / f"{skill}-{stamp}-baseline"
+        print(f"[baseline] running live SKILL.md in {sb} ...", file=sys.stderr)
+        base_result = run_runner(skill, live, fixture_date, sb,
+                                 args.model, args.max_turns, args.timeout)
+    baseline = score_run(skill, base_result)
+    if baseline["passed"] + baseline["failed"] == 0:
+        print(f"HARD FAIL: baseline produced no scorable artifact "
+              f"({baseline.get('run_error')}). Cannot ablation-test without a "
+              f"baseline.", file=sys.stderr)
+        return 2
+
+    # 2. Ablated (skill "unloaded").
+    stub_path = RUNS / f"{skill}-{stamp}-stub.md"
+    stub_text = Path(args.stub).read_text() if args.stub else build_stub(skill)
+    stub_path.write_text(stub_text)
+    sb2 = RUNS / f"{skill}-{stamp}-ablated"
+    print(f"[ablated] running stub (skill unloaded) in {sb2} ...", file=sys.stderr)
+    abl_result = run_runner(skill, stub_path, fixture_date, sb2,
+                            args.model, args.max_turns, args.timeout)
+    ablated = score_run(skill, abl_result)
+
+    # 3. Verdict.
+    v, delta, why = verdict(baseline, ablated, args.tolerance)
+    record = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "skill": skill,
+        "fixture_date": fixture_date,
+        "model": args.model,
+        "tolerance": args.tolerance,
+        "baseline_score": baseline["score"],
+        "baseline_passed": baseline["passed"],
+        "baseline_failed": baseline["failed"],
+        "ablated_score": ablated["score"],
+        "ablated_passed": ablated["passed"],
+        "ablated_failed": ablated["failed"],
+        "delta": delta,
+        "verdict": v,
+        "reason": why,
+        "baseline_reused": bool(args.baseline_result),
+        "ablated_cost_usd": ablated.get("cost_usd"),
+        "baseline_side_info": baseline.get("side_info", []),
+        "ablated_side_info": ablated.get("side_info", []),
+        "stub_path": str(stub_path),
+        "caveat": ("single fixture day on Haiku is weak evidence; want >=3 "
+                   "days / multiple seeds before retiring"),
+    }
+
+    ledger = Path(args.ledger) if args.ledger else DEFAULT_LEDGER
+    if not args.no_ledger:
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        with open(ledger, "a") as fh:
+            fh.write(json.dumps(record) + "\n")
+
+    if args.json:
+        print(json.dumps(record, indent=2))
+    else:
+        print()
+        print(f"  SKILL RETIREMENT TEST -- {skill}  (fixture {fixture_date}, {args.model})")
+        print(f"  baseline pass rate : {baseline['score']:.2%}  "
+              f"({baseline['passed']}/{baseline['passed']+baseline['failed']})"
+              f"{'  [reused]' if args.baseline_result else ''}")
+        print(f"  ablated  pass rate : {ablated['score']:.2%}  "
+              f"({ablated['passed']}/{ablated['passed']+ablated['failed']})"
+              f"  [skill body removed]")
+        print(f"  delta              : {delta:+.2%}   (tolerance {args.tolerance:.0%})")
+        print(f"  VERDICT            : {v}")
+        print(f"  reason             : {why}")
+        if ablated.get("side_info"):
+            print(f"  ablated failures   : {'; '.join(ablated['side_info'][:6])}")
+        print(f"  caveat             : {record['caveat']}")
+        if not args.no_ledger:
+            print(f"  logged             : {ledger}")
+        print()
+    return 0
+
+
+def cmd_show_stub(args):
+    print(build_stub(args.skill))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    t = sub.add_parser("test", help="run the ablation test for a skill")
+    t.add_argument("skill")
+    t.add_argument("--baseline-result", default=None,
+                   help="reuse a prior runner result.json instead of re-running the baseline")
+    t.add_argument("--fixture-date", default=None, help="default: newest frozen day")
+    t.add_argument("--tolerance", type=float, default=DEFAULT_TOLERANCE,
+                   help="max pass-rate drop still counted as 'held' (default 0.05)")
+    t.add_argument("--model", default="claude-haiku-4-5-20251001")
+    t.add_argument("--max-turns", type=int, default=100)
+    t.add_argument("--timeout", type=int, default=600)
+    t.add_argument("--stub", default=None, help="path to a custom ablation stub SKILL.md")
+    t.add_argument("--ledger", default=None, help=f"append record here (default {DEFAULT_LEDGER})")
+    t.add_argument("--no-ledger", action="store_true")
+    t.add_argument("--json", action="store_true")
+    t.set_defaults(func=cmd_test)
+
+    s = sub.add_parser("show-stub", help="print the ablation stub for a skill, don't run")
+    s.add_argument("skill")
+    s.set_defaults(func=cmd_show_stub)
+
+    args = ap.parse_args()
+    sys.exit(args.func(args))
+
+
+if __name__ == "__main__":
+    main()

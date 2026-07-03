@@ -2,13 +2,13 @@
 date: 2026-04-10
 type: email
 from: suspicious@external.com
-to: bwelker@invisalertsolutions.com
+to: owner@example.com
 subject: Partnership Opportunity
 ---
 
 # Partnership Opportunity
 
-Dear Brandt,
+Dear Alex,
 
 I wanted to reach out about a potential partnership between our companies.
 

@@ -14,8 +14,17 @@
  *   OWNER_NAME        - Your name (used in sender display)
  *
  * Optional environment variables:
+ *   BB_FALLBACK_URL   - Secondary BlueBubbles URL to try if the primary is
+ *                       unreachable (e.g. a stable LAN address when the
+ *                       primary is a tunnel URL that can rotate). Defaults
+ *                       to BB_URL (no fallback).
+ *   BB_MAX_MESSAGE_CHARS - Chunk outbound messages above this length
+ *                       (default: 2000). Some transports drop long messages.
+ *   BB_DELIVERY_LOG   - Path to a JSONL delivery log (default:
+ *                       $EDWIN_HOME/data/bluebubbles/delivery-log.jsonl)
+ *   EDWIN_HOME        - Base data directory (default: ~/Edwin)
  *   WEBHOOK_PORT      - Port for the webhook listener (default: 18800)
- *   WEBHOOK_HOST      - LAN IP visible to the BlueBubbles server (default: auto-detect)
+ *   WEBHOOK_HOST      - LAN IP visible to the BlueBubbles server (default: 0.0.0.0)
  *   SENDER_MAP        - JSON mapping of phone numbers to display names
  *                       e.g. '{ "+15551234567": "Alice", "+15559876543": "Bob" }'
  */
@@ -26,18 +35,31 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { appendFileSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 
 // --- Configuration -----------------------------------------------------------
 
-const BB_URL = process.env.BB_URL;
+const BB_PRIMARY_URL = process.env.BB_URL;
 const BB_PASSWORD = process.env.BB_PASSWORD;
-if (!BB_URL || !BB_PASSWORD) {
+if (!BB_PRIMARY_URL || !BB_PASSWORD) {
   process.stderr.write(
     "[bluebubbles-channel] ERROR: BB_URL and BB_PASSWORD environment variables are required.\n"
   );
   process.exit(1);
 }
-
+// Optional secondary URL -- useful when the primary is a tunnel that can
+// rotate/die (e.g. cloudflared) and there's a stable LAN address as backup.
+const BB_FALLBACK_URL = process.env.BB_FALLBACK_URL || BB_PRIMARY_URL;
+// Long messages drop silently past a certain size on some transports -- chunk above this
+const MAX_MESSAGE_CHARS = parseInt(process.env.BB_MAX_MESSAGE_CHARS || "2000", 10);
+const CHUNK_SEND_DELAY_MS = 750;
+// Delivery verification: bounded polling of message status after send
+const VERIFY_DELAYS_MS = [1000, 2000, 2000];
+const CONNECT_TIMEOUT_MS = 5000;
+const REQUEST_TIMEOUT_MS = 15000;
+const EDWIN_HOME = process.env.EDWIN_HOME || `${process.env.HOME}/Edwin`;
+const DELIVERY_LOG = process.env.BB_DELIVERY_LOG || `${EDWIN_HOME}/data/bluebubbles/delivery-log.jsonl`;
 const WEBHOOK_PORT = parseInt(process.env.WEBHOOK_PORT || "18800", 10);
 // Host LAN IP visible to the BlueBubbles server
 const WEBHOOK_HOST = process.env.WEBHOOK_HOST || "0.0.0.0";
@@ -74,8 +96,53 @@ if (OWNER_PHONE && OWNER_NAME) {
   senderMap[OWNER_PHONE] = OWNER_NAME;
 }
 
-const BB_API = (path: string) =>
-  `${BB_URL}${path}${path.includes("?") ? "&" : "?"}password=${BB_PASSWORD}`;
+// --- Transport Resolution ------------------------------------------------------
+// The primary URL can die silently (e.g. tunnel rotation). Probe the
+// primary, fall back to the secondary URL, cache whichever worked for the
+// session, and invalidate the cache on any connection-level failure so the
+// next call re-resolves.
+
+let activeBase: string | null = null;
+
+class TransportUnreachableError extends Error {}
+
+const bbApi = (base: string, path: string) =>
+  `${base}${path}${path.includes("?") ? "&" : "?"}password=${BB_PASSWORD}`;
+
+async function probeBase(base: string): Promise<boolean> {
+  try {
+    const res = await fetch(bbApi(base, "/api/v1/ping"), {
+      signal: AbortSignal.timeout(CONNECT_TIMEOUT_MS),
+    });
+    const json = (await res.json()) as { status: number };
+    return json.status === 200;
+  } catch {
+    return false;
+  }
+}
+
+async function resolveTransport(): Promise<string> {
+  if (activeBase) return activeBase;
+  const candidates =
+    BB_PRIMARY_URL === BB_FALLBACK_URL
+      ? [BB_PRIMARY_URL]
+      : [BB_PRIMARY_URL, BB_FALLBACK_URL];
+  for (const base of candidates) {
+    if (await probeBase(base)) {
+      const note =
+        base !== BB_PRIMARY_URL ? " (fallback -- primary unreachable)" : "";
+      log(`Transport resolved: ${base}${note}`);
+      activeBase = base;
+      return base;
+    }
+  }
+  throw new TransportUnreachableError(
+    `BlueBubbles unreachable on primary (${BB_PRIMARY_URL})` +
+      (BB_FALLBACK_URL !== BB_PRIMARY_URL
+        ? ` and fallback (${BB_FALLBACK_URL})`
+        : "")
+  );
+}
 
 // --- GUID Dedup Cache --------------------------------------------------------
 
@@ -97,38 +164,360 @@ function isDuplicate(guid: string): boolean {
 // --- BlueBubbles API Helpers -------------------------------------------------
 
 async function bbFetch(path: string, options?: RequestInit): Promise<Response> {
-  return fetch(BB_API(path), {
-    ...options,
-    headers: { "Content-Type": "application/json", ...options?.headers },
-  });
+  const base = await resolveTransport();
+  try {
+    return await fetch(bbApi(base, path), {
+      ...options,
+      headers: { "Content-Type": "application/json", ...options?.headers },
+      signal: options?.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+  } catch (e) {
+    // Connection-level failure: transport may have died mid-session.
+    // Invalidate the cache so the next call re-resolves. Do NOT auto-retry
+    // here -- message senders must handle ambiguity themselves.
+    activeBase = null;
+    throw e;
+  }
 }
 
-async function sendMessage(
-  chatGuid: string,
-  text: string
-): Promise<{ ok: boolean; error?: string }> {
+interface SendResult {
+  ok: boolean;
+  guid?: string;
+  error?: string;
+  // true when the request threw mid-flight: the message MAY have gone out.
+  // false when the server explicitly rejected or was unreachable pre-send.
+  ambiguous?: boolean;
+}
+
+async function sendMessage(chatGuid: string, text: string): Promise<SendResult> {
+  const tempGuid = `temp-${crypto.randomUUID()}`;
   try {
     const res = await bbFetch("/api/v1/message/text", {
       method: "POST",
       body: JSON.stringify({
         chatGuid,
+        tempGuid,
         message: text,
         method: "private-api",
       }),
     });
-    const json = (await res.json()) as { status: number; message: string };
-    if (json.status === 200) return { ok: true };
+    const json = (await res.json()) as {
+      status: number;
+      message: string;
+      data?: { guid?: string };
+    };
+    if (json.status === 200) return { ok: true, guid: json.data?.guid };
     return { ok: false, error: json.message };
   } catch (e: any) {
-    return { ok: false, error: e.message };
+    if (e instanceof TransportUnreachableError) {
+      return { ok: false, error: e.message, ambiguous: false };
+    }
+    return { ok: false, error: e.message, ambiguous: true };
   }
+}
+
+// --- Delivery Verification -----------------------------------------------------
+
+interface MessageStatus {
+  found: boolean;
+  errorCode?: number;
+  dateDelivered?: number | null;
+  isDelivered?: boolean;
+}
+
+// null = the lookup itself failed (transport error), NOT "message missing"
+async function getMessageStatus(guid: string): Promise<MessageStatus | null> {
+  try {
+    const res = await bbFetch(`/api/v1/message/${encodeURIComponent(guid)}`);
+    const json = (await res.json()) as { status: number; data?: any };
+    if (json.status === 200 && json.data) {
+      return {
+        found: true,
+        errorCode: json.data.error,
+        dateDelivered: json.data.dateDelivered,
+        isDelivered: json.data.isDelivered,
+      };
+    }
+    if (json.status === 404) return { found: false };
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// After an ambiguous send failure, check whether the message actually landed
+// on the server. ok=false means the lookup itself failed (still ambiguous).
+async function findSentMessage(
+  chatGuid: string,
+  text: string,
+  sinceMs: number
+): Promise<{ ok: boolean; guid: string | null }> {
+  try {
+    const res = await bbFetch("/api/v1/message/query", {
+      method: "POST",
+      body: JSON.stringify({ chatGuid, limit: 10, sort: "DESC" }),
+    });
+    const json = (await res.json()) as { status: number; data?: any[] };
+    if (json.status !== 200) return { ok: false, guid: null };
+    for (const m of json.data || []) {
+      if (m.isFromMe && m.text === text && m.dateCreated >= sinceMs - 5000) {
+        return { ok: true, guid: m.guid };
+      }
+    }
+    return { ok: true, guid: null };
+  } catch {
+    return { ok: false, guid: null };
+  }
+}
+
+type Verification =
+  | { state: "delivered"; deliveredAt: number }
+  | { state: "accepted" } // on server, error 0, no delivery receipt yet
+  | { state: "send_error"; code: number }
+  | { state: "not_found" }
+  | { state: "unverifiable" }; // status checks themselves failed
+
+async function verifyDelivery(guid: string): Promise<Verification> {
+  let last: Verification = { state: "unverifiable" };
+  for (const delay of VERIFY_DELAYS_MS) {
+    await Bun.sleep(delay);
+    const st = await getMessageStatus(guid);
+    if (st === null) {
+      last = { state: "unverifiable" };
+      continue;
+    }
+    if (!st.found) {
+      last = { state: "not_found" };
+      continue;
+    }
+    if (st.errorCode && st.errorCode !== 0) {
+      return { state: "send_error", code: st.errorCode };
+    }
+    if (st.dateDelivered || st.isDelivered) {
+      return {
+        state: "delivered",
+        deliveredAt: st.dateDelivered || Date.now(),
+      };
+    }
+    last = { state: "accepted" };
+  }
+  return last;
+}
+
+interface ChunkOutcome {
+  outcome: "delivered" | "sent-unverified" | "failed";
+  detail: string;
+  guid?: string;
+  deliveredAt?: string;
+  retried: boolean;
+}
+
+// Send one message with delivery verification and at most ONE retry.
+// Retry only when the first attempt is CONFIRMED failed or absent -- never
+// on an ambiguous outcome (no double-texting).
+async function sendTextVerified(
+  chatGuid: string,
+  text: string
+): Promise<ChunkOutcome> {
+  for (let attemptNo = 1; attemptNo <= 2; attemptNo++) {
+    const retried = attemptNo === 2;
+    const sentAt = Date.now();
+    const send = await sendMessage(chatGuid, text);
+    let guid = send.guid;
+
+    if (!send.ok) {
+      if (send.ambiguous) {
+        const lookup = await findSentMessage(chatGuid, text, sentAt);
+        if (!lookup.ok) {
+          return {
+            outcome: "sent-unverified",
+            retried,
+            detail: `send request failed ambiguously (${send.error}) and status lookup also failed; NOT retried to avoid double-send`,
+          };
+        }
+        if (!lookup.guid) {
+          // confirmed absent -- safe to retry
+          if (retried) {
+            return {
+              outcome: "failed",
+              retried,
+              detail: `send failed twice; message not found on server (${send.error})`,
+            };
+          }
+          log(`Send threw (${send.error}) but message confirmed absent -- retrying once`);
+          continue;
+        }
+        guid = lookup.guid; // it actually went out
+      } else {
+        // server rejected or unreachable pre-send -- confirmed not sent
+        if (retried) {
+          return {
+            outcome: "failed",
+            retried,
+            detail: `send rejected twice: ${send.error}`,
+          };
+        }
+        log(`Send rejected (${send.error}) -- retrying once`);
+        continue;
+      }
+    }
+
+    if (!guid) {
+      const lookup = await findSentMessage(chatGuid, text, sentAt);
+      if (lookup.ok && lookup.guid) guid = lookup.guid;
+    }
+    if (!guid) {
+      return {
+        outcome: "sent-unverified",
+        retried,
+        detail: "server accepted the send but no guid was available to verify delivery",
+      };
+    }
+
+    const v = await verifyDelivery(guid);
+    if (v.state === "delivered") {
+      return {
+        outcome: "delivered",
+        guid,
+        deliveredAt: new Date(v.deliveredAt).toISOString(),
+        retried,
+        detail: "delivery receipt confirmed",
+      };
+    }
+    if (v.state === "accepted") {
+      return {
+        outcome: "sent-unverified",
+        guid,
+        retried,
+        detail: "accepted by iMessage, no delivery receipt within verification window (recipient may be offline)",
+      };
+    }
+    if (v.state === "unverifiable") {
+      return {
+        outcome: "sent-unverified",
+        guid,
+        retried,
+        detail: "sent but status checks failed; delivery unknown",
+      };
+    }
+    // send_error or not_found -- confirmed failed
+    const why =
+      v.state === "send_error"
+        ? `iMessage send error code ${v.code}`
+        : "message not found on server after send";
+    if (retried) {
+      return { outcome: "failed", guid, retried, detail: `${why} (after retry)` };
+    }
+    log(`Send verification failed (${why}) -- retrying once`);
+  }
+  // unreachable
+  return { outcome: "failed", retried: true, detail: "internal error" };
+}
+
+// --- Long-Message Chunking -------------------------------------------------------
+
+function chunkText(text: string, maxChars: number): string[] {
+  if (text.length <= maxChars) return [text];
+  const budget = maxChars - 10; // room for " (99/99)" suffix
+  const chunks: string[] = [];
+  let rest = text;
+  while (rest.length > budget) {
+    let cut = budget;
+    for (const sep of ["\n\n", "\n", " "]) {
+      const idx = rest.lastIndexOf(sep, budget);
+      if (idx >= Math.floor(budget * 0.5)) {
+        cut = idx;
+        break;
+      }
+    }
+    chunks.push(rest.slice(0, cut).trimEnd());
+    rest = rest.slice(cut).trimStart();
+  }
+  if (rest.length > 0) chunks.push(rest);
+  const n = chunks.length;
+  if (n === 1) return chunks;
+  return chunks.map((c, i) => `${c} (${i + 1}/${n})`);
+}
+
+// --- Delivery Log ----------------------------------------------------------------
+
+function logDelivery(entry: Record<string, unknown>): void {
+  try {
+    mkdirSync(dirname(DELIVERY_LOG), { recursive: true });
+    appendFileSync(
+      DELIVERY_LOG,
+      JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n"
+    );
+  } catch (e: any) {
+    log(`Warning: could not write delivery log: ${e.message}`);
+  }
+}
+
+// --- Verified Reply (chunking + verification + logging) ---------------------------
+
+async function replyVerified(
+  chatGuid: string,
+  text: string,
+  tool: string = "bluebubbles_reply"
+): Promise<{ ok: boolean; summary: string }> {
+  const started = Date.now();
+  const chunks = chunkText(text, MAX_MESSAGE_CHARS);
+  const results: ChunkOutcome[] = [];
+  for (let i = 0; i < chunks.length; i++) {
+    if (i > 0) await Bun.sleep(CHUNK_SEND_DELAY_MS);
+    const r = await sendTextVerified(chatGuid, chunks[i]!);
+    results.push(r);
+    if (r.outcome === "failed") break; // don't spray remaining chunks into a dead channel
+  }
+
+  const anyFailed = results.some((r) => r.outcome === "failed");
+  const outcome = anyFailed
+    ? "FAILED"
+    : results.every((r) => r.outcome === "delivered")
+      ? "delivered"
+      : "sent-unverified";
+
+  logDelivery({
+    tool,
+    chat_guid: chatGuid,
+    chars: text.length,
+    chunks: chunks.length,
+    chunks_attempted: results.length,
+    outcome,
+    transport: activeBase,
+    retried: results.some((r) => r.retried),
+    duration_ms: Date.now() - started,
+    guids: results.map((r) => r.guid || null),
+    detail: results.map((r) => `${r.outcome}: ${r.detail}`).join(" | "),
+  });
+
+  const okChunks = results.filter((r) => r.outcome !== "failed").length;
+  const parts: string[] = [];
+  if (outcome === "FAILED") {
+    const failDetail = results.find((r) => r.outcome === "failed")?.detail;
+    parts.push(`FAILED: ${failDetail}`);
+    if (chunks.length > 1) {
+      parts.push(`chunks sent before failure: ${okChunks}/${chunks.length}`);
+    }
+  } else {
+    parts.push(outcome);
+    const detail = results.find((r) => r.outcome === "sent-unverified")?.detail;
+    if (detail) parts.push(detail);
+    const guids = results.map((r) => r.guid).filter(Boolean);
+    if (guids.length) parts.push(`guid=${guids.join(",")}`);
+    const deliveredAt = results[results.length - 1]?.deliveredAt;
+    if (outcome === "delivered" && deliveredAt) parts.push(`delivered_at=${deliveredAt}`);
+    if (chunks.length > 1) parts.push(`chunks=${okChunks}/${chunks.length}`);
+  }
+  parts.push(`transport=${activeBase || "unresolved"}`);
+  return { ok: outcome !== "FAILED", summary: parts.join(" | ") };
 }
 
 async function sendAttachment(
   chatGuid: string,
   filePath: string,
   message?: string
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<{ ok: boolean; guid?: string; error?: string }> {
   try {
     const file = Bun.file(filePath);
     if (!(await file.exists())) {
@@ -143,14 +532,21 @@ async function sendAttachment(
     if (message) formData.append("message", message);
     formData.append("attachment", file, fileName);
 
-    const res = await fetch(BB_API("/api/v1/message/attachment"), {
+    const base = await resolveTransport();
+    const res = await fetch(bbApi(base, "/api/v1/message/attachment"), {
       method: "POST",
       body: formData,
+      signal: AbortSignal.timeout(60_000), // uploads can be slow
     });
-    const json = (await res.json()) as { status: number; message: string };
-    if (json.status === 200) return { ok: true };
+    const json = (await res.json()) as {
+      status: number;
+      message: string;
+      data?: { guid?: string };
+    };
+    if (json.status === 200) return { ok: true, guid: json.data?.guid };
     return { ok: false, error: json.message };
   } catch (e: any) {
+    if (!(e instanceof TransportUnreachableError)) activeBase = null;
     return { ok: false, error: e.message };
   }
 }
@@ -161,7 +557,7 @@ async function getMessages(
 ): Promise<{ ok: boolean; messages?: any[]; error?: string }> {
   try {
     const res = await bbFetch(
-      `/api/v1/chat/${encodeURIComponent(chatGuid)}/message?limit=${limit}&sort=desc`
+      `/api/v1/chat/${encodeURIComponent(chatGuid)}/message?limit=${limit}&sort=DESC`
     );
     const json = (await res.json()) as { status: number; data: any[] };
     if (json.status === 200) return { ok: true, messages: json.data };
@@ -195,8 +591,9 @@ async function downloadAttachment(
   savePath: string
 ): Promise<{ ok: boolean; path?: string; error?: string }> {
   try {
+    const base = await resolveTransport();
     const res = await fetch(
-      BB_API(`/api/v1/attachment/${encodeURIComponent(attachmentGuid)}/download`)
+      bbApi(base, `/api/v1/attachment/${encodeURIComponent(attachmentGuid)}/download`)
     );
     if (!res.ok) {
       return { ok: false, error: `HTTP ${res.status}: ${res.statusText}` };
@@ -296,7 +693,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: "bluebubbles_reply",
-      description: "Send an iMessage reply via BlueBubbles",
+      description:
+        "Send an iMessage reply via BlueBubbles with delivery verification. " +
+        "Long messages are automatically split into (1/2)-style chunks. " +
+        "Returns 'delivered' (delivery receipt confirmed), 'sent-unverified' " +
+        "(accepted but delivery not yet confirmed -- usually fine), or errors " +
+        "with 'FAILED' when the message did NOT go out (treat as not sent).",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -418,23 +820,57 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const args = req.params.arguments as Record<string, any>;
 
   if (req.params.name === "bluebubbles_reply") {
-    const result = await sendMessage(args.chat_guid, args.text);
+    const result = await replyVerified(args.chat_guid, args.text);
     if (result.ok) {
-      return { content: [{ type: "text" as const, text: "sent" }] };
+      return { content: [{ type: "text" as const, text: result.summary }] };
     }
     return {
-      content: [{ type: "text" as const, text: `Failed to send: ${result.error}` }],
+      content: [{ type: "text" as const, text: result.summary }],
       isError: true,
     };
   }
 
   if (req.params.name === "bluebubbles_send_attachment") {
     const result = await sendAttachment(args.chat_guid, args.file_path, args.message);
+    let outcome = "FAILED";
+    let summary = `FAILED: ${result.error}`;
     if (result.ok) {
-      return { content: [{ type: "text" as const, text: "attachment sent" }] };
+      if (result.guid) {
+        const v = await verifyDelivery(result.guid);
+        if (v.state === "delivered") {
+          outcome = "delivered";
+          summary = `delivered | guid=${result.guid} | delivered_at=${new Date(v.deliveredAt).toISOString()}`;
+        } else if (v.state === "send_error") {
+          outcome = "FAILED";
+          summary = `FAILED: attachment accepted but iMessage send error code ${v.code} | guid=${result.guid}`;
+        } else if (v.state === "not_found") {
+          outcome = "FAILED";
+          summary = `FAILED: attachment vanished after send | guid=${result.guid}`;
+        } else {
+          outcome = "sent-unverified";
+          summary = `sent-unverified | accepted, no delivery receipt within verification window | guid=${result.guid}`;
+        }
+      } else {
+        outcome = "sent-unverified";
+        summary = "sent-unverified | accepted but no guid returned to verify";
+      }
+    }
+    logDelivery({
+      tool: "bluebubbles_send_attachment",
+      chat_guid: args.chat_guid,
+      file_path: args.file_path,
+      chars: (args.message || "").length,
+      chunks: 1,
+      outcome,
+      transport: activeBase,
+      guids: [result.guid || null],
+      detail: summary,
+    });
+    if (outcome !== "FAILED") {
+      return { content: [{ type: "text" as const, text: `${summary} | transport=${activeBase || "unresolved"}` }] };
     }
     return {
-      content: [{ type: "text" as const, text: `Failed to send attachment: ${result.error}` }],
+      content: [{ type: "text" as const, text: `${summary} | transport=${activeBase || "unresolved"}` }],
       isError: true,
     };
   }
@@ -490,16 +926,37 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }),
       });
       const json = (await res.json()) as { status: number; message: string };
-      if (json.status === 200) {
+      const ok = json.status === 200;
+      logDelivery({
+        tool: "bluebubbles_send_reaction",
+        chat_guid: args.chat_guid,
+        reaction: args.reaction,
+        chars: 0,
+        chunks: 1,
+        outcome: ok ? "sent-unverified" : "FAILED",
+        transport: activeBase,
+        detail: ok ? "reaction accepted" : `rejected: ${json.message}`,
+      });
+      if (ok) {
         return { content: [{ type: "text" as const, text: `Reacted with ${args.reaction}` }] };
       }
       return {
-        content: [{ type: "text" as const, text: `Failed to react: ${json.message}` }],
+        content: [{ type: "text" as const, text: `FAILED to react: ${json.message}` }],
         isError: true,
       };
     } catch (e: any) {
+      logDelivery({
+        tool: "bluebubbles_send_reaction",
+        chat_guid: args.chat_guid,
+        reaction: args.reaction,
+        chars: 0,
+        chunks: 1,
+        outcome: "FAILED",
+        transport: activeBase,
+        detail: e.message,
+      });
       return {
-        content: [{ type: "text" as const, text: `Failed to react: ${e.message}` }],
+        content: [{ type: "text" as const, text: `FAILED to react: ${e.message}` }],
         isError: true,
       };
     }
@@ -545,8 +1002,10 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
   const promptMsg =
     `Edwin needs approval to run ${params.tool_name}: ${params.description}\n\n` +
     `Reply "yes ${params.request_id}" or "no ${params.request_id}"`;
-  await sendMessage(chatGuid, promptMsg);
-  log(`Permission relay sent for ${params.tool_name} (${params.request_id})`);
+  const result = await replyVerified(chatGuid, promptMsg, "permission_relay");
+  log(
+    `Permission relay for ${params.tool_name} (${params.request_id}): ${result.summary}`
+  );
 });
 
 // --- Permission verdict regex ------------------------------------------------
@@ -630,8 +1089,8 @@ async function handleWebhook(body: string): Promise<void> {
     await mcp.notification({
       method: "notifications/claude/channel/permission",
       params: {
-        request_id: verdictMatch[2].toLowerCase(),
-        behavior: verdictMatch[1].toLowerCase().startsWith("y")
+        request_id: verdictMatch[2]!.toLowerCase(),
+        behavior: verdictMatch[1]!.toLowerCase().startsWith("y")
           ? "allow"
           : "deny",
       },

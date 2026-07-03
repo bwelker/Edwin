@@ -1,0 +1,110 @@
+name: CI
+
+# Partial-build / code-health gate for the public Edwin repo.
+# Fast + hermetic: no live services, no credentials, checked-out tree only.
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python (compile + lint + tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          # 3.12 pinned: fastembed/onnxruntime segfault on 3.14.
+          python-version: "3.12"
+
+      - name: Install lint tooling
+        run: pip install --quiet ruff
+
+      - name: Byte-compile all tracked .py (syntax gate)
+        run: |
+          git ls-files '*.py' | xargs -r python -m py_compile
+          echo "py_compile OK for $(git ls-files '*.py' | wc -l) file(s)"
+
+      - name: Byte-compile extensionless Python executables
+        run: |
+          files=$(git ls-files | while read -r f; do
+            head -1 "$f" 2>/dev/null | grep -qE '^#!.*python' && echo "$f"
+          done)
+          if [ -n "$files" ]; then
+            echo "$files" | xargs -r python -m py_compile
+            echo "py_compile OK for $(echo "$files" | wc -l) extensionless tool(s)"
+          else
+            echo "no extensionless python executables found"
+          fi
+
+      - name: Ruff -- critical errors (blocking)
+        run: ruff check --select E9,F63,F7,F82 .
+
+      - name: Ruff -- full lint (non-blocking, informational)
+        continue-on-error: true
+        run: ruff check .
+
+      - name: Python tests (hermetic only)
+        run: |
+          set -e
+          echo "== indexer bulkmail =="
+          python -m unittest tools/indexer/tests/test_bulkmail.py
+
+  typescript:
+    name: TypeScript (typecheck + tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # TODO(pii-port): bluebubbles-channel/index.ts has 3 known strict-null
+      # errors from the chunked-send port (index.ts L131/L135/L136, indexed
+      # access into [BB_PRIMARY_URL, BB_FALLBACK_URL] -> string | undefined
+      # under noUncheckedIndexedAccess). Runtime-safe (runs under bun, which
+      # does not typecheck). Non-blocking until fixed; then drop continue-on-error.
+      - name: bluebubbles-channel -- install + typecheck (non-blocking, known debt)
+        continue-on-error: true
+        working-directory: mcp-servers/bluebubbles-channel
+        run: |
+          bun install --frozen-lockfile || bun install
+          bunx tsc --noEmit
+
+      - name: events-channel -- install + typecheck (blocking)
+        working-directory: mcp-servers/events-channel
+        run: |
+          bun install --frozen-lockfile || bun install
+          bunx tsc --noEmit
+
+      - name: events-channel -- tests
+        working-directory: mcp-servers/events-channel
+        run: bun test
+
+  shell:
+    name: Shell (shellcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      - name: Shellcheck tracked scripts (fail on errors)
+        run: |
+          files=$(git ls-files '*.sh')
+          if [ -z "$files" ]; then echo "no .sh files"; exit 0; fi
+          echo "$files"
+          echo "$files" | xargs -r shellcheck --severity=error

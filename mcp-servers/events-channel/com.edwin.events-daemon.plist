@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd plists cannot expand ~ or environment variables in literal path
+  keys (WorkingDirectory, StandardOutPath, StandardErrorPath), so this runs
+  the daemon through a login shell (`bash -lc`) and expands $HOME and
+  $EDWIN_HOME at execution time instead of hardcoding an absolute path.
+  Set EDWIN_HOME in your shell profile (or edit the command below) if your
+  Edwin checkout isn't at ~/Edwin.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.edwin.events-daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-lc</string>
+        <string>EDWIN_HOME="${EDWIN_HOME:-$HOME/Edwin}"; exec /opt/homebrew/bin/bun "$EDWIN_HOME/mcp-servers/events-channel/daemon.ts" &gt;&gt; "$EDWIN_HOME/logs/events-daemon.log" 2&gt;&amp;1</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>EVENTS_PORT</key>
+        <string>8788</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>

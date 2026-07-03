@@ -8,9 +8,12 @@ search quality, and proposes curation of important decisions.
 Usage:
     librarian health           # Check Qdrant, Neo4j, Ollama, Docker
     librarian freshness        # Check connector sync freshness
+    librarian skills           # Check scheduled-skill artifact freshness (the watchdog)
     librarian quality          # Run spot-check queries against Qdrant
+    librarian eval             # Graded retrieval eval (hit@3/hit@8 + regression check)
     librarian curate           # Scan recent session summaries for decisions
-    librarian full             # Run all of the above
+    librarian memory-audit     # Bi-temporal validity audit of the curated memory layer
+    librarian full             # Run all of the above (eval: latest result, not a re-run)
 """
 
 import argparse
@@ -50,6 +53,90 @@ EXPECTED_CADENCE = {
     "photos": 24,
     "documents": 24,
     "sessions": 2,
+}
+
+# --- Scheduled-skill artifact watchdog ---------------------------------------
+# Plombery fires run_skill events on a schedule; the orchestrator spawns
+# subagents to execute them. Nothing used to verify that the skill actually
+# produced its artifact -- systems can silently degrade for a long time
+# before anyone notices. This check closes the loop.
+#
+# Each entry: skill name -> {
+#   "globs":    artifact glob patterns relative to EDWIN_HOME (newest match wins),
+#   "schedule": ("weekdays", H, M) | ("daily", H, M) | ("weekly", DOW, H, M)
+#               | ("interval", HOURS) | ("times", H, H, ...)   -- DOW: 0=Monday
+#               ("times", ...) = daily at several hours (cron hour="7,12,17")
+# }
+# Schedules mirror tools/plombery/app.py. If a pipeline schedule changes there,
+# update it here too.
+
+GRACE_HOURS = 3  # how long after the scheduled fire before a missing artifact counts as a miss
+
+SKILL_ARTIFACTS = {
+    "morning-brief": {
+        "globs": [
+            "briefing-book/docs/1. \U0001f4cb Briefs/Morning Brief -- *.md",
+            "briefing-book/docs/1. \U0001f4cb Briefs/Daily Archive/Morning Brief -- *.md",
+        ],
+        "schedule": ("weekdays", 6, 0),
+    },
+    "daily-agenda": {
+        "globs": [
+            "briefing-book/docs/2. \U0001f4c5 Calendar/Daily Agenda -- *.md",
+            "briefing-book/docs/2. \U0001f4c5 Calendar/Past Meeting Prep/**/Daily Agenda -- *.md",
+        ],
+        "schedule": ("weekdays", 6, 5),
+    },
+    "intent-check": {
+        "globs": ["briefing-book/docs/11. \U0001f916 Operations/Intent Check -- *.md"],
+        "schedule": ("weekdays", 7, 30),
+    },
+    "ops-dashboard": {
+        "globs": [
+            "briefing-book/docs/11. \U0001f916 Operations/Pipeline Status.md",
+            "briefing-book/docs/11. \U0001f916 Operations/Memory Health.md",
+            "briefing-book/docs/11. \U0001f916 Operations/Indexing Status.md",
+            "briefing-book/docs/11. \U0001f916 Operations/Capabilities.md",
+        ],
+        "schedule": ("times", 7, 12, 17),  # mirrors app.py t28 CronTrigger(hour="7,12,17")
+    },
+    "pm-capture": {
+        "globs": ["data/nightwatch/pm-capture-*.log"],
+        "schedule": ("daily", 22, 0),
+    },
+    "limitless-analysis": {
+        "globs": [
+            "briefing-book/docs/5. \U0001f319 Overnight/logs/*-limitless.md",
+            "briefing-book/docs/5. \U0001f319 Overnight/logs/archive/*-limitless.md",
+        ],
+        "schedule": ("daily", 22, 30),
+        # Data-gated: the analysis only runs if there is new source data for
+        # the day. On no-data days there is nothing to analyze and no
+        # artifact is expected -- that's not a miss.
+        # {date:...} is filled with the expected-fire date (YYYY-MM-DD).
+        "requires_data": ["data/limitless/lifelogs/{date:%Y-%m}/{date:%Y-%m-%d}-*.md"],
+    },
+    "nightwatch": {
+        "globs": [
+            "briefing-book/docs/5. \U0001f319 Overnight/logs/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md",
+            "briefing-book/docs/5. \U0001f319 Overnight/logs/archive/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md",
+        ],
+        "schedule": ("daily", 21, 0),
+    },
+    "weekly-dispatch": {
+        "globs": [
+            "briefing-book/docs/1. \U0001f4cb Briefs/Weekly Dispatch*.md",
+            "briefing-book/docs/1. \U0001f4cb Briefs/Weekly Archive/Weekly Dispatch*.md",
+        ],
+        "schedule": ("weekly", 4, 20, 0),  # Friday 8 PM
+    },
+    "bb-archiver": {
+        "globs": [
+            "briefing-book/docs/11. \U0001f916 Operations/Archiver Report -- *.md",
+            "briefing-book/docs/11. \U0001f916 Operations/archive/Archiver Report -- *.md",
+        ],
+        "schedule": ("weekly", 6, 5, 45),  # Sunday 5:45 AM (mirrors app.py t49)
+    },
 }
 
 
@@ -132,9 +219,34 @@ def cmd_health(args):
     return 0 if all_ok else 1
 
 
+DISMISSALS_FILE = MEMORY_DIR / "staleness-dismissals.json"
+DISMISSAL_DEFAULT_EXPIRES_DAYS = 7
+
+
+def _load_dismissals():
+    """The dismissed-as-non-bug registry.
+
+    A staleness dismissal is a CONDITIONAL verdict, not a permanent one. Each
+    entry: {"source", "dismissed" (YYYY-MM-DD), "context", "expires_days"?}.
+    While unexpired, a stale source is annotated as triaged and does not count
+    toward the exit code. Once (today - dismissed) > expires_days and the
+    source is STILL stale, the verdict is void: the source re-ALERTs and
+    counts as an issue again. Dismissals never suppress the [STALE] line
+    itself -- they only record the written triage."""
+    if not DISMISSALS_FILE.exists():
+        return {}
+    try:
+        entries = json.loads(DISMISSALS_FILE.read_text())
+        return {e["source"]: e for e in entries if "source" in e and "dismissed" in e}
+    except (json.JSONDecodeError, TypeError, KeyError) as e:
+        log(f"[WARN] staleness-dismissals.json unreadable ({e}) -- ignoring registry", "WARN")
+        return {}
+
+
 def cmd_freshness(args):
     """Check connector sync freshness."""
     issues = []
+    dismissals = _load_dismissals()
 
     for connector, max_hours in EXPECTED_CADENCE.items():
         connector_dir = DATA_DIR / connector
@@ -159,11 +271,37 @@ def cmd_freshness(args):
         threshold = max_hours * 2  # Flag at 2x expected cadence
 
         if age_hours > threshold:
-            log(
-                f"[STALE] {connector} -- last data {age_hours:.1f}h ago (expected every {max_hours}h)",
-                "WARN",
-            )
-            issues.append(connector)
+            d = dismissals.get(connector)
+            if d:
+                try:
+                    dismissed_on = datetime.strptime(d["dismissed"], "%Y-%m-%d")
+                    days_since = (datetime.now() - dismissed_on).days
+                except ValueError:
+                    dismissed_on, days_since = None, None
+                expires = int(d.get("expires_days", DISMISSAL_DEFAULT_EXPIRES_DAYS))
+                if days_since is None or days_since > expires:
+                    log(
+                        f"[ALERT] {connector} -- still stale {age_hours:.1f}h after non-bug "
+                        f"dismissal on {d['dismissed']} ({d.get('context', 'no context recorded')}) "
+                        f"-- verdict expired, re-investigate as new",
+                        "WARN",
+                    )
+                    issues.append(connector)
+                else:
+                    log(
+                        f"[STALE] {connector} -- last data {age_hours:.1f}h ago "
+                        f"(expected every {max_hours}h) "
+                        f"[triaged {d['dismissed']}: {d.get('context', 'no context recorded')}; "
+                        f"verdict expires after {expires}d]",
+                        "WARN",
+                    )
+                    # triaged in writing + unexpired -> not counted as an issue
+            else:
+                log(
+                    f"[STALE] {connector} -- last data {age_hours:.1f}h ago (expected every {max_hours}h)",
+                    "WARN",
+                )
+                issues.append(connector)
         else:
             log(f"[OK] {connector} -- last data {age_hours:.1f}h ago")
 
@@ -173,6 +311,161 @@ def cmd_freshness(args):
     else:
         log("\nAll connectors fresh.")
         return 0
+
+
+def _last_expected_fire(schedule, now):
+    """Most recent scheduled fire time that is at least GRACE_HOURS in the past.
+
+    Returns None for interval schedules (handled as a max-age check instead).
+    """
+    kind = schedule[0]
+    cutoff = now - timedelta(hours=GRACE_HOURS)
+    if kind == "interval":
+        return None
+    if kind == "daily":
+        _, h, m = schedule
+        t = cutoff.replace(hour=h, minute=m, second=0, microsecond=0)
+        if t > cutoff:
+            t -= timedelta(days=1)
+        return t
+    if kind == "weekdays":
+        _, h, m = schedule
+        t = cutoff.replace(hour=h, minute=m, second=0, microsecond=0)
+        if t > cutoff:
+            t -= timedelta(days=1)
+        while t.weekday() >= 5:  # Sat/Sun -> walk back to Friday
+            t -= timedelta(days=1)
+        return t
+    if kind == "weekly":
+        _, dow, h, m = schedule
+        t = cutoff.replace(hour=h, minute=m, second=0, microsecond=0)
+        while t.weekday() != dow or t > cutoff:
+            t -= timedelta(days=1)
+        return t
+    if kind == "times":
+        # Daily at several fixed hours, e.g. ("times", 7, 12, 17).
+        hours = sorted(schedule[1:], reverse=True)
+        for days_back in range(2):
+            day = cutoff - timedelta(days=days_back)
+            for h in hours:
+                t = day.replace(hour=h, minute=0, second=0, microsecond=0)
+                if t <= cutoff:
+                    return t
+        raise ValueError(f"No fire time found for schedule: {schedule}")
+    raise ValueError(f"Unknown schedule kind: {kind}")
+
+
+def _input_data_exists(spec, for_date):
+    """True if a data-gated skill had input data for the given date.
+
+    Skills without a "requires_data" key are unconditional and always return
+    True. For data-gated skills, a missing artifact is only a real miss when
+    input data actually existed for the expected-fire date -- "no new data
+    today" must not be flagged as a failure.
+    """
+    patterns = spec.get("requires_data")
+    if not patterns:
+        return True
+    for pattern in patterns:
+        resolved = pattern.format(date=for_date)
+        if any(EDWIN_HOME.glob(resolved)):
+            return True
+    return False
+
+
+def cmd_skills(args):
+    """Check that scheduled skills actually produced their artifacts (the watchdog).
+
+    Writes machine-readable status to memory/librarian/skill-freshness.json --
+    the morning brief reads it and surfaces misses to the user.
+    """
+    now = datetime.now()
+    results = []
+
+    for skill, spec in SKILL_ARTIFACTS.items():
+        newest_mtime = 0
+        newest_file = None
+        for pattern in spec["globs"]:
+            for f in EDWIN_HOME.glob(pattern):
+                try:
+                    mtime = f.stat().st_mtime
+                except OSError:
+                    continue
+                if mtime > newest_mtime:
+                    newest_mtime = mtime
+                    newest_file = f
+
+        schedule = spec["schedule"]
+        entry = {
+            "skill": skill,
+            "schedule": " ".join(str(s) for s in schedule),
+            "newest_artifact": str(newest_file.relative_to(EDWIN_HOME)) if newest_file else None,
+            "newest_mtime": datetime.fromtimestamp(newest_mtime).isoformat() if newest_mtime else None,
+        }
+
+        if newest_mtime == 0:
+            # Data-gated skill that has never had input data -> not a miss.
+            expected_date = None
+            if schedule[0] != "interval":
+                expected_date = _last_expected_fire(schedule, now)
+            if expected_date is not None and not _input_data_exists(spec, expected_date):
+                entry["status"] = "ok"
+                entry["note"] = "no input data for the expected day -- nothing to produce"
+                log(f"[OK] {skill} -- no input data for {expected_date:%Y-%m-%d} (data-gated, not a miss)")
+            else:
+                entry["status"] = "missing"
+                entry["note"] = "no artifact has ever been produced at the expected path"
+                log(f"[MISSING] {skill} -- no artifacts match {spec['globs'][0]}", "WARN")
+        elif schedule[0] == "interval":
+            age_hours = (now - datetime.fromtimestamp(newest_mtime)).total_seconds() / 3600
+            threshold = schedule[1] * 2 + GRACE_HOURS
+            if age_hours > threshold:
+                entry["status"] = "stale"
+                entry["note"] = f"newest artifact is {age_hours:.1f}h old (interval {schedule[1]}h, threshold {threshold}h)"
+                log(f"[STALE] {skill} -- {entry['note']}", "WARN")
+            else:
+                entry["status"] = "ok"
+                log(f"[OK] {skill} -- newest artifact {age_hours:.1f}h old")
+        else:
+            expected = _last_expected_fire(schedule, now)
+            entry["expected_since"] = expected.isoformat()
+            # 30 min slack: an artifact written slightly before the scheduled
+            # fire (e.g. brief generated at 05:59 for the 06:00 fire) is fine.
+            if datetime.fromtimestamp(newest_mtime) < expected - timedelta(minutes=30):
+                if not _input_data_exists(spec, expected):
+                    # Data-gated skill, no input data for the expected day --
+                    # not a miss.
+                    entry["status"] = "ok"
+                    entry["note"] = f"no input data for {expected:%Y-%m-%d} -- nothing to produce (last artifact {datetime.fromtimestamp(newest_mtime):%Y-%m-%d %H:%M})"
+                    log(f"[OK] {skill} -- no input data for {expected:%Y-%m-%d} (data-gated, not a miss)")
+                else:
+                    age_hours = (now - datetime.fromtimestamp(newest_mtime)).total_seconds() / 3600
+                    entry["status"] = "stale"
+                    entry["note"] = f"last fire was {expected:%Y-%m-%d %H:%M} but newest artifact is from {datetime.fromtimestamp(newest_mtime):%Y-%m-%d %H:%M} ({age_hours:.0f}h old)"
+                    log(f"[STALE] {skill} -- {entry['note']}", "WARN")
+            else:
+                entry["status"] = "ok"
+                log(f"[OK] {skill} -- artifact newer than last scheduled fire ({expected:%Y-%m-%d %H:%M})")
+
+        results.append(entry)
+
+    misses = [r for r in results if r["status"] != "ok"]
+
+    # Write status file for the morning brief / ops dashboard
+    MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    status_file = MEMORY_DIR / "skill-freshness.json"
+    status_file.write_text(json.dumps({
+        "checked_at": now.isoformat(),
+        "miss_count": len(misses),
+        "results": results,
+    }, indent=2, ensure_ascii=False) + "\n")
+
+    if misses:
+        log(f"\n{len(misses)} skill(s) not producing artifacts: {', '.join(r['skill'] for r in misses)}", "WARN")
+        log(f"Status written to {status_file}")
+        return 1
+    log(f"\nAll scheduled skills producing artifacts. Status written to {status_file}")
+    return 0
 
 
 def cmd_quality(args):
@@ -277,6 +570,46 @@ def cmd_quality(args):
     return 0 if failed == 0 else 1
 
 
+def cmd_eval(args):
+    """Graded retrieval eval through the production search path.
+
+    Replicates mcp-servers/qdrant/index.js (hybrid RRF, per-file grouping,
+    thresholds), grades hit@3/hit@8 against eval-queries.json, appends to
+    .eval-history.jsonl, and alerts on regressions. See lib/retrieval_eval.py.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+    import retrieval_eval
+    return retrieval_eval.run_eval(log=lambda msg: log(msg))
+
+
+def _eval_summary():
+    """Compact summary of the LATEST eval run (from history -- no re-run).
+
+    The full eval costs several embeds + searches; run it on its own
+    schedule (e.g. weekly via your scheduler) and let `librarian full`
+    (typically daily) just report the latest result.
+    """
+    history_file = Path(__file__).resolve().parent / ".eval-history.jsonl"
+    if not history_file.exists():
+        log("No eval history yet -- run `librarian eval` to baseline.", "WARN")
+        return 0
+    lines = [l for l in history_file.read_text().splitlines() if l.strip()]
+    if not lines:
+        log("Eval history file is empty -- run `librarian eval` to baseline.", "WARN")
+        return 0
+    last = json.loads(lines[-1])
+    alerts = last.get("alerts", [])
+    icon = "OK" if not alerts else "ALERT"
+    log(f"[{icon}] retrieval eval (last run {last['ts']}): "
+        f"hit@3 {last['hit3']}/{last['positives']}, "
+        f"hit@8 {last['hit8']}/{last['positives']}, "
+        f"negative probes {last['negatives_passed']}/{last['negatives']}, "
+        f"latency p50 {last['latency_p50_ms']}ms")
+    for a in alerts:
+        log(a, "WARN")
+    return 1 if alerts else 0
+
+
 def cmd_curate(args):
     """Scan recent session summaries for significant decisions."""
     sessions_dir = EDWIN_HOME / "memory" / "sessions"
@@ -357,6 +690,228 @@ def cmd_curate(args):
     return 0
 
 
+# --- Bi-temporal memory audit -------------------------------------------------
+# Curated memory facts rot silently (org changes, parked projects, corrected
+# facts) if nothing detects that reality changed. Conventions in
+# tools/librarian/MEMORY-CONVENTIONS.md; this audit enforces them.
+
+def _detect_memory_layer_dir():
+    """Auto-detect the Claude Code project memory dir for this Edwin instance.
+
+    Mirrors the EDWIN_HOME auto-detect idiom used by session-slicer /
+    session-watcher: env var override, then the Claude Code project dir slug
+    derived from EDWIN_HOME, then a best-effort fallback."""
+    env_dir = os.environ.get("EDWIN_MEMORY_LAYER")
+    if env_dir:
+        return Path(env_dir)
+    claude_projects = Path.home() / ".claude" / "projects"
+    home_str = str(EDWIN_HOME).replace("/", "-")
+    if home_str.startswith("-") and claude_projects.exists():
+        candidate = claude_projects / home_str / "memory"
+        if candidate.exists():
+            return candidate
+    if claude_projects.exists():
+        for d in sorted(claude_projects.iterdir()):
+            if d.is_dir() and not d.name.startswith("."):
+                candidate = d / "memory"
+                if candidate.exists():
+                    return candidate
+    return claude_projects / "memory"
+
+
+MEMORY_LAYER_DIR = _detect_memory_layer_dir()
+MEMORY_AUDIT_HISTORY = MEMORY_DIR / ".memory-audit-history.jsonl"
+
+# CONFIG: type volatility map. Volatile types age out of trust after
+# MEMORY_STALE_DAYS even without an explicit review_after; stable types only
+# expire via review_after.
+MEMORY_VOLATILITY = {
+    "project": "volatile",
+    "reference": "volatile",
+    "user": "stable",
+    "feedback": "stable",
+}
+MEMORY_STALE_DAYS = 90
+
+
+def _parse_frontmatter(path):
+    """Return (frontmatter_dict, error_str). Fields may live in a nested
+    'metadata:' block or at top level -- callers use _fm_field()."""
+    import yaml
+
+    text = path.read_text()
+    if not text.startswith("---\n"):
+        return None, "no frontmatter block"
+    end = text.find("\n---", 4)
+    if end == -1:
+        return None, "unterminated frontmatter block"
+    try:
+        fm = yaml.safe_load(text[4:end])
+    except yaml.YAMLError as e:
+        return None, f"YAML parse error: {str(e).splitlines()[0]}"
+    if not isinstance(fm, dict):
+        return None, "frontmatter is not a mapping"
+    return fm, None
+
+
+def _fm_field(fm, key):
+    """Look up a field in metadata: block first, then top level."""
+    meta = fm.get("metadata")
+    if isinstance(meta, dict) and key in meta:
+        return meta[key]
+    return fm.get(key)
+
+
+def _as_date(value):
+    """Coerce a frontmatter date (str or datetime.date from yaml) to date."""
+    from datetime import date
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return datetime.strptime(str(value).strip(), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _link_key(s):
+    """Normalize a memory name / file stem / [[wikilink]] target for matching
+    (names use hyphens, underscores, or prose interchangeably)."""
+    return str(s).strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def cmd_memory_audit(args):
+    """Bi-temporal validity audit of the curated memory layer.
+
+    Deterministic frontmatter checks (conventions: MEMORY-CONVENTIONS.md):
+    EXPIRED review_after (exit 2), AGING volatile facts, UNAUDITED files,
+    superseded-in-place, dangling [[links]]/superseded_by, MEMORY.md index
+    drift, unparseable frontmatter. Appends a summary line to
+    memory/librarian/.memory-audit-history.jsonl.
+    """
+    import re
+
+    today = datetime.now().date()
+    mem_dir = MEMORY_LAYER_DIR
+    if not mem_dir.exists():
+        log(f"[FAIL] memory layer not found at {mem_dir}", "ERROR")
+        return 1
+
+    active = sorted(f for f in mem_dir.glob("*.md") if f.name != "MEMORY.md")
+    archived = sorted((mem_dir / "archive").glob("*.md")) if (mem_dir / "archive").exists() else []
+
+    # Build the link-resolution universe: file stems + name: fields, active + archive.
+    known = {}
+    parsed = {}
+    for f in active + archived:
+        fm, err = _parse_frontmatter(f)
+        parsed[f] = (fm, err)
+        known[_link_key(f.stem)] = f
+        if fm and fm.get("name"):
+            known[_link_key(fm["name"])] = f
+
+    expired, aging, unaudited, assumed = [], [], [], []
+    dangling, superseded_in_place, parse_errors = [], [], []
+
+    for f in active:
+        fm, err = parsed[f]
+        if err:
+            parse_errors.append(f"{f.name}: {err}")
+            log(f"[PARSE] {f.name} -- {err}", "WARN")
+            continue
+
+        mtype = str(_fm_field(fm, "type") or "").strip().lower()
+        valid_as_of = _as_date(_fm_field(fm, "valid_as_of"))
+        review_after = _as_date(_fm_field(fm, "review_after"))
+        basis = str(_fm_field(fm, "valid_basis") or "").strip().lower()
+        sup = _fm_field(fm, "superseded_by")
+
+        if valid_as_of is None:
+            unaudited.append(f.name)
+            log(f"[UNAUDITED] {f.name} -- no valid_as_of (conventions: tools/librarian/MEMORY-CONVENTIONS.md)", "WARN")
+        else:
+            if basis == "assumed":
+                assumed.append(f.name)
+            age_days = (today - valid_as_of).days
+            if review_after and review_after < today:
+                expired.append(f.name)
+                log(f"[EXPIRED] {f.name} -- review_after {review_after} is past "
+                    f"(valid_as_of {valid_as_of}) -- re-verify before trusting", "WARN")
+            elif MEMORY_VOLATILITY.get(mtype, "stable") == "volatile" and age_days > MEMORY_STALE_DAYS:
+                aging.append(f.name)
+                log(f"[AGING] {f.name} -- volatile ({mtype}) verified {age_days}d ago "
+                    f"(valid_as_of {valid_as_of}, threshold {MEMORY_STALE_DAYS}d)", "WARN")
+
+        if sup:
+            superseded_in_place.append(f.name)
+            log(f"[SUPERSEDED] {f.name} -- superseded_by {sup} but still in the active dir "
+                f"(move to memory/archive/)", "WARN")
+            if _link_key(sup) not in known:
+                dangling.append(f"{f.name}: superseded_by -> {sup}")
+                log(f"[DANGLING] {f.name} -- superseded_by target '{sup}' resolves to nothing", "WARN")
+
+        for target in re.findall(r"\[\[([^\]|#]+)", f.read_text()):
+            # Only memory-shaped names count as wikilinks: skip PM-item refs
+            # ([[pm-dff7b4]]) and code snippets ([['OOB','start',100]]).
+            if not re.fullmatch(r"[A-Za-z0-9 _.\-]+", target.strip()):
+                continue
+            if re.fullmatch(r"pm-[0-9a-f]{4,}", target.strip(), re.I):
+                continue
+            if _link_key(target) not in known:
+                dangling.append(f"{f.name}: [[{target}]]")
+                log(f"[DANGLING] {f.name} -- [[{target}]] resolves to no active or archived memory", "WARN")
+
+    # MEMORY.md index consistency
+    index_issues = []
+    index_file = mem_dir / "MEMORY.md"
+    if index_file.exists():
+        indexed = {m[:-3] for m in re.findall(r"\]\(([^)]+\.md)\)", index_file.read_text())}
+        file_stems = {f.stem for f in active}
+        for stem in sorted(indexed - file_stems):
+            index_issues.append(f"index line for missing file: {stem}.md")
+            log(f"[INDEX] MEMORY.md lists {stem}.md but no such active file exists", "WARN")
+        for stem in sorted(file_stems - indexed):
+            index_issues.append(f"file with no index line: {stem}.md")
+            log(f"[INDEX] {stem}.md has no line in MEMORY.md", "WARN")
+    else:
+        index_issues.append("MEMORY.md index missing")
+        log("[INDEX] MEMORY.md not found", "WARN")
+
+    structural = dangling + index_issues + superseded_in_place + parse_errors
+    icon = "ALERT" if expired else ("WARN" if structural else "OK")
+    summary = (f"[{icon}] memory-audit: {len(active)} active files -- "
+               f"{len(expired)} expired, {len(aging)} aging, {len(unaudited)} unaudited, "
+               f"{len(assumed)} assumed-basis, {len(dangling)} dangling links, "
+               f"{len(index_issues)} index issues, {len(superseded_in_place)} superseded-in-place")
+    log("")
+    log(summary, "WARN" if (expired or structural) else "INFO")
+
+    MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    with open(MEMORY_AUDIT_HISTORY, "a") as fh:
+        fh.write(json.dumps({
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "files": len(active),
+            "expired": expired,
+            "aging": aging,
+            "unaudited": unaudited,
+            "assumed_basis": len(assumed),
+            "dangling": dangling,
+            "index_issues": index_issues,
+            "superseded_in_place": superseded_in_place,
+            "parse_errors": parse_errors,
+        }, ensure_ascii=False) + "\n")
+
+    if expired:
+        return 2
+    if structural:
+        return 1
+    return 0
+
+
 def cmd_full(args):
     """Run all checks."""
     log("=" * 60)
@@ -373,8 +928,20 @@ def cmd_full(args):
     if cmd_freshness(args):
         exit_code = 1
 
+    log("\n--- SKILL ARTIFACTS ---")
+    if cmd_skills(args):
+        exit_code = 1
+
     log("\n--- QUALITY ---")
     if cmd_quality(args):
+        exit_code = 1
+
+    log("\n--- RETRIEVAL EVAL (latest run) ---")
+    if _eval_summary():
+        exit_code = 1
+
+    log("\n--- MEMORY AUDIT ---")
+    if cmd_memory_audit(args):
         exit_code = 1
 
     log("\n--- CURATION ---")
@@ -402,8 +969,11 @@ def main():
 
     sub.add_parser("health", help="Check service health")
     sub.add_parser("freshness", help="Check connector freshness")
+    sub.add_parser("skills", help="Check scheduled-skill artifact freshness")
     sub.add_parser("quality", help="Run spot-check queries")
+    sub.add_parser("eval", help="Graded retrieval eval (production path, hit@3/hit@8)")
     sub.add_parser("curate", help="Scan session summaries for decisions")
+    sub.add_parser("memory-audit", help="Bi-temporal validity audit of the curated memory layer")
     sub.add_parser("full", help="Run all checks")
 
     args = parser.parse_args()
@@ -411,8 +981,11 @@ def main():
     handlers = {
         "health": cmd_health,
         "freshness": cmd_freshness,
+        "skills": cmd_skills,
         "quality": cmd_quality,
+        "eval": cmd_eval,
         "curate": cmd_curate,
+        "memory-audit": cmd_memory_audit,
         "full": cmd_full,
     }
 

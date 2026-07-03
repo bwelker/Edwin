@@ -1,0 +1,11 @@
+#!/bin/bash
+# usage-check -- bash entrypoint for the Claude Max plan usage poller.
+# Runs usage_check.py inside its dedicated venv (curl_cffi requires it for
+# Cloudflare TLS impersonation). Safe for headless/launchd invocation: no
+# interactive prompts, absolute paths, exits non-zero on failure (see
+# usage_check.py's fail-loud contract -- it still writes an error status file
+# on failure, this exit code is just for launchd's log).
+set -euo pipefail
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+exec "$DIR/venv/bin/python" "$DIR/usage_check.py"

@@ -1,0 +1,12 @@
+{
+  "name": "bluebubbles",
+  "description": "BlueBubbles channel for Claude Code — two-way iMessage bridge via BlueBubbles REST API.",
+  "version": "0.0.1",
+  "keywords": [
+    "bluebubbles",
+    "imessage",
+    "messaging",
+    "channel",
+    "mcp"
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "skill": "system",
+  "_comment": "System-level suite (not a skill in docs/SKILLS.md; check-all runs it as a system-level suite). This is where self-retro corrections that are cross-skill/infrastructure land as permanent checks. The artifact under test is the newest nightly Systems Report -- tools/systems-report/report computes the underlying facts (Plombery failure streaks, expired staleness dismissals) and these checks turn its ALERT lines into exit-2 signal the daily sys-skill-evals job cannot normalize away.",
+  "artifact_globs": [
+    "briefing-book/docs/1. 📋 Briefs/Systems Report -- *.md",
+    "briefing-book/docs/1. 📋 Briefs/Daily Archive/Systems Report -- *.md",
+    "briefing-book/docs/1. 📋 Briefs/Daily Archive/*/Systems Report -- *.md"
+  ],
+  "checks": [
+    {"name": "systems-report-exists", "check": "file_exists", "target": "artifact"},
+    {"name": "systems-report-fresh", "check": "file_fresh", "target": "artifact",
+     "params": {"max_age_hours": 30}},
+    {"name": "no-consecutive-failure-streaks", "check": "regex_absent", "target": "artifact",
+     "params": {"pattern": "ALERT: \\S+ failed \\d+\\+? consecutive runs"},
+     "_origin": "self-retro 2026-07-02 correction 3 (feedback_dont_normalize_red): mem-librarian ran red 8 straight days unread. A streak ALERT in the nightly report now fails this check until the job is fixed or triaged in writing."},
+    {"name": "no-expired-staleness-dismissals", "check": "regex_absent", "target": "artifact",
+     "params": {"pattern": "verdict expired"},
+     "_origin": "self-retro 2026-07-02 correction 2 (feedback_stale_verdict_expiry): a non-bug verdict on a quiet source expires; librarian freshness re-ALERTs when a dismissed source is still stale past its expiry and this check fails until re-investigated."},
+    {"name": "staleness-registry-parses", "check": "json_parses", "target": "path",
+     "params": {"path": "memory/librarian/staleness-dismissals.json"}}
+  ]
+}

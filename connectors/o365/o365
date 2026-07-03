@@ -17,8 +17,10 @@ import time
 import fcntl
 import tempfile
 import hashlib
+import itertools
 import html as html_mod
 import requests
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 import pytz
@@ -43,6 +45,19 @@ DEL_SCOPES      = "Chat.ReadWrite ChatMessage.Send Chat.Create Chat.ReadWrite.Al
 
 GRAPH           = "https://graph.microsoft.com/v1.0"
 DEFAULT_SINCE   = 30  # days back for initial sync
+
+# Teams denied-chat cache: a chat that 403/404'd is re-probed at most once per
+# this window instead of on every 15-min run. ~100 chronic no-preview 403
+# chats probed every run = ~9,600 wasted Graph calls/day, a likely feeder of
+# the 502/504 throttle storms. A chat that becomes accessible again exits the
+# cache on its next (daily) re-probe.
+DENIED_REPROBE_HOURS = 24
+
+# Partial-failure accounting. Sync functions append human-readable error
+# descriptions here; cmd_sync reports them in the final summary and exits
+# nonzero so the scheduler/Plombery/events-channel see partial failures
+# instead of a silent "ok".
+SYNC_ERRORS: list = []
 
 
 # ── Lockfile ──────────────────────────────────────────────────────────────────
@@ -189,6 +204,114 @@ def _delegated_login():
 _last_throttle_time = 0.0   # epoch seconds of last 429 response
 _THROTTLE_COOLDOWN  = 2.0   # seconds to pause after a recent 429
 
+# ── Stall protection (2026-06-17) ─────────────────────────────────────────────
+# Root cause of the silent O365 sync hangs: a reused keep-alive socket from
+# requests' default connection pool goes half-dead on an @odata.nextLink
+# pagination GET. The OpenSSL recv() then blocks below the socket-timeout layer,
+# so requests' read timeout never fires and the run blows past the 300s
+# Plombery cap (reported as a generic timeout). This is interpreter-independent
+# (3.12 and 3.14 both hang identically).
+#
+# Defence in depth:
+#   1. (connect, read) timeout tuple on every request so the read timeout is
+#      explicit at the socket layer.
+#   2. A hard wall-clock watchdog (thread + future.result(timeout=...)) around
+#      each request so even an OpenSSL-level stall that ignores the socket
+#      timeout is bounded. On fire we raise a retryable _StallTimeout.
+#   3. A dedicated requests.Session whose connection pool we *discard* on any
+#      stall/timeout, so the tenacity retry runs on a brand-new pool instead of
+#      re-grabbing the same half-dead socket.
+_CONNECT_TIMEOUT = 10   # seconds to establish the TCP/TLS connection
+_READ_TIMEOUT    = 30   # seconds to wait between bytes (socket-layer)
+_WATCHDOG_SECS   = 30   # hard wall-clock ceiling per request, backstops
+                        # OpenSSL stalls. Sized so the worst case across all 5
+                        # tenacity attempts (5*30s + ~30s exp backoff = ~180s)
+                        # stays well under the 300s Plombery cap. A healthy page
+                        # returns in <1s, so 30s of zero bytes means a dead socket.
+
+_session_lock = threading.Lock()
+_http_session = None    # lazily created requests.Session, reset on stall
+
+
+class _StallTimeout(Exception):
+    """A request exceeded the hard wall-clock watchdog (OpenSSL-level stall).
+    Retryable: the retry runs on a fresh connection pool."""
+
+
+def _get_session():
+    """Return the shared requests.Session, creating it on first use."""
+    global _http_session
+    with _session_lock:
+        if _http_session is None:
+            _http_session = requests.Session()
+        return _http_session
+
+
+def _reset_session():
+    """Discard the current session/connection pool so the next request opens
+    fresh sockets. Called after a stall/timeout to avoid reusing a half-dead
+    keep-alive socket on retry."""
+    global _http_session
+    with _session_lock:
+        old, _http_session = _http_session, None
+    if old is not None:
+        try:
+            old.close()
+        except Exception:
+            pass
+
+
+def _request_with_watchdog(method, url, **kwargs):
+    """Issue a single HTTP request bounded by a hard wall-clock watchdog.
+
+    The (connect, read) timeout tuple bounds the socket layer; the watchdog
+    bounds everything (including OpenSSL recv stalls that ignore the socket
+    timeout). On either firing we reset the connection pool and raise a
+    retryable exception so the tenacity-decorated caller retries on fresh
+    sockets.
+
+    A raw *daemon* worker thread runs the blocking call (not a
+    ThreadPoolExecutor: its workers are non-daemon and the interpreter's atexit
+    handler join()s them, so a worker wedged forever in OpenSSL recv would hang
+    the whole process at exit even after we'd moved on). A daemon thread is
+    abandoned cleanly when the process exits.
+    """
+    sess = _get_session()
+    kwargs.setdefault("timeout", (_CONNECT_TIMEOUT, _READ_TIMEOUT))
+
+    box = {}                       # one-shot result/exception mailbox
+    done = threading.Event()
+
+    def _do():
+        try:
+            box["resp"] = sess.request(method, url, **kwargs)
+        except BaseException as e:  # propagate socket timeouts etc. to caller
+            box["exc"] = e
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=_do, name="o365-http", daemon=True)
+    worker.start()
+
+    if not done.wait(timeout=_WATCHDOG_SECS):
+        # Watchdog fired: the worker is wedged (likely OpenSSL recv on a
+        # half-dead keep-alive socket). Poison the pool so the retry opens
+        # fresh sockets, abandon the daemon worker, and raise retryably.
+        _reset_session()
+        raise _StallTimeout(
+            f"request to {url} exceeded {_WATCHDOG_SECS}s wall-clock watchdog"
+        )
+
+    if "exc" in box:
+        exc = box["exc"]
+        if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+            # Socket-layer timeout / connection drop: poison the pool too, so
+            # the retry gets fresh sockets.
+            _reset_session()
+        raise exc
+    return box["resp"]
+
+
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
 def _wait_retry_after_or_exp(retry_state):
@@ -198,23 +321,46 @@ def _wait_retry_after_or_exp(retry_state):
         retry_after = exc.response.headers.get("Retry-After")
         if retry_after is not None:
             try:
-                return int(retry_after)
+                # Cap honored waits: anything larger fails fast via
+                # _is_retryable_http's >300s check before reaching here.
+                return min(int(retry_after), 300)
             except (ValueError, TypeError):
                 pass
     return wait_exponential(multiplier=2, min=2, max=60)(retry_state)
 
 
 def _is_retryable_http(exc):
-    """Retryable HTTP errors: 401 (token expiry), 429 (throttle), 503 (transient).
+    """Retryable HTTP errors: 401 (token expiry), 429 (throttle),
+    500/502/503/504 (transient Graph gateway errors).
+
+    Graph's chat-message endpoints throw frequent 502/504 blips — the nightwatch
+    audit (2026-06-10) found 1,128x 502 + 423x 504 aborting Teams syncs that
+    still reported ok. Retrying with backoff rides through almost all of them.
 
     On 401, invalidate the cached app token so the next retry fetches a fresh one.
     On 429, record the throttle time so subsequent requests can cool down.
     """
     global _last_throttle_time
+    # Stall watchdog fire / socket-layer timeout / connection drop: retry on a
+    # fresh connection pool (the session was already reset at the raise site).
+    if isinstance(exc, (_StallTimeout, requests.Timeout, requests.ConnectionError)):
+        return True
     if isinstance(exc, requests.HTTPError) and exc.response is not None:
         status = exc.response.status_code
         if status == 429:
             _last_throttle_time = time.time()
+            # Quota exhaustion (e.g. metered Teams export APIs after a big
+            # backfill): Graph can demand waits of minutes-to-hours via
+            # Retry-After. Sleeping that out inside a scheduled run hangs the
+            # pipeline (2026-06-12: 2h+ silent hangs). Fail the source fast
+            # instead; the next scheduled run retries when quota recovers.
+            ra = exc.response.headers.get("Retry-After")
+            try:
+                if ra is not None and int(ra) > 300:
+                    print(f"  throttled hard (Retry-After={ra}s) -- deferring to next scheduled run", file=sys.stderr)
+                    return False
+            except (ValueError, TypeError):
+                pass
         if status == 401:
             # P3-13: Bust the app token cache so the next call to get_app_token()
             # fetches a fresh token instead of returning the expired cached one.
@@ -223,7 +369,7 @@ def _is_retryable_http(exc):
             except Exception:
                 pass
             return True
-        return status in (429, 503)
+        return status in (429, 500, 502, 503, 504)
     if isinstance(exc, json.JSONDecodeError):
         return True  # Malformed API response — retry
     return False
@@ -231,7 +377,8 @@ def _is_retryable_http(exc):
 
 @retry(retry=retry_if_exception(_is_retryable_http),
        wait=_wait_retry_after_or_exp,
-       stop=stop_after_attempt(5))
+       stop=stop_after_attempt(5),
+       reraise=True)  # raise the original HTTPError, not tenacity.RetryError
 def _get(url, token_getter, params=None, extra_headers=None):
     """GET with auto token refresh, backoff on 401/429/503."""
     if time.time() - _last_throttle_time < _THROTTLE_COOLDOWN:
@@ -240,21 +387,24 @@ def _get(url, token_getter, params=None, extra_headers=None):
     headers = {"Authorization": f"Bearer {token}"}
     if extra_headers:
         headers.update(extra_headers)
-    resp = requests.get(url, headers=headers, params=params, timeout=60)
+    resp = _request_with_watchdog("GET", url, headers=headers, params=params)
     resp.raise_for_status()
     return resp.json()
 
 
 @retry(retry=retry_if_exception(_is_retryable_http),
        wait=_wait_retry_after_or_exp,
-       stop=stop_after_attempt(5))
+       stop=stop_after_attempt(5),
+       reraise=True)  # raise the original HTTPError, not tenacity.RetryError
 def _post(url, token_getter, body):
     if time.time() - _last_throttle_time < _THROTTLE_COOLDOWN:
         time.sleep(_THROTTLE_COOLDOWN)
     token = token_getter() if callable(token_getter) else token_getter
-    resp = requests.post(url, headers={"Authorization": f"Bearer {token}",
-                                       "Content-Type": "application/json"},
-                         json=body, timeout=60)
+    resp = _request_with_watchdog(
+        "POST", url,
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/json"},
+        json=body)
     resp.raise_for_status()
     return resp
 
@@ -587,27 +737,73 @@ def _cal_dt(dt: datetime) -> str:
     return dt.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+CAL_SELECT = ("id,subject,type,seriesMasterId,start,end,isAllDay,location,"
+              "organizer,attendees,body,sensitivity,isCancelled,"
+              "isOnlineMeeting,onlineMeetingUrl,recurrence")
+
+
+def _fill_from_master(event: dict, masters: dict, token_getter) -> dict:
+    """calendarView/delta returns recurring-event occurrences with only the
+    fields that differ from the seriesMaster (so subject/organizer/body come
+    back empty). Inherit the missing fields from the master event."""
+    master_id = event.get("seriesMasterId")
+    if not master_id or event.get("subject"):
+        return event
+    master = masters.get(master_id)
+    if master is None:
+        try:
+            master = _get(f"{GRAPH}/users/{EMAIL_ADDRESS}/events/{master_id}",
+                          token_getter, {"$select": CAL_SELECT})
+        except requests.HTTPError:
+            master = {}
+        masters[master_id] = master  # cache (even failures) per run
+    merged = dict(master)
+    merged.update({k: v for k, v in event.items() if v not in (None, "", [], {})})
+    return merged
+
+
 def sync_calendar(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = False):
     token_getter = get_app_token
     tz   = pytz.timezone(TZ)
     now  = datetime.now(tz)
     last_sync  = state.get("calendar", {}).get("lastSync")
     delta_link = state.get("calendar", {}).get("deltaLink")
+    window_end = state.get("calendar", {}).get("windowEnd")
 
     cal_headers = {
         "Prefer": f'odata.maxpagesize=50,outlook.timezone="{TZ}"'
     }
+
+    # calendarView/delta tracks ONLY events inside the start/end window that
+    # was fixed when the delta was first established. Graph keeps serving the
+    # deltaLink forever, so without re-anchoring, events past the original
+    # endDateTime are silently invisible (this dropped all of June 2026).
+    # Re-anchor when the stored window edge is within 14 days of now, or when
+    # the state predates window tracking (windowEnd missing).
+    if delta_link:
+        stale = True
+        if window_end:
+            try:
+                we = datetime.fromisoformat(window_end.replace("Z", "+00:00"))
+                stale = (we - now.astimezone(pytz.utc)) < timedelta(days=14)
+            except ValueError:
+                pass
+        if stale:
+            print("  Calendar delta window stale — re-anchoring.", file=sys.stderr)
+            delta_link = None
+            state.setdefault("calendar", {}).pop("deltaLink", None)
 
     if delta_link:
         url, params = delta_link, None
     else:
         start = _cal_dt(now - timedelta(days=since_days))
         end   = _cal_dt(now + timedelta(days=60))
+        state.setdefault("calendar", {})["windowEnd"] = end
         url   = f"{GRAPH}/users/{EMAIL_ADDRESS}/calendarView/delta"
         params = {
             "startDateTime": start,
             "endDateTime": end,
-            "$select": "id,subject,start,end,isAllDay,location,organizer,attendees,body,sensitivity,isCancelled,isOnlineMeeting,onlineMeetingUrl,recurrence",
+            "$select": CAL_SELECT,
         }
 
     print("  Syncing calendar...", file=sys.stderr)
@@ -622,17 +818,20 @@ def sync_calendar(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = 
                          else now - timedelta(days=since_days))
             start = _cal_dt(gap_start)
             end   = _cal_dt(now + timedelta(days=60))
+            state.setdefault("calendar", {})["windowEnd"] = end
             url   = f"{GRAPH}/users/{EMAIL_ADDRESS}/calendarView/delta"
             params = {
                 "startDateTime": start,
                 "endDateTime": end,
-                "$select": "id,subject,start,end,isAllDay,location,organizer,attendees,body,sensitivity,isCancelled,isOnlineMeeting,onlineMeetingUrl,recurrence",
+                "$select": CAL_SELECT,
             }
             items, new_delta = _paginate_delta(url, token_getter, params, extra_headers=cal_headers)
         else:
             raise
 
-    count = sum(_write_calendar_item(e, tz) for e in items)
+    masters = {e["id"]: e for e in items if e.get("type") == "seriesMaster"}
+    count = sum(_write_calendar_item(_fill_from_master(e, masters, token_getter), tz)
+                for e in items)
     if new_delta:
         state.setdefault("calendar", {})["deltaLink"] = new_delta
     state.setdefault("calendar", {})["lastSync"] = datetime.now(pytz.utc).isoformat()
@@ -732,9 +931,19 @@ def sync_teams(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = Fal
 
     chats = list(_paginate(f"{GRAPH}/users/{EMAIL_ADDRESS}/chats", token_getter,
                            {"$expand": "lastMessagePreview", "$top": 50}))
-    count = 0
+    count  = 0
+    failed = []  # (chat_label, error) — transient errors; chat is retried next run
+    denied = []  # chat_label — 403/404, no access; reported but not fatal
+    # Denied-chat cache: chat_id -> ISO timestamp of last 403/404-denied probe.
+    # Cached chats are skipped (no Graph call) until DENIED_REPROBE_HOURS pass,
+    # then re-probed once: still denied -> timestamp refreshed; accessible
+    # again -> removed from the cache and processed normally.
+    denied_cache = state.setdefault("teams", {}).setdefault("deniedChats", {})
+    now_utc = datetime.now(pytz.utc)
+    cache_skips = 0
     for chat in chats:
         # Skip chats with no activity since last sync
+        had_recent_activity = False  # confirmed new messages since lastSync
         last_preview = chat.get("lastMessagePreview") or {}
         last_ts = last_preview.get("createdDateTime", "")
         if last_ts:
@@ -743,20 +952,50 @@ def sync_teams(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = Fal
                 since_dt = datetime.fromisoformat(since_str.replace("Z", "+00:00"))
                 if last_dt < since_dt:
                     continue
+                had_recent_activity = True
             except (ValueError, TypeError):
                 pass  # If parsing fails, don't skip — process the chat
 
-        # Try server-side filter first; fall back to client-side if Graph rejects it
+        chat_label = ((chat.get("topic") or "").strip()
+                      or f"{chat.get('chatType', 'chat')}:{chat.get('id', '?')[:24]}")
+        chat_id = chat.get("id", "")
+
+        # Denied-cache check: skip the probe entirely if this chat 403/404'd
+        # within the re-probe window. The confirmed-recent-activity accounting
+        # stays intact — a cached-denied chat whose preview shows new messages
+        # still counts as inaccessible (we know the probe outcome without
+        # spending the Graph call).
+        denied_at = denied_cache.get(chat_id)
+        if denied_at:
+            try:
+                denied_dt = datetime.fromisoformat(denied_at)
+            except (ValueError, TypeError):
+                denied_dt = None  # unparseable — fall through to re-probe
+            if denied_dt and now_utc - denied_dt < timedelta(hours=DENIED_REPROBE_HOURS):
+                cache_skips += 1
+                if had_recent_activity:
+                    denied.append(chat_label)
+                    print(f"  Teams: no access to '{chat_label}' (denied-cache) "
+                          f"— recent messages missed", file=sys.stderr)
+                elif verbose:
+                    print(f"  Teams: skipping '{chat_label}' (denied-cache, "
+                          f"re-probe after {DENIED_REPROBE_HOURS}h)", file=sys.stderr)
+                continue
+            # Window expired — daily re-probe falls through to the fetch below.
+
+        # Try server-side filter first; fall back to client-side if Graph rejects it.
+        # Any per-chat error is accounted for — never silently swallowed — and one
+        # bad chat no longer aborts the rest of the Teams pass.
         try:
-            messages = list(_paginate(
-                f"{GRAPH}/users/{EMAIL_ADDRESS}/chats/{chat['id']}/messages",
-                token_getter,
-                {"$top": 50, "$filter": f"lastModifiedDateTime gt {since_str}"}
-            ))
-        except requests.HTTPError as e:
-            if e.response.status_code in (400, 501):
-                # Filter not supported on this chat type — fetch all, filter locally
-                try:
+            try:
+                messages = list(_paginate(
+                    f"{GRAPH}/users/{EMAIL_ADDRESS}/chats/{chat['id']}/messages",
+                    token_getter,
+                    {"$top": 50, "$filter": f"lastModifiedDateTime gt {since_str}"}
+                ))
+            except requests.HTTPError as e:
+                if e.response is not None and e.response.status_code in (400, 501):
+                    # Filter not supported on this chat type — fetch all, filter locally
                     all_msgs = list(_paginate(
                         f"{GRAPH}/users/{EMAIL_ADDRESS}/chats/{chat['id']}/messages",
                         token_getter, {"$top": 50}
@@ -764,15 +1003,42 @@ def sync_teams(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = Fal
                     _since_parsed = datetime.fromisoformat(since_str.replace("Z", "+00:00"))
                     messages = [m for m in all_msgs
                                 if _try_parse_iso(m.get("lastModifiedDateTime") or "") >= _since_parsed]
-                except requests.HTTPError as e2:
-                    if e2.response.status_code in (403, 404):
-                        continue
+                else:
                     raise
-            elif e.response.status_code in (403, 404):
-                # No access to this specific chat — skip silently
-                continue
+        except requests.HTTPError as e:
+            status_code = e.response.status_code if e.response is not None else "?"
+            if status_code in (403, 404):
+                # No access to this chat. Cache the denial so the next runs
+                # skip the probe until the re-probe window passes. Only count
+                # it when there was confirmed recent activity (= real messages
+                # missed); chats with no lastMessagePreview are chronic,
+                # not new data loss, so verbose-only.
+                denied_cache[chat_id] = now_utc.isoformat()
+                if had_recent_activity:
+                    denied.append(chat_label)
+                    print(f"  Teams: no access to '{chat_label}' "
+                          f"(HTTP {status_code}) — recent messages missed",
+                          file=sys.stderr)
+                elif verbose:
+                    print(f"  Teams: no access to '{chat_label}' (HTTP {status_code})",
+                          file=sys.stderr)
             else:
-                raise
+                failed.append((chat_label, f"HTTP {status_code}"))
+                print(f"  Teams: chat '{chat_label}' failed (HTTP {status_code}) — "
+                      f"will retry next sync", file=sys.stderr)
+            continue
+        except (requests.RequestException, json.JSONDecodeError) as e:
+            failed.append((chat_label, type(e).__name__))
+            print(f"  Teams: chat '{chat_label}' failed ({type(e).__name__}: {e}) — "
+                  f"will retry next sync", file=sys.stderr)
+            continue
+
+        # Probe succeeded — if this chat was in the denied cache, access has
+        # been restored; evict it so it goes back to normal per-run syncing.
+        if chat_id in denied_cache:
+            del denied_cache[chat_id]
+            print(f"  Teams: '{chat_label}' accessible again — removed from "
+                  f"denied-cache", file=sys.stderr)
 
         if not messages:
             continue
@@ -817,7 +1083,16 @@ def sync_teams(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = Fal
             daily_messages.setdefault(day_key, []).append(md)
             count += 1
 
-        # Write per-day-per-channel files for Haiku context indexing
+        # Write per-day-per-channel files for Haiku context indexing.
+        # WAVE-2 CLEANUP (2026-07-02): these per-day writes duplicate the
+        # per-conversation files above and were slated for removal, but a few
+        # downstream tools still key on the {chat}/YYYY-MM-DD.md layout (dates
+        # come from FILENAMES, so porting them is a rewrite, not a path swap):
+        #   tools/teams-unanswered/teams-unanswered  (scheduled weekdays)
+        #   tools/ambient-poll/ambient-poll          (scheduled every 30 min)
+        # Port those to data/o365/teams/{named,oneOnOne,group}/ (per-message
+        # `date:` frontmatter) first, THEN delete this block. Never delete the
+        # existing teams-daily files on disk -- they're archive.
         if daily_messages:
             # Create channel subfolder using same name as conversation file
             channel_name = conv_path.stem  # e.g., "Dev Daily Update"
@@ -829,15 +1104,51 @@ def sync_teams(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = Fal
                 if day_path.exists():
                     existing = day_path.read_text(encoding="utf-8")
                     # Only append messages not already in the file
+                    # md already embeds the hashed id; hashing it again made
+                    # this membership test never match (duplicate appends).
                     new_msgs = [m for m in day_msgs
-                                if _id_hash(m.split("idhash: ")[1].split("\n")[0]) not in existing]
+                                if m.split("idhash: ")[1].split("\n")[0] not in existing]
                     if new_msgs:
                         _append_md(day_path, "\n\n".join(new_msgs))
                 else:
                     _atomic_write(day_path, day_content + "\n")
 
-    state.setdefault("teams", {})["lastSync"] = datetime.now(pytz.utc).isoformat()
-    print(f"  Teams: {count} new messages", file=sys.stderr)
+    # Prune denied-cache entries for chats that no longer appear in the chat
+    # list at all (deleted chats) so the cache can't grow without bound.
+    seen_ids = {c.get("id", "") for c in chats}
+    for stale_id in [cid for cid in denied_cache if cid not in seen_ids]:
+        del denied_cache[stale_id]
+
+    if cache_skips:
+        print(f"  Teams: denied-cache hits: {cache_skips} probes skipped "
+              f"({len(denied_cache)} chats cached, re-probe every "
+              f"{DENIED_REPROBE_HOURS}h)", file=sys.stderr)
+
+    # Only advance lastSync when no chat hit a transient error — holding it back
+    # makes the failed chats' messages land in the next run's window (idhash
+    # dedup prevents duplicate writes for the chats that did succeed).
+    if failed:
+        print(f"  Teams: holding lastSync at {since_str} so {len(failed)} "
+              f"failed chat(s) are retried next run", file=sys.stderr)
+    else:
+        state.setdefault("teams", {})["lastSync"] = datetime.now(pytz.utc).isoformat()
+
+    # Partial-status summary line — the events-channel filter and the
+    # orchestrator key on this output, so error counts must be visible here.
+    summary = f"Teams: {count} new messages"
+    if failed:
+        summary += f", {len(failed)} chats failed"
+    if denied:
+        summary += f", {len(denied)} chats inaccessible (403/404)"
+    if cache_skips:
+        summary += f", {cache_skips} denied-cache skips"
+    print(f"  {summary}", file=sys.stderr)
+
+    if failed:
+        detail = "; ".join(f"{label} ({err})" for label, err in failed[:5])
+        if len(failed) > 5:
+            detail += f" (+{len(failed) - 5} more)"
+        SYNC_ERRORS.append(f"teams: {len(failed)} chats failed — {detail}")
     return count
 
 
@@ -931,7 +1242,9 @@ def sync_onedrive(state, since_days=DEFAULT_SINCE, verbose=False):
 def cmd_sync(args):
     with SyncLock():
         state   = _load_state()
-        sources = (["mail", "calendar", "teams", "sharepoint"]
+        # Teams last: its export APIs are metered and can throttle for hours
+        # after heavy use -- it must never starve the sources behind it.
+        sources = (["mail", "calendar", "sharepoint", "teams"]
                    if args.source == "all" else [args.source])
 
         if args.reset:
@@ -948,9 +1261,19 @@ def cmd_sync(args):
                 total += fns[source](state, since_days=args.since, verbose=args.verbose)
             except Exception as e:
                 print(f"  {source} sync failed: {e}", file=sys.stderr)
+                SYNC_ERRORS.append(f"{source}: {e}")
                 if args.verbose:
                     import traceback; traceback.print_exc()
             _save_state(state)
+        if SYNC_ERRORS:
+            # Partial failure: make it visible in the summary line AND the exit
+            # code, so Plombery marks the run "error" and the events-channel
+            # filter delivers it instead of dropping a fake-ok no-op.
+            print(f"Sync complete — {total} total items, "
+                  f"{len(SYNC_ERRORS)} error(s):", file=sys.stderr)
+            for err in SYNC_ERRORS:
+                print(f"  ! {err}", file=sys.stderr)
+            sys.exit(2)
         print(f"Sync complete — {total} total items.", file=sys.stderr)
 
 
@@ -969,7 +1292,16 @@ def cmd_mail(args):
     if filters:  params["$filter"] = " and ".join(filters)
     if args.max: params["$top"] = args.max
 
-    emails = list(_paginate(f"{GRAPH}/users/{EMAIL_ADDRESS}/messages", token_getter, params))
+    # Cap at --max. _paginate follows @odata.nextLink until the *entire* mailbox
+    # is exhausted; $top only sets the page size, not a stop condition. Without
+    # this islice, `mail --max 30` paged the whole mailbox (hundreds of sequential
+    # Graph calls, each pulling full HTML bodies), routinely blowing past a
+    # downstream tool's 300s subprocess timeout. islice stops pulling pages
+    # from the lazy generator once the cap is hit, so we fetch only the first
+    # page and never follow nextLink. (Sync path is unaffected -- it doesn't use
+    # cmd_mail.)
+    page = _paginate(f"{GRAPH}/users/{EMAIL_ADDRESS}/messages", token_getter, params)
+    emails = list(itertools.islice(page, args.max)) if args.max else list(page)
     if args.json: print(json.dumps(emails, indent=2)); return
     for e in emails:
         sender = e.get("from", {}).get("emailAddress", {})
@@ -1024,8 +1356,11 @@ def cmd_calendar(args):
     params = {"startDateTime": start.isoformat(), "endDateTime": end.isoformat(),
               "$select": "subject,start,end,isAllDay,location,organizer,isCancelled",
               "$orderby": "start/dateTime"}
+    cal_headers = {
+        "Prefer": f'odata.maxpagesize=50,outlook.timezone="{TZ}"'
+    }
     events = [e for e in _paginate(f"{GRAPH}/users/{EMAIL_ADDRESS}/calendar/calendarView",
-                                   token_getter, params)
+                                   token_getter, params, extra_headers=cal_headers)
               if not e.get("isCancelled")]
     if args.json: print(json.dumps(events, indent=2)); return
     for e in events:

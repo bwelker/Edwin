@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+"""
+Edwin Smart Scheduler — time-aware connector orchestration
+
+Runs every 15 minutes via LaunchAgent. Checks what's due based on
+last sync times and time-of-day rules, then runs connectors.
+
+Usage:
+    connectors/scheduler/scheduler              # normal run — check due, sync
+    connectors/scheduler/scheduler --dry-run    # print what would run
+    connectors/scheduler/scheduler --status     # show schedule + last sync times
+    connectors/scheduler/scheduler --force-all  # run everything
+"""
+
+import subprocess
+import sys
+import os
+import json
+import fcntl
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import pytz
+
+
+# -- Config --------------------------------------------------------------------
+
+SCRIPT_DIR  = Path(__file__).resolve().parent
+EDWIN_HOME  = Path(os.environ.get("EDWIN_HOME", SCRIPT_DIR.parent.parent))
+CONNECTORS_DIR = EDWIN_HOME / "connectors"
+DATA_DIR    = EDWIN_HOME / "data"
+LOG_DIR     = EDWIN_HOME / "logs"
+LOCK_FILE   = Path("/tmp/edwin-scheduler.lock")
+STATE_FILE  = DATA_DIR / ".scheduler-state.json"
+PYTHON      = os.environ.get("EDWIN_PYTHON3", "/opt/homebrew/bin/python3")
+ET          = pytz.timezone("US/Eastern")
+WORK_START  = 6    # 6:00 AM ET
+WORK_END    = 20.5 # 8:30 PM ET (20:30)
+WORK_DAYS   = range(0, 5)  # Mon=0 through Fri=4
+MAX_LOG_FILES = 50
+CONNECTOR_TIMEOUT = 7200  # 2 hours per connector
+
+# Schedule: each connector has a path (relative to connectors/), args for sync,
+# and either work/off intervals (minutes) or a daily hour (ET).
+# work: interval during work hours. None = skip during work hours.
+# off:  interval during off hours. None = skip during off hours.
+# daily: hour (ET) to run once per day. Overrides work/off.
+SCHEDULE = {
+    "o365":       {"path": "o365/o365",             "args": ["sync", "all"], "work": 15,   "off": 60},
+    "google":     {"path": "google/google",         "args": ["sync", "all"], "work": 30,   "off": 120},
+    "imessage":   {"path": "imessage/imessage",     "args": ["sync", "all"], "work": 60,   "off": 120},
+    "limitless":  {"path": "limitless/limitless",   "args": ["sync", "all"], "work": 60,   "off": 60},
+    "browser":    {"path": "browser/browser",       "args": ["sync", "all"], "work": 120,  "off": 120},
+    "notes":      {"path": "notes/notes",           "args": ["sync", "all"], "work": 120,  "off": 120},
+    "sessions":   {"path": "sessions/sessions",     "args": ["sync"],        "work": 120,  "off": 120},
+    "atlassian":  {"path": "atlassian/atlassian",   "args": ["sync", "all"], "work": 120,  "off": 480, "background": True},
+    "fireflies":  {"path": "fireflies/fireflies",   "args": ["sync", "all"], "daily": 21},
+    "screentime": {"path": "screentime/screentime", "args": ["sync", "all"], "daily": 21},
+    "calls":      {"path": "calls/calls",           "args": ["sync", "all"], "daily": 21},
+    "photos":     {"path": "photos/photos",         "args": ["sync", "all"], "daily": 21},
+    "documents":  {"path": "documents/documents",   "args": ["sync", "all"], "daily": 21},
+    "plaud":      {"path": "plaud/plaud",             "args": ["sync", "all"], "work": 120,  "off": 120},
+    "indexer":    {"path": "../tools/indexer/indexer", "args": ["sync"],        "work": 60,   "off": 240, "python": os.environ.get("EDWIN_PYTHON312", "/opt/homebrew/bin/python3.12")},
+    "librarian":  {"path": "../tools/librarian/librarian", "args": ["full"],     "daily": 6},
+    "session-watcher": {"path": "../tools/session-watcher/capture", "args": [],  "work": 15, "off": 30},
+}
+
+
+# -- Lock ----------------------------------------------------------------------
+
+class SchedulerLock:
+    """Prevent overlapping scheduler runs."""
+    def __init__(self):
+        self._f = None
+
+    def __enter__(self):
+        self._f = open(LOCK_FILE, "w")
+        try:
+            fcntl.flock(self._f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Another scheduler run in progress — exiting.", file=sys.stderr)
+            sys.exit(0)
+        self._f.write(str(os.getpid()))
+        self._f.flush()
+        return self
+
+    def __exit__(self, *_):
+        if self._f:
+            fcntl.flock(self._f, fcntl.LOCK_UN)
+            self._f.close()
+
+
+# -- Time helpers --------------------------------------------------------------
+
+PIPELINE_WINDOW_START = 4    # 4:00 AM ET
+PIPELINE_WINDOW_END   = 6    # 6:00 AM ET
+
+
+def _is_pipeline_window(now_et):
+    """Check if current ET time is in the pipeline window (4-6 AM).
+    During this window, the scheduler pauses to let the final connector
+    sync and indexer LaunchAgents run without contention."""
+    hour_frac = now_et.hour + now_et.minute / 60.0
+    return PIPELINE_WINDOW_START <= hour_frac < PIPELINE_WINDOW_END
+
+
+def _is_work_hours(now_et):
+    """Check if current ET time is within work hours (Mon-Fri 6AM-8:30PM)."""
+    if now_et.weekday() not in WORK_DAYS:
+        return False
+    hour_frac = now_et.hour + now_et.minute / 60.0
+    return WORK_START <= hour_frac < WORK_END
+
+
+# -- State helpers -------------------------------------------------------------
+
+def _collect_last_sync(obj, timestamps):
+    """Recursively collect all lastSync timestamps from a state dict."""
+    if isinstance(obj, dict):
+        for key, val in obj.items():
+            if key == "lastSync" and isinstance(val, str) and val:
+                try:
+                    ts = datetime.fromisoformat(val)
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    timestamps.append(ts)
+                except ValueError:
+                    pass
+            # Google uses top-level keys like mail_last_sync, calendar_last_sync
+            elif key.endswith("_last_sync") and isinstance(val, str) and val:
+                try:
+                    ts = datetime.fromisoformat(val)
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    timestamps.append(ts)
+                except ValueError:
+                    pass
+            elif isinstance(val, (dict, list)):
+                _collect_last_sync(val, timestamps)
+    elif isinstance(obj, list):
+        for item in obj:
+            _collect_last_sync(item, timestamps)
+
+
+def _get_last_sync(name):
+    """Get the most recent lastSync time for a connector. Returns datetime or None."""
+    # Sessions state is under data/sessions/, not data/sessions-claude-code/
+    if name == "sessions":
+        state_path = DATA_DIR / "sessions" / ".sync-state.json"
+    # Indexer stores state in tools/indexer/.index-state.json with "last_run" key
+    elif name == "indexer":
+        state_path = EDWIN_HOME / "tools" / "indexer" / ".index-state.json"
+        if not state_path.exists():
+            return None
+        try:
+            state = json.loads(state_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+        last_run = state.get("last_run")
+        if last_run:
+            try:
+                ts = datetime.fromisoformat(last_run)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                return ts
+            except ValueError:
+                return None
+        return None
+    # Librarian uses scheduler-state tracking (daily), no separate state file
+    elif name == "librarian":
+        return None  # daily jobs use scheduler_state, not _get_last_sync
+    else:
+        state_path = DATA_DIR / name / ".sync-state.json"
+
+    if not state_path.exists():
+        return None
+    try:
+        state = json.loads(state_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    timestamps = []
+    _collect_last_sync(state, timestamps)
+    return max(timestamps) if timestamps else None
+
+
+def _load_scheduler_state():
+    """Load the scheduler's own state (daily run tracking)."""
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {"daily_runs": {}}
+
+
+def _save_scheduler_state(state):
+    """Save the scheduler's own state."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+# -- Due check ----------------------------------------------------------------
+
+def _is_due(name, config, now_utc, now_et, sched_state, force=False):
+    """Check if a connector is due to run. Returns (due: bool, reason: str)."""
+    if force:
+        return True, "forced"
+
+    # Daily jobs
+    if "daily" in config:
+        daily_hour = config["daily"]
+        today_str = now_et.strftime("%Y-%m-%d")
+        last_run = sched_state.get("daily_runs", {}).get(name)
+
+        if last_run == today_str:
+            return False, f"daily already ran today ({today_str})"
+
+        if now_et.hour >= daily_hour:
+            return True, f"daily due (hour {now_et.hour} >= {daily_hour})"
+        else:
+            return False, f"daily not yet (hour {now_et.hour} < {daily_hour})"
+
+    # Interval jobs
+    work = _is_work_hours(now_et)
+    interval = config.get("work") if work else config.get("off")
+
+    if interval is None:
+        period = "work hours" if work else "off hours"
+        return False, f"not scheduled during {period}"
+
+    last = _get_last_sync(name)
+    if last is None:
+        return True, "never synced"
+
+    elapsed = (now_utc - last).total_seconds() / 60.0
+    if elapsed >= interval:
+        return True, f"due ({elapsed:.0f}m elapsed >= {interval}m interval)"
+    else:
+        remaining = interval - elapsed
+        return False, f"not due ({remaining:.0f}m remaining)"
+
+
+# -- Connector runner ----------------------------------------------------------
+
+def _run_connector(name, cmd, log_file):
+    """Run a connector, capturing output to log file. Returns (success, duration)."""
+    start = datetime.now(timezone.utc)
+    log_file.write(f"\n{'='*60}\n")
+    log_file.write(f"[{start.isoformat()}] Starting {name}\n")
+    log_file.write(f"  Command: {' '.join(cmd)}\n")
+    log_file.write(f"{'='*60}\n")
+    log_file.flush()
+
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=CONNECTOR_TIMEOUT,
+        )
+        log_file.write(result.stdout)
+        elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+        status = "OK" if result.returncode == 0 else f"FAILED (exit {result.returncode})"
+        log_file.write(f"\n[{name}] {status} in {elapsed:.1f}s\n")
+        # On failure, extract last few lines of output for the stderr summary
+        if result.returncode != 0 and result.stdout:
+            last_lines = result.stdout.strip().split('\n')[-3:]
+            err_preview = ' | '.join(l.strip() for l in last_lines if l.strip())
+            log_file.write(f"  Error preview: {err_preview[:200]}\n")
+        log_file.flush()
+        return result.returncode == 0, elapsed
+    except subprocess.TimeoutExpired:
+        elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+        log_file.write(f"\n[{name}] TIMEOUT after {elapsed:.1f}s\n")
+        log_file.flush()
+        return False, elapsed
+    except FileNotFoundError:
+        log_file.write(f"\n[{name}] SKIPPED — connector not found: {cmd[0]}\n")
+        log_file.flush()
+        return False, 0
+
+
+def _rotate_logs():
+    """Remove old log files beyond MAX_LOG_FILES."""
+    if not LOG_DIR.exists():
+        return
+    logs = sorted(LOG_DIR.glob("scheduler-2*.log"), reverse=True)
+    for old in logs[MAX_LOG_FILES:]:
+        old.unlink()
+
+
+# -- Commands ------------------------------------------------------------------
+
+def cmd_status():
+    """Show schedule config, last sync times, and next due info."""
+    now_utc = datetime.now(timezone.utc)
+    now_et = now_utc.astimezone(ET)
+    sched_state = _load_scheduler_state()
+    work = _is_work_hours(now_et)
+
+    print(f"Edwin Scheduler Status — {now_et.strftime('%Y-%m-%d %H:%M ET')}")
+    print(f"Work hours: {'YES' if work else 'NO'} (Mon-Fri {WORK_START}:00-{int(WORK_END)}:30 ET)")
+    print(f"{'='*70}")
+    print(f"{'Connector':13s} {'Interval':10s} {'Last Sync':22s} {'Status'}")
+    print(f"{'-'*13} {'-'*10} {'-'*22} {'-'*25}")
+
+    for name, config in SCHEDULE.items():
+        # Determine display interval
+        if "daily" in config:
+            interval_str = f"daily@{config['daily']}"
+        elif work:
+            interval_str = f"{config.get('work', '—')}m" if config.get("work") else "skip"
+        else:
+            interval_str = f"{config.get('off', '—')}m" if config.get("off") else "skip"
+
+        # Last sync
+        last = _get_last_sync(name)
+        if last:
+            last_et = last.astimezone(ET)
+            last_str = last_et.strftime("%Y-%m-%d %H:%M ET")
+        else:
+            last_str = "(never)"
+
+        # Due check
+        due, reason = _is_due(name, config, now_utc, now_et, sched_state)
+        status = f"DUE — {reason}" if due else reason
+
+        print(f"{name:13s} {interval_str:10s} {last_str:22s} {status}")
+
+    print()
+
+
+def cmd_run(dry_run=False, force_all=False):
+    """Main scheduler run — check what's due and sync."""
+    now_utc = datetime.now(timezone.utc)
+    now_et = now_utc.astimezone(ET)
+
+    # Pipeline window: 4-6 AM ET. Pause to let final sync + indexer LaunchAgents
+    # run without contention. Skip unless forced.
+    if _is_pipeline_window(now_et) and not force_all:
+        print(f"[{now_et.strftime('%H:%M ET')}] Pipeline window (4-6 AM) — paused.", file=sys.stderr)
+        return 0
+
+    sched_state = _load_scheduler_state()
+
+    # Determine what's due
+    due_list = []
+    for name, config in SCHEDULE.items():
+        due, reason = _is_due(name, config, now_utc, now_et, sched_state, force=force_all)
+        if due:
+            due_list.append((name, config, reason))
+
+    if not due_list:
+        print(f"[{now_et.strftime('%H:%M ET')}] Nothing due.", file=sys.stderr)
+        return 0
+
+    names = [n for n, _, _ in due_list]
+    print(f"[{now_et.strftime('%H:%M ET')}] Due: {', '.join(names)}", file=sys.stderr)
+
+    if dry_run:
+        for name, config, reason in due_list:
+            print(f"  {name}: {reason}", file=sys.stderr)
+        print("(dry run — nothing executed)", file=sys.stderr)
+        return 0
+
+    # Set up logging
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _rotate_logs()
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_path = LOG_DIR / f"scheduler-{timestamp}.log"
+
+    results = {}
+
+    with open(log_path, "w") as log_file:
+        log_file.write(f"Edwin scheduler run at {now_utc.isoformat()}\n")
+        log_file.write(f"Work hours: {_is_work_hours(now_et)}\n")
+        log_file.write(f"Due connectors: {', '.join(names)}\n")
+
+        for name, config, reason in due_list:
+            connector_path = CONNECTORS_DIR / config["path"]
+            python = config.get("python", PYTHON)
+            cmd = [python, str(connector_path)] + config["args"]
+
+            # Background connectors: launch detached, don't block
+            if config.get("background"):
+                bg_log_path = LOG_DIR / f"bg-{name}-{timestamp}.log"
+                log_file.write(f"\n--- {name}: {reason} (BACKGROUND) ---\n")
+                log_file.write(f"  Command: {' '.join(cmd)}\n")
+                log_file.write(f"  Log: {bg_log_path}\n")
+                try:
+                    bg_log = open(bg_log_path, "w")
+                    subprocess.Popen(
+                        cmd,
+                        stdout=bg_log,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                    results[name] = True
+                    print(f"  {name}: LAUNCHED (background)", file=sys.stderr)
+                except Exception as e:
+                    log_file.write(f"  FAILED to launch: {e}\n")
+                    results[name] = False
+                    print(f"  {name}: FAILED to launch ({e})", file=sys.stderr)
+                continue
+
+            log_file.write(f"\n--- {name}: {reason} ---\n")
+            ok, dur = _run_connector(name, cmd, log_file)
+            results[name] = ok
+
+            # Mark daily runs as attempted (even on failure -- daily means once/day,
+            # not retry-until-success). Failures are logged for review.
+            if "daily" in config:
+                today_str = now_et.strftime("%Y-%m-%d")
+                sched_state.setdefault("daily_runs", {})[name] = today_str
+                _save_scheduler_state(sched_state)
+
+            status_str = 'OK' if ok else 'FAILED'
+            print(f"  {name}: {status_str} ({dur:.1f}s)", file=sys.stderr)
+
+        log_file.write(f"\nScheduler run finished at {datetime.now(timezone.utc).isoformat()}\n")
+
+    successes = sum(1 for v in results.values() if v)
+    total = len(results)
+
+    if successes == total:
+        return 0
+    elif successes > 0:
+        return 1
+    else:
+        return 2
+
+
+# -- CLI -----------------------------------------------------------------------
+
+def main():
+    args = sys.argv[1:]
+
+    if "--status" in args:
+        cmd_status()
+        return
+
+    dry_run = "--dry-run" in args
+    force_all = "--force-all" in args
+
+    with SchedulerLock():
+        sys.exit(cmd_run(dry_run=dry_run, force_all=force_all))
+
+
+if __name__ == "__main__":
+    main()

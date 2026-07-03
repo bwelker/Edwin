@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.edwin.usage-check</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__EDWIN_HOME__/tools/usage-check/usage-check</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>7200</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>WorkingDirectory</key>
+    <string>__EDWIN_HOME__/tools/usage-check</string>
+    <key>StandardOutPath</key>
+    <string>__EDWIN_HOME__/logs/usage-check/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>__EDWIN_HOME__/logs/usage-check/stderr.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

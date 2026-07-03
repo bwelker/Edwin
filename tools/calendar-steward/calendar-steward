@@ -1,0 +1,695 @@
+#!/usr/bin/env python3
+"""
+Calendar Steward -- the analysis layer over the principal's calendar.
+
+The principal manages their own calendar. Hard rules this tool exists UNDER, not around:
+  - CLAUDE.md Level 3: "Accept/decline calendar invites on the principal's behalf"
+    is ALWAYS ASK. This tool never touches an invite. Read-only, zero writes
+    to any calendar system, nothing outbound.
+  - CLAUDE.md behavioral rule 7: "Meeting reminders: mention once, then never
+    again." This tool is not a reminder engine. It audits structure
+    (conflicts, prep gaps, load, meeting-worthiness) and leaves attendance
+    entirely to the principal.
+
+What it does own: the analysis. Conflicts detected before they bite, prep-time
+gaps flagged, per-day load and maker-time fragmentation measured, and
+conservative advisory notes on meetings that may not need the principal at all
+(skip / delegate-to-X / shorten / keep). The principal acts on all of it themselves.
+
+Usage:
+    calendar-steward audit                # next 5 business days -> Calendar Audit doc
+    calendar-steward audit --days 10      # wider window
+    calendar-steward audit --no-publish   # skip obsidian-publish (testing)
+    calendar-steward status               # one-liner for embedding
+
+Data sources (read-only):
+    data/o365/calendar/YYYY-MM/YYYY-MM-DD.md    work calendar (may lag)
+    data/google/calendar/YYYY-MM/YYYY-MM-DD.md  9 calendars: work mirror
+                                                ("Calendar") + personal/family
+    Per the 7/01 reconciliation rule, the google mirror is STATUS TRUTH for
+    work events: a "Canceled:" entry there marks the o365 event dead.
+
+Output: briefing-book/docs/2. \U0001f4c5 Calendar/Calendar Audit -- YYYY-MM-DD.md
+Consumed by skills/daily-agenda (surfaces CONFLICTS + PREP GAPS up top).
+
+Scheduled: Plombery `sys-calendar-steward`, weekdays 6:00 AM (t63) -- before
+daily-agenda at 6:05 so the audit is on disk when the agenda reads it.
+"""
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from datetime import date, datetime, time, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+TOOL_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = TOOL_DIR.parent.parent
+O365_DIR = PROJECT_DIR / "data" / "o365" / "calendar"
+GOOGLE_DIR = PROJECT_DIR / "data" / "google" / "calendar"
+CALENDAR_DOCS = PROJECT_DIR / "briefing-book" / "docs" / "2. \U0001f4c5 Calendar"
+PUBLISH_SCRIPT = PROJECT_DIR / "briefing-book" / "scripts" / "obsidian-publish"
+
+ET = ZoneInfo("America/New_York")
+UTC = ZoneInfo("UTC")
+
+PRINCIPAL_EMAIL = os.environ.get("PRINCIPAL_EMAIL", "").lower()
+WORK_DOMAIN = os.environ.get("WORK_DOMAIN", "example.com")
+
+# =============================================================================
+# CONFIG -- every heuristic and every exclusion lives here, nowhere else.
+# =============================================================================
+
+# Google calendars that mirror the o365 work calendar (dedup targets +
+# cancellation status truth). Everything else in google is personal/family.
+WORK_MIRROR_CALENDARS = {"Calendar"}
+
+# Work-hours boundary (CLAUDE.md: 6 AM - 8:30 PM ET, strict).
+DAY_START = time(6, 0)
+DAY_END = time(20, 30)
+
+# Maker-time window for the fragmentation score: free blocks >= 45 min
+# between these hours count as usable deep-work blocks.
+CORE_START = time(8, 0)
+CORE_END = time(18, 0)
+MAKER_BLOCK_MIN = 45
+
+# LOAD: flag days with more than this many meeting-hours.
+HEAVY_DAY_HOURS = 5.0
+
+# PREP GAPS: a prep-worthy meeting with fewer than this many free minutes in
+# the prior 60 gets flagged as back-to-back.
+PREP_MIN_FREE_MINUTES = 15
+
+# Titles that mark a meeting as a decision forum (plausibly needs prep even
+# with no external attendees). Substring match on the normalized title.
+DECISION_FORUM_PATTERNS = [
+    "priorities",
+    "board",
+    "leadership sync",
+    "1:1",
+    "code freeze",
+]
+
+# WORTHINESS -- hard exclusions. Meetings matching these are NEVER given a
+# skip/delegate/shorten recommendation, full stop. Family-calendar events are
+# excluded wholesale (worthiness only ever looks at work events).
+NEVER_RECOMMEND_PATTERNS = [
+    "priorities",
+    "board",
+    "ceo",                 # covers any exec/CEO 1:1 or standing sync
+]
+# Meetings organized by these people are also never questioned (e.g. the CEO's
+# meetings are not the assistant's to audit). Set CEO_EMAIL to populate.
+NEVER_RECOMMEND_ORGANIZERS = {e for e in [os.environ.get("CEO_EMAIL", "").lower()] if e}
+
+# WORTHINESS -- delegate map. If the principal ORGANIZES a recurring meeting
+# whose title lands in someone else's lane, name the delegate. Advisory only.
+# Replace the roles with real names to fit your own org.
+DELEGATE_RULES = [
+    (r"sprint|stand[- ]?up|backlog|grooming|retro\b|qa\b|dev daily|code freeze",
+     "the engineering lead", "sprint/dev/QA operations are their lane"),
+    (r"\binfra(structure)?\b|\baws\b|\brelease\b|\bsre\b|\bsupport\b|\bcab\b|\bcmgt\b|deployment",
+     "the ops lead", "ops/infra/release management is their lane"),
+]
+
+# WORTHINESS -- large forums. The day-file format carries no required/optional
+# flag, so "principal optional-listed" is not detectable; the conservative
+# proxy is a big meeting the principal neither organizes nor obviously anchors.
+LARGE_FORUM_MIN_ATTENDEES = 8
+
+# WORTHINESS -- zombie recurrences: recurring meetings cancelled >= 2 of the
+# last 4 instances (google mirror is the cancellation record). Lookback for
+# recurrence + zombie history, in days:
+HISTORY_LOOKBACK_DAYS = 42
+RECURRING_MIN_DATES = 3   # same title on >= 3 distinct dates = recurring
+ZOMBIE_WINDOW = 4         # look at the last 4 instances...
+ZOMBIE_MIN_CANCELLED = 2  # ...>= 2 cancelled = zombie
+
+# An event >= this long is treated as all-day (context, not a meeting).
+ALL_DAY_MIN_HOURS = 20
+
+# =============================================================================
+
+
+@dataclass
+class Event:
+    title: str
+    title_norm: str
+    start: datetime            # naive, ET
+    end: datetime              # naive, ET
+    all_day: bool
+    source: str                # o365 | google-work | google-personal
+    calendar: str              # o365 | google calendar display name
+    organizer: str = ""        # email where known
+    organizer_name: str = ""
+    attendees: list = field(default_factory=list)
+    cancelled: bool = False
+
+    @property
+    def day(self) -> date:
+        return self.start.date()
+
+    def slot(self) -> str:
+        if self.all_day:
+            return "all day"
+        return f"{self.start:%H:%M}-{self.end:%H:%M}"
+
+    def label(self) -> str:
+        cal = "" if self.source != "google-personal" else f" [{self.calendar}]"
+        return f"{self.title}{cal}"
+
+
+def norm_title(title: str) -> str:
+    t = re.sub(r"^cancell?ed:\s*", "", title.strip(), flags=re.I)
+    return re.sub(r"\s+", " ", t).lower()
+
+
+def is_cancelled_title(title: str) -> bool:
+    return bool(re.match(r"^cancell?ed:\s*", title.strip(), flags=re.I))
+
+
+# -- Parsing -----------------------------------------------------------------------
+
+
+def parse_dt(value: str) -> tuple:
+    """Return (naive ET datetime, is_date_only). Handles 'YYYY-MM-DD HH:MM',
+    date-only, and ISO-8601 with Z/offset (converted to ET)."""
+    value = value.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return datetime.strptime(value, "%Y-%m-%d"), True
+    if "T" in value:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(ET).replace(tzinfo=None)
+        return dt, False
+    return datetime.strptime(value, "%Y-%m-%d %H:%M"), False
+
+
+def day_file(base: Path, d: date) -> Path:
+    return base / f"{d:%Y-%m}" / f"{d:%Y-%m-%d}.md"
+
+
+def split_blocks(text: str) -> list:
+    return re.split(r"^---\s*$", text, flags=re.M)
+
+
+def kv_lines(chunk: str) -> dict:
+    out = {}
+    for line in chunk.splitlines():
+        m = re.match(r"^([a-z_]+):\s*(.*)$", line.strip())
+        if m:
+            out[m.group(1)] = m.group(2).strip()
+    return out
+
+
+def parse_o365_day(d: date) -> list:
+    md_file = day_file(O365_DIR, d)
+    if not md_file.exists():
+        return []
+    chunks = split_blocks(md_file.read_text(encoding="utf-8", errors="replace"))
+    events, pending = [], None
+    for chunk in chunks:
+        kv = kv_lines(chunk)
+        if kv.get("source") == "o365-calendar" and "start" in kv:
+            pending = kv
+            continue
+        if pending is not None:
+            ev = build_o365_event(pending, chunk)
+            if ev:
+                events.append(ev)
+            pending = None
+    if pending is not None:
+        ev = build_o365_event(pending, "")
+        if ev:
+            events.append(ev)
+    return events
+
+
+def build_o365_event(kv: dict, body: str):
+    try:
+        start, s_dateonly = parse_dt(kv["start"])
+        end, _ = parse_dt(kv.get("end", kv["start"]))
+    except (KeyError, ValueError):
+        return None
+    title = kv.get("subject", "(untitled)")
+    attendees, organizer_name = [], ""
+    m = re.search(r"\*\*Attendees:\*\*\s*(.+)", body)
+    if m:
+        attendees = [a.strip() for a in m.group(1).split(",") if a.strip()]
+    m = re.search(r"\*\*Organizer:\*\*\s*(.+)", body)
+    if m:
+        organizer_name = m.group(1).strip()
+    all_day = s_dateonly or (end - start) >= timedelta(hours=ALL_DAY_MIN_HOURS)
+    return Event(
+        title=re.sub(r"^cancell?ed:\s*", "", title, flags=re.I),
+        title_norm=norm_title(title),
+        start=start, end=end, all_day=all_day,
+        source="o365", calendar="o365",
+        organizer=kv.get("organizer", "").lower(),
+        organizer_name=organizer_name,
+        attendees=attendees,
+        cancelled=is_cancelled_title(title),
+    )
+
+
+def parse_google_day(d: date) -> list:
+    md_file = day_file(GOOGLE_DIR, d)
+    if not md_file.exists():
+        return []
+    events = []
+    for chunk in split_blocks(md_file.read_text(encoding="utf-8", errors="replace")):
+        m = re.search(r"^##\s+(.+)$", chunk, flags=re.M)
+        kv = kv_lines(chunk)
+        if not m or "idhash" not in kv or "start" not in kv:
+            continue
+        title = m.group(1).strip()
+        try:
+            start, s_dateonly = parse_dt(kv["start"])
+            end, e_dateonly = parse_dt(kv.get("end", kv["start"]))
+        except ValueError:
+            continue
+        all_day = s_dateonly or (end - start) >= timedelta(hours=ALL_DAY_MIN_HOURS)
+        cal = kv.get("calendar", "")
+        events.append(Event(
+            title=re.sub(r"^cancell?ed:\s*", "", title, flags=re.I),
+            title_norm=norm_title(title),
+            start=start, end=end, all_day=all_day,
+            source="google-work" if cal in WORK_MIRROR_CALENDARS else "google-personal",
+            calendar=cal,
+            organizer=kv.get("organizer", "").lower(),
+            cancelled=is_cancelled_title(title),
+        ))
+    return events
+
+
+# -- Merge + dedup -----------------------------------------------------------------
+
+
+def merge_day(d: date) -> list:
+    """One merged event list for the day. Identity across mirrors =
+    (normalized title, start minute in ET). o365 record wins as canonical
+    (it carries attendees/organizer email); the google work mirror
+    contributes existence + cancellation status (7/01 rule: status truth).
+    A slot counts as cancelled only when the mirror has a Canceled: entry
+    and NO active entry for it (rescheduled series leave both)."""
+    o365 = parse_o365_day(d)
+    google = parse_google_day(d)
+
+    merged = {}
+    for ev in o365:  # also collapses o365-internal duplicates (recurring master vs instance)
+        ident = (ev.title_norm, ev.start.strftime("%Y-%m-%d %H:%M"))
+        if ident not in merged:
+            merged[ident] = ev
+
+    mirror_active, mirror_cancelled = set(), set()
+    for ev in google:
+        if ev.source != "google-work":
+            continue
+        ident = (ev.title_norm, ev.start.strftime("%Y-%m-%d %H:%M"))
+        if ev.cancelled:
+            mirror_cancelled.add(ident)
+        else:
+            mirror_active.add(ident)
+            if ident not in merged:      # mirror has it, stale o365 doesn't
+                merged[ident] = ev
+
+    for ident in mirror_cancelled - mirror_active:  # status truth: cancelled
+        if ident in merged:
+            merged[ident].cancelled = True
+
+    out = [ev for ev in merged.values() if not ev.cancelled]
+    for ev in google:                  # personal/family calendars, as-is
+        if ev.source == "google-personal" and not ev.cancelled:
+            out.append(ev)
+    return sorted(out, ident=lambda e: (e.all_day, e.start))
+
+
+def is_work(ev: Event) -> bool:
+    return ev.source in ("o365", "google-work")
+
+
+def timed(events: list) -> list:
+    return [e for e in events if not e.all_day]
+
+
+# -- History (recurrence + zombie detection) ----------------------------------------
+
+
+def load_history(today: date) -> dict:
+    """title_norm -> {date: 'active'|'cancelled'} over the lookback window,
+    google work mirror only (it is the cancellation record)."""
+    hist = {}
+    for i in range(1, HISTORY_LOOKBACK_DAYS + 1):
+        d = today - timedelta(days=i)
+        for ev in parse_google_day(d):
+            if ev.source != "google-work":
+                continue
+            days = hist.setdefault(ev.title_norm, {})
+            prev = days.get(d)
+            # an active entry outranks a cancelled one on the same date
+            if ev.cancelled and prev is None:
+                days[d] = "cancelled"
+            elif not ev.cancelled:
+                days[d] = "active"
+    return hist
+
+
+# -- Detections ---------------------------------------------------------------------
+
+
+def find_conflicts(day_events: list) -> list:
+    """Overlap pairs (at least one work event -- a work meeting over a family
+    commitment counts; two family calendars overlapping is not the principal's
+    conflict to solve) + work-hours boundary violations."""
+    findings = []
+    evs = timed(day_events)
+    for i in range(len(evs)):
+        for j in range(i + 1, len(evs)):
+            a, b = evs[i], evs[j]
+            if not (is_work(a) or is_work(b)):
+                continue
+            if a.start < b.end and b.start < a.end:
+                kind = "double-booked" if (is_work(a) and is_work(b)) else "work-over-personal"
+                findings.append(
+                    f"{a.day:%a %m-%d}: **{a.label()}** ({a.slot()}) overlaps "
+                    f"**{b.label()}** ({b.slot()}) [{kind}]"
+                )
+    for ev in evs:
+        if not is_work(ev):
+            continue
+        if ev.start.time() < DAY_START:
+            findings.append(
+                f"{ev.day:%a %m-%d}: **{ev.title}** starts {ev.start:%H:%M}, "
+                f"before the 6:00 AM boundary"
+            )
+        if ev.end.time() > DAY_END or ev.end.date() > ev.start.date():
+            findings.append(
+                f"{ev.day:%a %m-%d}: **{ev.title}** runs to {ev.end:%H:%M}, "
+                f"past the 8:30 PM boundary"
+            )
+    return findings
+
+
+def needs_prep(ev: Event) -> str:
+    """Return a reason string if the meeting plausibly needs prep, else ''."""
+    for pat in DECISION_FORUM_PATTERNS:
+        if pat in ev.title_norm:
+            return "decision forum"
+    externals = [
+        a for a in ev.attendees
+        if "@" in a and not a.lower().endswith("@" + WORK_DOMAIN)
+    ]
+    if externals:
+        return f"external attendees ({', '.join(externals[:3])})"
+    return ""
+
+
+def find_prep_gaps(day_events: list) -> list:
+    findings = []
+    evs = timed(day_events)
+    for ev in evs:
+        if not is_work(ev):
+            continue
+        reason = needs_prep(ev)
+        if not reason:
+            continue
+        window_start = ev.start - timedelta(minutes=60)
+        busy = 0.0
+        for other in evs:
+            if other is ev:
+                continue
+            lo = max(window_start, other.start)
+            hi = min(ev.start, other.end)
+            if hi > lo:
+                busy += (hi - lo).total_seconds() / 60
+        free = max(0, 60 - int(busy))
+        if free < PREP_MIN_FREE_MINUTES:
+            findings.append(
+                f"{ev.day:%a %m-%d}: **{ev.title}** ({ev.slot()}) -- {reason}, "
+                f"but only {free} free min in the prior hour (back-to-back)"
+            )
+    return findings
+
+
+def day_load(day_events: list) -> tuple:
+    """(meeting_hours, maker_blocks) for one day. Load counts work meetings;
+    maker-time free blocks are carved against everything timed."""
+    work = [e for e in timed(day_events) if is_work(e)]
+    hours = sum((e.end - e.start).total_seconds() for e in work) / 3600
+
+    d = day_events[0].day if day_events else None
+    if d is None:
+        return 0.0, 0
+    core_lo = datetime.combine(d, CORE_START)
+    core_hi = datetime.combine(d, CORE_END)
+    busy = sorted(
+        (max(e.start, core_lo), min(e.end, core_hi))
+        for e in timed(day_events) if e.start < core_hi and e.end > core_lo
+    )
+    blocks, cursor = 0, core_lo
+    for lo, hi in busy:
+        if (lo - cursor).total_seconds() / 60 >= MAKER_BLOCK_MIN:
+            blocks += 1
+        cursor = max(cursor, hi)
+    if (core_hi - cursor).total_seconds() / 60 >= MAKER_BLOCK_MIN:
+        blocks += 1
+    return hours, blocks
+
+
+def excluded_from_worthiness(ev: Event) -> bool:
+    if any(pat in ev.title_norm for pat in NEVER_RECOMMEND_PATTERNS):
+        return True
+    if ev.organizer in NEVER_RECOMMEND_ORGANIZERS:
+        return True
+    return False
+
+
+def zombie_check(title_norm: str, history: dict) -> tuple:
+    """(is_zombie, cancelled_count, window_size) from the mirror history."""
+    hist_days = history.get(title_norm, {})
+    if len(hist_days) < RECURRING_MIN_DATES:
+        return False, 0, 0
+    recent = [hist_days[x] for x in sorted(hist_days)[-ZOMBIE_WINDOW:]]
+    cancelled = recent.count("cancelled")
+    return cancelled >= ZOMBIE_MIN_CANCELLED, cancelled, len(recent)
+
+
+def collect_cancelled(days: list) -> dict:
+    """Cancelled work events in the audit window: title_norm -> (date, Event).
+    Needed because merge_day drops cancelled events, and a zombie series whose
+    NEXT instance is already cancelled is the strongest zombie there is."""
+    out = {}
+    for d in days:
+        for ev in parse_o365_day(d) + parse_google_day(d):
+            if ev.source == "google-personal" or not ev.cancelled:
+                continue
+            out.setdefault(ev.title_norm, (d, ev))
+    return out
+
+
+def find_worthiness(days_events: dict, history: dict) -> list:
+    """Conservative advisory notes: delegate candidates (the principal organizes a
+    recurring meeting in someone else's lane), large forums, and zombie
+    recurrences. One recommendation line each. Hard exclusions apply first."""
+    findings, seen = [], set()
+
+    # zombies whose upcoming instance is itself cancelled (invisible to the
+    # active-event scan below)
+    for title_norm, (d, ev) in collect_cancelled(sorted(days_events)).items():
+        if excluded_from_worthiness(ev):
+            continue
+        is_zombie, cancelled, window = zombie_check(title_norm, history)
+        if is_zombie:
+            seen.add(title_norm)
+            findings.append(
+                f"**{ev.title}** (next: {d:%a %m-%d}, already cancelled) -- "
+                f"cancelled {cancelled} of the last {window} instances. "
+                f"Recommendation: kill the series (zombie recurrence)."
+            )
+    for d in sorted(days_events):
+        for ev in days_events[d]:
+            if not is_work(ev) or ev.all_day or ev.title_norm in seen:
+                continue
+            if excluded_from_worthiness(ev):
+                continue
+            recurring = len(history.get(ev.title_norm, {})) >= RECURRING_MIN_DATES
+
+            # zombie recurrence: >= ZOMBIE_MIN_CANCELLED of last ZOMBIE_WINDOW
+            is_zombie, cancelled, window = zombie_check(ev.title_norm, history)
+            if is_zombie:
+                seen.add(ev.title_norm)
+                findings.append(
+                    f"**{ev.title}** ({d:%a %m-%d} {ev.slot()}) -- cancelled "
+                    f"{cancelled} of the last {window} instances. "
+                    f"Recommendation: skip or kill the series (zombie recurrence)."
+                )
+                continue
+
+            # delegate candidate: the principal organizes, topic is someone else's lane
+            if ev.organizer == PRINCIPAL_EMAIL and recurring:
+                for pat, who, why in DELEGATE_RULES:
+                    if re.search(pat, ev.title_norm):
+                        seen.add(ev.title_norm)
+                        findings.append(
+                            f"**{ev.title}** ({d:%a %m-%d} {ev.slot()}) -- the principal "
+                            f"organizes, but {why}. Recommendation: delegate to {who}."
+                        )
+                        break
+                if ev.title_norm in seen:
+                    continue
+
+            # large RECURRING forum, the principal not the organizer (the day-file
+            # format has no required/optional flag, so this is the
+            # conservative proxy; one-offs like incident calls never flag)
+            if (recurring
+                    and len(ev.attendees) >= LARGE_FORUM_MIN_ATTENDEES
+                    and ev.organizer != PRINCIPAL_EMAIL):
+                seen.add(ev.title_norm)
+                findings.append(
+                    f"**{ev.title}** ({d:%a %m-%d} {ev.slot()}) -- "
+                    f"{len(ev.attendees)} attendees, the principal is not the organizer. "
+                    f"Recommendation: confirm the principal is needed or send a delegate."
+                )
+    return findings
+
+
+# -- Collection ---------------------------------------------------------------------
+
+
+def business_days(start: date, n: int) -> list:
+    days, d = [], start
+    while len(days) < n:
+        if d.weekday() < 5:
+            days.append(d)
+        d += timedelta(days=1)
+    return days
+
+
+def collect(today: date, n_days: int) -> dict:
+    return {d: merge_day(d) for d in business_days(today, n_days)}
+
+
+# -- Report -------------------------------------------------------------------------
+
+
+def build_report(today: date, days_events: dict, history: dict) -> tuple:
+    days = sorted(days_events)
+    conflicts, prep_gaps = [], []
+    for d in days:
+        conflicts += find_conflicts(days_events[d])
+        prep_gaps += find_prep_gaps(days_events[d])
+    worthiness = find_worthiness(days_events, history)
+
+    loads = {d: day_load(days_events[d]) for d in days}
+    worst = max(days, key=lambda d: loads[d][0]) if days else today
+
+    lines = [
+        "---",
+        f"date: {today:%Y-%m-%d}",
+        "type: calendar-audit",
+        f"window: {days[0]:%Y-%m-%d} .. {days[-1]:%Y-%m-%d} ({len(days)} business days)",
+        "---",
+        "",
+        f"# Calendar Audit -- {today:%Y-%m-%d}",
+        "",
+        "*Advisory only. The assistant never accepts, declines, or moves anything "
+        "(Level 3), and this is not a reminder -- the principal owns the calendar. "
+        "Sources: o365 calendar + google mirror (status truth) + family "
+        "calendars, deduplicated.*",
+        "",
+        f"## CONFLICTS -- {len(conflicts)}",
+        "",
+    ]
+    lines += [f"- {c}" for c in conflicts] or ["None."]
+    lines += ["", f"## PREP GAPS -- {len(prep_gaps)}", ""]
+    lines += [f"- {p}" for p in prep_gaps] or ["None."]
+    lines += [
+        "",
+        "## LOAD",
+        "",
+        "| Day | Meetings | Hours | Maker blocks (>=45 min, 8-6) |",
+        "|-----|----------|-------|------------------------------|",
+    ]
+    for d in days:
+        n_meet = len([e for e in timed(days_events[d]) if is_work(e)])
+        hours, blocks = loads[d]
+        flag = " **HEAVY**" if hours > HEAVY_DAY_HOURS else ""
+        lines.append(f"| {d:%a %m-%d} | {n_meet} | {hours:.1f}{flag} | {blocks} |")
+    lines += ["", f"## WORTHINESS CANDIDATES -- {len(worthiness)}", ""]
+    if worthiness:
+        lines += [f"- {w}" for w in worthiness]
+    else:
+        lines.append("None. Everything on the window looks earned.")
+    lines += [
+        "",
+        "*Never questioned (CONFIG hard exclusions): priorities, "
+        "board, anything CEO, family events.*",
+        "",
+    ]
+
+    stats = {
+        "conflicts": len(conflicts),
+        "prep_gaps": len(prep_gaps),
+        "worst_day": worst,
+        "worst_hours": loads[worst][0] if days else 0.0,
+    }
+    return "\n".join(lines), stats
+
+
+def status_line(stats: dict) -> str:
+    return (
+        f"Calendar steward: {stats['conflicts']} conflicts, "
+        f"{stats['prep_gaps']} prep gaps, worst day "
+        f"{stats['worst_day']:%a %m-%d} ({stats['worst_hours']:.1f}h)"
+    )
+
+
+def write_and_publish(path: Path, content: str, publish: bool) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    print(f"Written: {path}")
+    if publish and PUBLISH_SCRIPT.exists():
+        result = subprocess.run(
+            ["python3", str(PUBLISH_SCRIPT), str(path)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0:
+            print("Published to Obsidian vault.")
+        else:
+            print(f"Publish failed (doc still written): {result.stderr.strip()[:300]}",
+                  file=sys.stderr)
+
+
+# -- Main ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Calendar Steward -- read-only conflict/prep/load/worthiness audit")
+    parser.add_argument("command", choices=["audit", "status"])
+    parser.add_argument("--days", type=int, default=5,
+                        help="business days ahead (default 5)")
+    parser.add_argument("--no-publish", action="store_true",
+                        help="Skip obsidian-publish")
+    args = parser.parse_args()
+
+    today = datetime.now(ET).date()
+    days_events = collect(today, args.days)
+    history = load_history(today)
+    content, stats = build_report(today, days_events, history)
+
+    if args.command == "status":
+        print(status_line(stats))
+        return
+
+    out_path = CALENDAR_DOCS / f"Calendar Audit -- {today:%Y-%m-%d}.md"
+    write_and_publish(out_path, content, not args.no_publish)
+    print(status_line(stats))
+
+
+if __name__ == "__main__":
+    main()

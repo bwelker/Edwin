@@ -1,0 +1,28 @@
+{
+  "_comment": "PUBLIC denylist TEMPLATE for pii-guard in the open-source Edwin repo. It contains NO private entity seed -- only generic, non-sensitive tripwire tokens. Structural detection (emails, phones, API keys, /Users paths, private keys) runs WITHOUT any seed, so this file being generic does not weaken the structural gate. The authoritative private person/entity seed is injected at CI time from the PII_DENYLIST GitHub Actions secret (see README-ci.md) and never lives in this repo. Add your own private names/terms to that secret, not to this file.",
+
+  "person_names": [],
+
+  "direct_reports_and_colleagues": [],
+
+  "_business_terms_note": "Generic confidentiality markers -- if any of these literal strings appear in a public file it is almost certainly a leaked internal document and should fail the gate. Safe to publish: they are generic English phrases, not PII.",
+  "business_terms": [
+    "CONFIDENTIAL",
+    "INTERNAL ONLY",
+    "DO NOT DISTRIBUTE",
+    "PROPRIETARY AND CONFIDENTIAL",
+    "ATTORNEY-CLIENT PRIVILEGED"
+  ],
+
+  "sensitive_projects": [],
+
+  "locations": [],
+
+  "machine_terms": [
+    "EDWIN_HOME"
+  ],
+
+  "known_phone_digits": [],
+
+  "known_emails": []
+}

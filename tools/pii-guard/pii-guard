@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+"""pii-guard -- CONTENT-based PII / sensitive-data gate for the public-repo port.
+
+WHY THIS EXISTS
+    The parity port plan (docs/edwin-parity-portplan-2026-07-03.md) designated
+    the public repo's `content-guard` as the "hard PII grep gate". It is NOT a
+    PII scanner -- it is a prompt-INJECTION scanner (30 regexes, zero PII
+    patterns) and it walks a directory BY FILE EXTENSION (default .md), so
+    Edwin's extensionless executables (budget-watch, worklist, dispatch, ...)
+    scan as "0 files" and slip the gate. Trusting it would give a false
+    all-clear on a public push. pii-guard is the real gate.
+
+WHAT IT DOES
+    Reads FILE CONTENTS (not extensions). Scans every text file it finds --
+    extensionless executables, .md, .py, .json, .sh, everything -- for the
+    classes of data that must never reach a public repo:
+
+      * emails, phone numbers (any format + known-number digit match)
+      * absolute user paths (/Users/<name>/, /home/<name>/) and EDWIN_HOME-style
+        machine specifics
+      * credentials / tokens / API keys / private keys / JWTs / key=value secrets
+      * a configurable person-name + business-term DENYLIST (denylist.json),
+        seeded from known entities and extensible
+      * physical-address heuristics
+      * binary files it cannot read -> flagged as UNVERIFIED (recall-safe:
+        a .db of session data cannot be allowed to pass silently)
+
+RECALL OVER PRECISION -- ON PURPOSE
+    This is a leak gate. A false positive costs one human review. A false
+    negative leaks PII to a PUBLIC repository, irreversibly. Every ambiguous
+    call is therefore resolved toward FLAGGING. The denylist deliberately
+    includes common first names and generic terms. Expect noise; that is the
+    tool working as designed, not a bug. Prune with --allow / config, never by
+    loosening the patterns.
+
+OUTPUT / GATE
+    Per-file findings (class, severity, line, match, context), a summary, and a
+    hard PASS/FAIL. Exit codes for automation:
+        0  = PASS  (no findings at or above --fail-on)
+        1  = FAIL  (findings at or above --fail-on -- do NOT push)
+        2  = usage / runtime error
+    --json emits a machine-readable report for the port pipeline.
+"""
+
+import argparse
+import json
+import math
+import os
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+
+__version__ = "1.0.0"
+
+SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2}
+
+# Directories never worth scanning (and huge). Vendored / generated / VCS.
+SKIP_DIRS = {
+    ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
+    "env", "plombery-env", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    "dist", "build", ".idea", ".vscode", "target", "runs", "candidates",
+}
+
+# Binary extensions we flag-as-unverified without trying to decode.
+BINARY_EXTS = {
+    ".db", ".sqlite", ".sqlite3", ".png", ".jpg", ".jpeg", ".gif", ".pdf",
+    ".zip", ".gz", ".tar", ".tgz", ".whl", ".so", ".dylib", ".o", ".a",
+    ".bin", ".pyc", ".ico", ".woff", ".woff2", ".ttf", ".mp4", ".mov",
+    ".wav", ".mp3", ".parquet", ".npy", ".pkl",
+}
+
+# ---------------------------------------------------------------------------
+# High-precision structural regexes (independent of the denylist)
+# Each: (compiled, class, severity, description)
+# ---------------------------------------------------------------------------
+STRUCTURAL_PATTERNS = [
+    # ---- emails ----------------------------------------------------------
+    (re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"),
+     "email", "high", "Email address"),
+
+    # ---- phone numbers (formatted; bare-digit handled by denylist) -------
+    (re.compile(r"\+?\d{1,2}[\s.\-]\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}\b"),
+     "phone", "high", "Phone number (intl / separated)"),
+    (re.compile(r"\(\d{3}\)\s?\d{3}[\s.\-]?\d{4}\b"),
+     "phone", "high", "Phone number (parenthesized area code)"),
+    (re.compile(r"\b\d{3}[.\-]\d{3}[.\-]\d{4}\b"),
+     "phone", "high", "Phone number (NNN-NNN-NNNN)"),
+
+    # ---- absolute user paths --------------------------------------------
+    (re.compile(r"/Users/[A-Za-z0-9._\-]+"),
+     "user_path", "high", "Absolute macOS user path (/Users/<name>/)"),
+    (re.compile(r"/home/[A-Za-z0-9._\-]+"),
+     "user_path", "high", "Absolute Linux home path (/home/<name>/)"),
+    (re.compile(r"/var/folders/[A-Za-z0-9._\-/]+"),
+     "user_path", "medium", "macOS per-user temp path"),
+
+    # ---- credentials / tokens / keys ------------------------------------
+    (re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----"),
+     "private_key", "high", "PEM private key block"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+     "credential", "high", "AWS access key id"),
+    (re.compile(r"\bASIA[0-9A-Z]{16}\b"),
+     "credential", "high", "AWS temporary access key id"),
+    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}\b"),
+     "credential", "high", "GitHub token"),
+    (re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}\b"),
+     "credential", "high", "Slack token"),
+    (re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{20,}\b"),
+     "credential", "high", "Anthropic API key"),
+    (re.compile(r"\bsk-[A-Za-z0-9]{32,}\b"),
+     "credential", "high", "OpenAI-style secret key"),
+    (re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"),
+     "credential", "high", "Google API key"),
+    (re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{6,}\b"),
+     "credential", "high", "JWT (JSON Web Token)"),
+    (re.compile(r"(?i)\b(?:bearer|authorization)\b\s*[:=]?\s*[A-Za-z0-9._\-]{20,}"),
+     "credential", "high", "Bearer / Authorization token"),
+    (re.compile(
+        r"""(?ix)
+        \b(password|passwd|secret|token|api[_\-]?key|access[_\-]?key
+        |client[_\-]?secret|private[_\-]?key|auth[_\-]?token|credential)
+        \b\s*[:=]\s*
+        ['"]?[^\s'"#]{6,}""" ),
+     "credential", "high", "Secret-like key=value assignment"),
+
+    # ---- machine / env specifics ----------------------------------------
+    (re.compile(r"\bEDWIN_HOME\b"),
+     "machine_specific", "medium", "EDWIN_HOME machine-env marker"),
+
+    # ---- physical address heuristic -------------------------------------
+    (re.compile(
+        r"\b\d{1,5}\s+[A-Z][A-Za-z.]+(?:\s+[A-Z][A-Za-z.]+)*\s+"
+        r"(?:St|Street|Ave|Avenue|Rd|Road|Dr|Drive|Ln|Lane|Blvd|Boulevard"
+        r"|Ct|Court|Way|Pl|Place|Ter|Terrace|Cir|Circle)\b\.?"),
+     "physical_address", "medium", "Street-address heuristic"),
+
+    # ---- possible high-entropy secret block (low sev, noisy) ------------
+    (re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),
+     "possible_secret_blob", "low", "Long base64-ish blob (possible secret)"),
+]
+
+# key=value keys whose values we ALSO entropy-check even if short pattern missed
+_ASSIGN_RE = re.compile(r"""[A-Za-z0-9_\-]*
+    (?:key|secret|token|password|passwd|cred|auth|pat)[A-Za-z0-9_\-]*
+    \s*[:=]\s*['"]?([^\s'"#]{8,})['"]?""", re.IGNORECASE | re.VERBOSE)
+
+
+def shannon_entropy(s: str) -> float:
+    if not s:
+        return 0.0
+    counts = Counter(s)
+    n = len(s)
+    return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
+
+# ---------------------------------------------------------------------------
+# Denylist compilation
+# ---------------------------------------------------------------------------
+
+def load_denylist(path: Path) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def compile_denylist(denylist: dict, allow: set[str]):
+    """Return (term_patterns, phone_digit_set).
+
+    term_patterns: list of (compiled_regex, class, severity, term)
+    phone_digit_set: set of known bare-digit phone strings for normalized match
+    """
+    # class + severity per denylist section
+    section_meta = {
+        "person_names":                 ("person_name", "high"),
+        "direct_reports_and_colleagues":("person_name", "high"),
+        "business_terms":               ("business_term", "high"),
+        "sensitive_projects":           ("sensitive_project", "medium"),
+        "locations":                    ("location", "medium"),
+        "machine_terms":                ("machine_specific", "medium"),
+        "known_emails":                 ("email", "high"),
+    }
+    patterns = []
+    seen = set()
+    for section, (klass, sev) in section_meta.items():
+        for term in denylist.get(section, []):
+            t = term.strip()
+            if not t or t.lower() in allow or t.lower() in seen:
+                continue
+            seen.add(t.lower())
+            # word-boundary, case-insensitive. Escape term; allow flexible
+            # internal whitespace so "Jane Doe" matches across runs of space.
+            esc = re.escape(t).replace(r"\ ", r"\s+")
+            # \b works for alnum-bounded terms; for terms with punctuation
+            # (emails, "O'Brien Co.") fall back to a looser boundary.
+            if re.match(r"^[\w\s]+$", t):
+                rx = re.compile(r"\b" + esc + r"\b", re.IGNORECASE)
+            else:
+                rx = re.compile(esc, re.IGNORECASE)
+            patterns.append((rx, klass, sev, t))
+
+    phone_digits = set(denylist.get("known_phone_digits", []))
+    return patterns, phone_digits
+
+
+# ---------------------------------------------------------------------------
+# Scanning
+# ---------------------------------------------------------------------------
+
+def is_probably_binary(sample: bytes) -> bool:
+    if b"\x00" in sample:
+        return True
+    # high proportion of non-text bytes
+    if not sample:
+        return False
+    textchars = bytes(range(32, 127)) + b"\n\r\t\f\b"
+    nontext = sum(1 for b in sample if b not in textchars)
+    return (nontext / len(sample)) > 0.30
+
+
+def redact(s: str, keep: int = 4) -> str:
+    if len(s) <= keep + 2:
+        return "*" * len(s)
+    return s[:keep] + "*" * (len(s) - keep - 2) + s[-2:]
+
+
+def scan_line(line, line_num, filepath, term_patterns, phone_digits,
+              do_redact) -> list[dict]:
+    issues = []
+
+    def add(klass, severity, description, match_text, start):
+        snippet_start = max(0, start - 30)
+        snippet_end = min(len(line), start + len(match_text) + 30)
+        context = line[snippet_start:snippet_end].strip()
+        shown = redact(match_text) if do_redact else match_text
+        issues.append({
+            "file": filepath, "line": line_num,
+            "class": klass, "severity": severity, "description": description,
+            "match": shown, "context": (redact(context) if do_redact else context),
+        })
+
+    # structural patterns
+    for rx, klass, sev, desc in STRUCTURAL_PATTERNS:
+        for m in rx.finditer(line):
+            add(klass, sev, desc, m.group(0), m.start())
+
+    # entropy check on secret-ish assignments (catches values the fixed
+    # patterns miss)
+    for m in _ASSIGN_RE.finditer(line):
+        val = m.group(1)
+        if shannon_entropy(val) >= 3.5 and len(val) >= 12:
+            add("credential", "high", "High-entropy secret assignment",
+                m.group(0), m.start())
+
+    # denylist terms
+    for rx, klass, sev, term in term_patterns:
+        for m in rx.finditer(line):
+            add(klass, sev, f"Denylist term: {term}", m.group(0), m.start())
+
+    # normalized bare-digit phone match (any formatting)
+    if phone_digits:
+        digits = re.sub(r"\D", "", line)
+        for known in phone_digits:
+            idx = digits.find(known)
+            if idx != -1:
+                add("phone", "high", f"Known phone number (digits {known})",
+                    known, 0)
+
+    return issues
+
+
+def scan_file(filepath, term_patterns, phone_digits, do_redact):
+    """Return (issues, meta). meta.status in {scanned, binary, unreadable}."""
+    try:
+        with open(filepath, "rb") as f:
+            sample = f.read(8192)
+    except OSError as e:
+        return [{
+            "file": filepath, "line": 0, "class": "unreadable", "severity": "high",
+            "description": f"Could not open file: {e}", "match": "", "context": "",
+        }], {"status": "unreadable"}
+
+    ext = Path(filepath).suffix.lower()
+    if ext in BINARY_EXTS or is_probably_binary(sample):
+        # recall-safe: a binary we cannot read may carry PII (e.g. a .db of
+        # session slices). Flag as UNVERIFIED so it cannot pass silently.
+        return [{
+            "file": filepath, "line": 0, "class": "binary_unverified",
+            "severity": "high",
+            "description": "Binary/undecodable file -- content NOT scanned; "
+                           "must be manually reviewed or excluded before push",
+            "match": "", "context": "",
+        }], {"status": "binary"}
+
+    issues = []
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            for line_num, line in enumerate(f, start=1):
+                issues.extend(scan_line(line.rstrip("\n"), line_num, filepath,
+                                        term_patterns, phone_digits, do_redact))
+    except OSError as e:
+        return [{
+            "file": filepath, "line": 0, "class": "unreadable", "severity": "high",
+            "description": f"Read error: {e}", "match": "", "context": "",
+        }], {"status": "unreadable"}
+    return issues, {"status": "scanned"}
+
+
+def scan_path(target, term_patterns, phone_digits, do_redact):
+    target_path = Path(target).resolve()
+    files_scanned = []
+    all_issues = []
+    stats = Counter()
+
+    def handle(fpath):
+        files_scanned.append(fpath)
+        issues, meta = scan_file(fpath, term_patterns, phone_digits, do_redact)
+        stats[meta["status"]] += 1
+        all_issues.extend(issues)
+
+    if target_path.is_file():
+        handle(str(target_path))
+    elif target_path.is_dir():
+        for root, dirs, files in os.walk(target_path):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            for fname in sorted(files):
+                handle(os.path.join(root, fname))
+    else:
+        print(f"Error: {target} is not a file or directory", file=sys.stderr)
+        sys.exit(2)
+
+    return files_scanned, all_issues, stats
+
+
+# ---------------------------------------------------------------------------
+# Gate + output
+# ---------------------------------------------------------------------------
+
+def gate(all_issues, fail_on):
+    threshold = SEVERITY_ORDER[fail_on]
+    gating = [i for i in all_issues if SEVERITY_ORDER[i["severity"]] >= threshold]
+    return (len(gating) == 0), gating
+
+
+def print_human(files_scanned, all_issues, stats, fail_on, verbose):
+    by_file = {}
+    for i in all_issues:
+        by_file.setdefault(i["file"], []).append(i)
+
+    for fpath in files_scanned:
+        short = os.path.relpath(fpath)
+        if fpath in by_file:
+            fi = by_file[fpath]
+            print(f"  FLAG {short} -- {len(fi)} finding(s)")
+            # sort by line
+            for issue in sorted(fi, key=lambda x: (x["line"])):
+                sev = issue["severity"].upper()
+                loc = f"L{issue['line']}" if issue["line"] else "file"
+                print(f"    {loc:>6} [{sev:6}] {issue['class']}: {issue['description']}")
+                if verbose and issue["match"]:
+                    print(f"           match: {issue['match']!r}")
+                    if issue["context"]:
+                        print(f"           ...{issue['context']}...")
+        elif verbose:
+            print(f"  ok   {short}")
+
+    cls_counts = Counter(i["class"] for i in all_issues)
+    passed, gating = gate(all_issues, fail_on)
+    print()
+    print(f"Scanned {len(files_scanned)} file(s): "
+          f"{stats.get('scanned',0)} text, {stats.get('binary',0)} binary/unverified, "
+          f"{stats.get('unreadable',0)} unreadable")
+    print(f"Findings: {len(all_issues)} across {len(by_file)} file(s)")
+    if cls_counts:
+        print("By class: " + ", ".join(f"{c}={n}" for c, n in cls_counts.most_common()))
+    print(f"Gate (fail-on={fail_on}): {'PASS' if passed else 'FAIL'} "
+          f"({len(gating)} gating finding(s))")
+
+
+def print_json(files_scanned, all_issues, stats, fail_on):
+    by_file = {}
+    for i in all_issues:
+        by_file.setdefault(i["file"], []).append(i)
+    passed, gating = gate(all_issues, fail_on)
+    result = {
+        "version": __version__,
+        "scanned": len(files_scanned),
+        "text_files": stats.get("scanned", 0),
+        "binary_unverified": stats.get("binary", 0),
+        "unreadable": stats.get("unreadable", 0),
+        "flagged_files": len(by_file),
+        "total_findings": len(all_issues),
+        "by_class": dict(Counter(i["class"] for i in all_issues)),
+        "fail_on": fail_on,
+        "gating_findings": len(gating),
+        "gate": "PASS" if passed else "FAIL",
+        "findings": all_issues,
+    }
+    print(json.dumps(result, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def cmd_scan(args):
+    here = Path(__file__).resolve().parent
+    denylist_path = Path(args.denylist) if args.denylist else here / "denylist.json"
+    try:
+        denylist = load_denylist(denylist_path)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"Error loading denylist {denylist_path}: {e}", file=sys.stderr)
+        return 2
+
+    allow = {a.strip().lower() for a in (args.allow or "").split(",") if a.strip()}
+    term_patterns, phone_digits = compile_denylist(denylist, allow)
+
+    if not args.json:
+        print(f"pii-guard {__version__} scanning: {args.path}")
+        print(f"  denylist: {denylist_path} ({len(term_patterns)} terms, "
+              f"{len(phone_digits)} known numbers) | "
+              f"structural patterns: {len(STRUCTURAL_PATTERNS)}")
+
+    files_scanned, all_issues, stats = scan_path(
+        args.path, term_patterns, phone_digits, args.redact)
+
+    if args.json:
+        print_json(files_scanned, all_issues, stats, args.fail_on)
+    else:
+        print_human(files_scanned, all_issues, stats, args.fail_on, args.verbose)
+
+    passed, _ = gate(all_issues, args.fail_on)
+    return 0 if passed else 1
+
+
+def cmd_patterns(_args):
+    by_class = {}
+    for rx, klass, sev, desc in STRUCTURAL_PATTERNS:
+        by_class.setdefault(klass, []).append((sev, desc, rx.pattern))
+    for klass, items in by_class.items():
+        print(f"\n{klass}:")
+        for sev, desc, pat in items:
+            print(f"  [{sev.upper():6}] {desc}")
+    print(f"\n{len(STRUCTURAL_PATTERNS)} structural patterns across "
+          f"{len(by_class)} classes (+ configurable denylist.json terms).")
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="pii-guard",
+        description="Content-based PII/sensitive-data gate for the public-repo port.")
+    sub = p.add_subparsers(dest="command")
+
+    s = sub.add_parser("scan", help="Scan a file or tree for PII")
+    s.add_argument("path", help="File or directory to scan")
+    s.add_argument("--json", action="store_true", help="Machine-readable JSON output")
+    s.add_argument("--fail-on", choices=["low", "medium", "high"], default="low",
+                   help="Minimum severity that fails the gate (default: low = "
+                        "any finding fails; favors recall)")
+    s.add_argument("--denylist", metavar="PATH",
+                   help="Override denylist.json path")
+    s.add_argument("--allow", metavar="TERMS",
+                   help="Comma-separated denylist terms to suppress this run")
+    s.add_argument("--redact", action="store_true",
+                   help="Mask matched values in output (for shareable reports)")
+    s.add_argument("--verbose", "-v", action="store_true",
+                   help="Show matches/context and list clean files")
+
+    sub.add_parser("patterns", help="List structural detection patterns")
+    sub.add_parser("version", help="Show version")
+
+    args = p.parse_args()
+    if args.command == "scan":
+        sys.exit(cmd_scan(args))
+    elif args.command == "patterns":
+        cmd_patterns(args)
+    elif args.command == "version":
+        print(f"pii-guard {__version__}")
+    else:
+        p.print_help()
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
