@@ -50,6 +50,39 @@ PII_GUARD = HERE / "pii-guard"
 GATE_SEVERITY = "high"
 SEV = {"low": 0, "medium": 1, "high": 2}
 
+# --- Path excludes ---------------------------------------------------------
+# Files/dirs that INTENTIONALLY contain PII-like patterns or confidentiality
+# tripwire words as fixtures or documentation. Scanning them yields guaranteed
+# false positives (the content is there ON PURPOSE), so they are removed from
+# the CHANGED-FILES gate. This list is deliberately tight -- only self-referential
+# gate/test assets, never broad code directories. Each entry documents WHY it is
+# safe. Matched against the repo-relative POSIX path of each changed file.
+_EXCLUDE_DIR_PREFIXES = (
+    # Content-guard injection fixtures embed phishing-style fake email
+    # addresses at made-up external domains precisely so the injection-detection
+    # tests have something to detect. Fabricated, not real PII.
+    "tools/content-guard/test-samples/",
+    # pii-guard's own positive-case fixtures: files that MUST contain PII-shaped
+    # strings so the scanner's detection can be exercised.
+    "tools/pii-guard/test-samples/",
+)
+_EXCLUDE_FILES = frozenset({
+    # The gate's own CI doc necessarily quotes the confidentiality tripwire
+    # phrases it detects -- documentation of the detector, not a leak.
+    "tools/pii-guard/README-ci.md",
+    # pii-guard's README likewise names the terms/patterns it flags.
+    "tools/pii-guard/README.md",
+})
+
+
+def _is_excluded(relpath: str) -> bool:
+    """True if a changed file is an intentional-fixture / gate-doc that must not
+    be scanned (guaranteed false positives). Tight allowlist only."""
+    p = Path(relpath).as_posix()
+    if p in _EXCLUDE_FILES:
+        return True
+    return any(p.startswith(pref) for pref in _EXCLUDE_DIR_PREFIXES)
+
 # --- Noise-floor allowlist -------------------------------------------------
 # RFC-2606 reserved domains + documentation placeholder mailboxes.
 _RESERVED_EMAIL = re.compile(
@@ -184,7 +217,8 @@ def main():
         # outside the repo, so it is never in the file list anyway.)
         targets = [f for f in (args.files or [])
                    if Path(f).is_file()
-                   and not re.match(r"denylist.*\.json$", Path(f).name)]
+                   and not re.match(r"denylist.*\.json$", Path(f).name)
+                   and not _is_excluded(f)]
         if not targets:
             print("ci_gate: no files to scan (empty diff) -- PASS")
             sys.exit(0)

@@ -55,6 +55,24 @@ __version__ = "1.0.0"
 
 SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2}
 
+# ---------------------------------------------------------------------------
+# Sanctioned public tokens -- structural machine-markers / public FOSS names
+# that are NOT PII and are the *correct* sanitized form. These are suppressed
+# from BOTH structural and denylist matches so a correctly-sanitized file does
+# not fail the gate on them. This is an allowlist of SPECIFIC known-clean
+# tokens -- it does not loosen any pattern. Compared case-insensitively against
+# the exact matched text. Extend only with tokens confirmed safe for public.
+#   * EDWIN_HOME  -- the sanctioned env-var convention (replaces the real
+#     absolute path); a structural marker, not personal data.
+#   * BlueBubbles / bluebubbles -- open-source project name, already public.
+# ---------------------------------------------------------------------------
+SANCTIONED_ALLOW = {"edwin_home", "bluebubbles"}
+
+# RFC 2606 / RFC 6761 reserved domains -- placeholder/example addresses that
+# cannot belong to a real person. Emails at these domains are documentation
+# stand-ins, not PII, so they do not flag.
+RESERVED_EMAIL_DOMAINS = {"example.com", "example.net", "example.org"}
+
 # Directories never worth scanning (and huge). Vendored / generated / VCS.
 SKIP_DIRS = {
     ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
@@ -116,13 +134,11 @@ STRUCTURAL_PATTERNS = [
      "credential", "high", "JWT (JSON Web Token)"),
     (re.compile(r"(?i)\b(?:bearer|authorization)\b\s*[:=]?\s*[A-Za-z0-9._\-]{20,}"),
      "credential", "high", "Bearer / Authorization token"),
-    (re.compile(
-        r"""(?ix)
-        \b(password|passwd|secret|token|api[_\-]?key|access[_\-]?key
-        |client[_\-]?secret|private[_\-]?key|auth[_\-]?token|credential)
-        \b\s*[:=]\s*
-        ['"]?[^\s'"#]{6,}""" ),
-     "credential", "high", "Secret-like key=value assignment"),
+    # NOTE: secret-like `key = value` assignments are handled separately in
+    # scan_line (see _NAMED_SECRET_RE / _ASSIGN_RE) so the gate keys on the
+    # VALUE's literal-secret shape, not merely the variable NAME. A bare
+    # assignment whose value is a code reference (self.api_key, os.path.join,
+    # a *_path) is NOT a secret and must not flag.
 
     # ---- machine / env specifics ----------------------------------------
     (re.compile(r"\bEDWIN_HOME\b"),
@@ -140,10 +156,29 @@ STRUCTURAL_PATTERNS = [
      "possible_secret_blob", "low", "Long base64-ish blob (possible secret)"),
 ]
 
-# key=value keys whose values we ALSO entropy-check even if short pattern missed
-_ASSIGN_RE = re.compile(r"""[A-Za-z0-9_\-]*
-    (?:key|secret|token|password|passwd|cred|auth|pat)[A-Za-z0-9_\-]*
-    \s*[:=]\s*['"]?([^\s'"#]{8,})['"]?""", re.IGNORECASE | re.VERBOSE)
+# Assignments with a strongly secret-implying KEY name. We still require the
+# VALUE to be an actual literal (not a code reference) before flagging -- this
+# catches short/low-entropy real secrets (password: hunter2...) while ignoring
+# `api_key = self.api_key` and similar plumbing. group(1) = the value.
+_NAMED_SECRET_RE = re.compile(
+    r"""\b(?:password|passwd|secret|token|api[_\-]?key|access[_\-]?key
+        |client[_\-]?secret|private[_\-]?key|auth[_\-]?token|credential)
+        \b\s*[:=]\s*
+        ['"]?([^\s'"#]{6,})['"]?""",
+    re.IGNORECASE | re.VERBOSE)
+
+# ANY assignment -- name-agnostic. We flag ONLY when the VALUE itself has the
+# shape of a literal secret (known key prefix, or a long high-entropy opaque
+# token). This is the fix for the old name-based heuristic that flagged every
+# `*_path`, `os.path.join(...)`, and `api_key = self.api_key`. group(1) = value.
+_ASSIGN_RE = re.compile(
+    r"""[A-Za-z_][A-Za-z0-9_.\-]*\s*[:=]\s*['"]?([^\s'"#]{12,})['"]?""",
+    re.VERBOSE)
+
+# Known credential prefixes -- a value starting with one of these IS a secret
+# regardless of entropy (short high-signal tokens).
+_SECRET_PREFIX_RE = re.compile(
+    r"^(?:sk-ant-|sk-|AKIA|ASIA|gh[pousr]_|xox[baprs]-|AIza|eyJ)")
 
 
 def shannon_entropy(s: str) -> float:
@@ -152,6 +187,68 @@ def shannon_entropy(s: str) -> float:
     counts = Counter(s)
     n = len(s)
     return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
+
+def _strip_quotes(v: str) -> str:
+    return v.strip().strip("\"'`")
+
+
+def is_code_reference(value: str) -> bool:
+    """True if `value` is plainly a code reference/expression, not a literal
+    secret: an attribute access (self.x, os.environ), a dotted identifier, a
+    function call, or a shell/interpolation reference. Used to keep secret-named
+    assignments whose value is just plumbing from flagging."""
+    v = _strip_quotes(value)
+    if not v:
+        return True
+    if v.startswith(("self.", "cls.", "os.", "sys.", "this.", "$", "{")):
+        return True
+    if re.search(r"[A-Za-z_]\w*\(", v):          # a function call
+        return True
+    # a dotted identifier reference like foo.bar.baz (no secret has dots)
+    if re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+", v):
+        return True
+    return False
+
+
+def looks_like_literal_secret(value: str) -> bool:
+    """True only if `value` has the SHAPE of a literal secret: a known key
+    prefix, or a long, opaque, mixed-alphanumeric high-entropy token. Code
+    references, paths, expressions, and plain words are rejected."""
+    v = _strip_quotes(value)
+    if len(v) < 12:
+        return False
+    if _SECRET_PREFIX_RE.match(v):
+        return True
+    # otherwise require a long opaque token with no code-structure characters
+    if len(v) < 16:
+        return False
+    if any(c in v for c in " /\\().$@{}[]<>:;,'\"`"):
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9_\-+=]+", v):
+        return False
+    if not (any(c.isalpha() for c in v) and any(c.isdigit() for c in v)):
+        return False
+    # All-lowercase hyphen-separated slugs are IDENTIFIERS, not secrets:
+    # model ids (claude-haiku-4-5-20251001), pipeline/skill ids
+    # (skill-pre-1on1-brief), kebab-case config values, UUIDs. A real opaque
+    # secret in this branch carries uppercase (base64/base62 tokens) or a known
+    # prefix (handled above by _SECRET_PREFIX_RE). Reject the slug shape so
+    # these do not false-positive.
+    if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)+", v):
+        return False
+    return shannon_entropy(v) >= 3.5
+
+
+def is_placeholder_email(addr: str) -> bool:
+    """True for RFC 2606 reserved / documentation domains (example.com etc.,
+    the `.example` TLD, and any `example.*`) -- not a real person's address."""
+    domain = addr.rsplit("@", 1)[-1].lower()
+    if domain in RESERVED_EMAIL_DOMAINS:
+        return True
+    if domain.endswith(".example") or domain.startswith("example."):
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +321,7 @@ def redact(s: str, keep: int = 4) -> str:
 
 
 def scan_line(line, line_num, filepath, term_patterns, phone_digits,
-              do_redact) -> list[dict]:
+              do_redact, allow=frozenset()) -> list[dict]:
     issues = []
 
     def add(klass, severity, description, match_text, start):
@@ -241,13 +338,27 @@ def scan_line(line, line_num, filepath, term_patterns, phone_digits,
     # structural patterns
     for rx, klass, sev, desc in STRUCTURAL_PATTERNS:
         for m in rx.finditer(line):
-            add(klass, sev, desc, m.group(0), m.start())
+            match_text = m.group(0)
+            # sanctioned machine-markers / public FOSS names are not PII
+            if match_text.lower() in allow:
+                continue
+            # RFC 2606 placeholder emails are documentation stand-ins
+            if klass == "email" and is_placeholder_email(match_text):
+                continue
+            add(klass, sev, desc, match_text, m.start())
 
-    # entropy check on secret-ish assignments (catches values the fixed
-    # patterns miss)
-    for m in _ASSIGN_RE.finditer(line):
+    # secret-named assignments: flag when the VALUE is an actual literal, not
+    # a code reference (self.api_key / os.path.join / a *_path is plumbing).
+    for m in _NAMED_SECRET_RE.finditer(line):
         val = m.group(1)
-        if shannon_entropy(val) >= 3.5 and len(val) >= 12:
+        if not is_code_reference(val):
+            add("credential", "high", "Secret-like key=value assignment",
+                m.group(0), m.start())
+
+    # name-agnostic assignments: flag ONLY when the VALUE has literal-secret
+    # shape (known prefix or long high-entropy opaque token).
+    for m in _ASSIGN_RE.finditer(line):
+        if looks_like_literal_secret(m.group(1)):
             add("credential", "high", "High-entropy secret assignment",
                 m.group(0), m.start())
 
@@ -268,7 +379,7 @@ def scan_line(line, line_num, filepath, term_patterns, phone_digits,
     return issues
 
 
-def scan_file(filepath, term_patterns, phone_digits, do_redact):
+def scan_file(filepath, term_patterns, phone_digits, do_redact, allow=frozenset()):
     """Return (issues, meta). meta.status in {scanned, binary, unreadable}."""
     try:
         with open(filepath, "rb") as f:
@@ -296,7 +407,8 @@ def scan_file(filepath, term_patterns, phone_digits, do_redact):
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
             for line_num, line in enumerate(f, start=1):
                 issues.extend(scan_line(line.rstrip("\n"), line_num, filepath,
-                                        term_patterns, phone_digits, do_redact))
+                                        term_patterns, phone_digits, do_redact,
+                                        allow))
     except OSError as e:
         return [{
             "file": filepath, "line": 0, "class": "unreadable", "severity": "high",
@@ -305,7 +417,7 @@ def scan_file(filepath, term_patterns, phone_digits, do_redact):
     return issues, {"status": "scanned"}
 
 
-def scan_path(target, term_patterns, phone_digits, do_redact):
+def scan_path(target, term_patterns, phone_digits, do_redact, allow=frozenset()):
     target_path = Path(target).resolve()
     files_scanned = []
     all_issues = []
@@ -313,7 +425,8 @@ def scan_path(target, term_patterns, phone_digits, do_redact):
 
     def handle(fpath):
         files_scanned.append(fpath)
-        issues, meta = scan_file(fpath, term_patterns, phone_digits, do_redact)
+        issues, meta = scan_file(fpath, term_patterns, phone_digits, do_redact,
+                                 allow)
         stats[meta["status"]] += 1
         all_issues.extend(issues)
 
@@ -412,6 +525,8 @@ def cmd_scan(args):
         return 2
 
     allow = {a.strip().lower() for a in (args.allow or "").split(",") if a.strip()}
+    # always suppress sanctioned public tokens (EDWIN_HOME, BlueBubbles, ...)
+    allow |= SANCTIONED_ALLOW
     term_patterns, phone_digits = compile_denylist(denylist, allow)
 
     if not args.json:
@@ -421,7 +536,7 @@ def cmd_scan(args):
               f"structural patterns: {len(STRUCTURAL_PATTERNS)}")
 
     files_scanned, all_issues, stats = scan_path(
-        args.path, term_patterns, phone_digits, args.redact)
+        args.path, term_patterns, phone_digits, args.redact, allow)
 
     if args.json:
         print_json(files_scanned, all_issues, stats, args.fail_on)
