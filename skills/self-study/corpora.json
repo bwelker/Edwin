@@ -1,0 +1,50 @@
+{
+  "_comment": [
+    "Self-study corpus registry. Each entry is a candidate corpus for offline distillation",
+    "into ~/Edwin/memory/distilled/<id>.md -- synthesis notes + anticipated Q&A that chunk",
+    "retrieval can't answer on its own. The skill picks the STALEST entry per run:",
+    "never-distilled (last_distilled null) first, then largest overdue ratio",
+    "(days since last_distilled / volatility horizon).",
+    "",
+    "Fields:",
+    "  id           kebab-case corpus id -- becomes the distillate filename",
+    "  title        human-readable scope statement",
+    "  paths        globs/paths to read (the corpus). ~ expands to $HOME.",
+    "  queries      memory_search seed queries (limit 5 each) to pull cross-references",
+    "               that live outside the globs (transcripts, mail, sessions).",
+    "  volatility   high = review_after +60d, medium = +90d, low = +180d",
+    "  last_distilled  ISO date of the last distillation run, or null (never).",
+    "",
+    "The entries below are PLACEHOLDER EXAMPLES showing the schema. Replace them with",
+    "your own high-value corpora (a key project, a working relationship, an org history)."
+  ],
+  "corpora": [
+    {
+      "id": "example-project",
+      "title": "Example project -- full history, key decisions, current state, open questions",
+      "paths": [
+        "~/Edwin/memory/project_*.md",
+        "~/Edwin/data/decisions/ledger.jsonl"
+      ],
+      "queries": [
+        "project status and key decisions",
+        "project open questions and risks"
+      ],
+      "volatility": "high",
+      "last_distilled": null
+    },
+    {
+      "id": "example-relationship",
+      "title": "Example working relationship -- history, commitments, communication patterns",
+      "paths": [
+        "~/Edwin/briefing-book/docs/9. 👥 People/*.md"
+      ],
+      "queries": [
+        "working relationship history and commitments",
+        "communication style and preferences"
+      ],
+      "volatility": "medium",
+      "last_distilled": null
+    }
+  ]
+}
