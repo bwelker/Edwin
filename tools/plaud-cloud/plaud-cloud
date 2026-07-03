@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+"""plaud-cloud -- Pull recordings, transcripts, and summaries from Plaud API."""
+
+import argparse
+import gzip
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import requests
+
+BASE_URL = "https://api.plaud.ai"
+EDWIN_HOME = Path(os.environ.get("EDWIN_HOME", Path.home() / "Edwin"))
+DATA_DIR = EDWIN_HOME / "data" / "plaud"
+CRED_FILE = Path.home() / ".edwin" / "credentials" / "plaud" / "env"
+
+HEADERS = {
+    "User-Agent": "PlaudApp/4.9.2 (iPhone; iOS 18.4)",
+    "app-platform": "ios",
+    "app-version": "4.9.2",
+    "app-versionNumber": "4.9.2",
+    "app-buildNumber": "492",
+    "app-language": "en",
+    "Accept": "application/json",
+}
+
+SCENE_MAP = {1: "memo", 100: "memo", 101: "call", 102: "meeting"}
+
+
+def load_token():
+    """Load JWT from PLAUD_TOKEN env var or credentials file."""
+    jwt = os.environ.get("PLAUD_TOKEN")
+    if jwt:
+        return jwt.strip()
+    if CRED_FILE.exists():
+        for line in CRED_FILE.read_text().splitlines():
+            if line.startswith("PLAUD_TOKEN="):
+                return line.split("=", 1)[1].strip()
+    print("Error: No PLAUD_TOKEN found. Set env var or add to", CRED_FILE)
+    sys.exit(1)
+
+
+def api_get(path, jwt, params=None, retries=3):
+    """GET request with retry on 429."""
+    url = f"{BASE_URL}{path}"
+    headers = {**HEADERS, "Authorization": f"Bearer {jwt}"}
+    for attempt in range(retries):
+        r = requests.get(url, headers=headers, params=params, timeout=30)
+        if r.status_code == 429:
+            wait = int(r.headers.get("Retry-After", 5))
+            print(f"  Rate limited, waiting {wait}s...")
+            time.sleep(wait)
+            continue
+        if r.status_code == 401:
+            print("Error: Token expired or invalid (401). Get a new token.")
+            sys.exit(1)
+        r.raise_for_status()
+        return r.json()
+    print(f"Error: Failed after {retries} retries: {url}")
+    sys.exit(1)
+
+
+def download_content(url, retries=2):
+    """Download content from S3 presigned URL."""
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, timeout=60)
+            r.raise_for_status()
+            # Try gzip first, fall back to raw
+            try:
+                return gzip.decompress(r.content).decode("utf-8")
+            except (gzip.BadGzipFile, OSError):
+                return r.text
+        except Exception as e:
+            if attempt < retries - 1:
+                time.sleep(2)
+                continue
+            print(f"  Warning: Download failed: {e}")
+            return None
+
+
+def extract_text(raw):
+    """Extract readable text from Plaud content (may be JSON with ai_content or plain text)."""
+    if not raw:
+        return ""
+    text = raw.strip()
+    # Plaud wraps summaries/minutes in JSON with an ai_content field
+    if text.startswith("{") or text.startswith("["):
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict) and "ai_content" in obj:
+                return obj["ai_content"].strip()
+            # Outline is a JSON array of topic segments
+            if isinstance(obj, list) and obj and "topic" in obj[0]:
+                lines = []
+                for seg in obj:
+                    start = format_timestamp(seg.get("start_time", 0))
+                    end = format_timestamp(seg.get("end_time", 0))
+                    topic = seg.get("topic", "")
+                    lines.append(f"- [{start}-{end}] {topic}")
+                return "\n".join(lines)
+        except json.JSONDecodeError:
+            pass
+    return text
+
+
+def format_timestamp(ms):
+    """Format milliseconds to MM:SS."""
+    total_s = int(ms / 1000)
+    m, s = divmod(total_s, 60)
+    return f"{m:02d}:{s:02d}"
+
+
+def scene_label(scene):
+    """Convert numeric scene to label."""
+    if isinstance(scene, int):
+        return SCENE_MAP.get(scene, str(scene))
+    return str(scene)
+
+
+def cmd_status(args):
+    """Show account info, device info, recording count."""
+    jwt = load_token()
+
+    print("== Account ==")
+    user = api_get("/user/me", jwt)
+    u = user.get("data_user", {})
+    print(f"  User ID: {u.get('id', 'N/A')}")
+    print(f"  Nickname: {u.get('nickname', 'N/A')}")
+    print(f"  Email: {u.get('email', 'N/A')}")
+    expire = u.get("expire_time", 0)
+    if expire:
+        exp_dt = datetime.fromtimestamp(expire, tz=timezone.utc)
+        print(f"  Membership expires: {exp_dt.strftime('%Y-%m-%d')}")
+    secs = u.get("seconds_left", 0)
+    if secs:
+        hours = secs / 3600
+        print(f"  Transcription remaining: {hours:.1f} hours")
+
+    print("\n== Devices ==")
+    devices = api_get("/device/list", jwt)
+    for d in devices.get("data_devices", []):
+        print(f"  {d.get('name', 'Unknown')} (SN: {d.get('sn', 'N/A')})")
+        print(f"    Model: {d.get('model', 'N/A')}, FW: {d.get('version_number', 'N/A')}")
+
+    print("\n== Recordings ==")
+    files = api_get("/file/version_v2", jwt, params={"scene": "all_sync"})
+    vlist = files.get("data_version_list", [])
+    active = [f for f in vlist if not f.get("is_deleted")]
+    print(f"  Total: {len(vlist)} ({len(active)} active, {len(vlist) - len(active)} deleted)")
+
+
+def cmd_list(args):
+    """List all recordings with details fetched per-file."""
+    jwt = load_token()
+    files = api_get("/file/version_v2", jwt, params={"scene": "all_sync"})
+    vlist = files.get("data_version_list", [])
+    active = [f for f in vlist if not f.get("is_deleted")]
+
+    if not active:
+        print("No recordings found.")
+        return
+
+    # Sort by version (timestamp) descending
+    active.sort(key=lambda x: x.get("version_ms", 0), reverse=True)
+
+    print(f"{'File ID':<34} {'Date':<12} {'Scene':<9} {'Dur':<7} {'Title'}")
+    print("-" * 100)
+
+    for item in active:
+        fid = item["file_id"]
+        try:
+            detail = api_get(f"/file/detail/{fid}", jwt)
+            d = detail.get("data", {})
+            title = d.get("file_name", "Untitled")
+            scene = scene_label(d.get("scene", "?"))
+            start = d.get("start_time", 0)
+            duration = d.get("duration", 0)
+
+            if start > 0:
+                ts = start / 1000 if start > 1e12 else start
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                date_str = dt.strftime("%Y-%m-%d")
+            else:
+                date_str = "?"
+
+            dur_m = int(duration / 60000) if duration else 0
+            dur_str = f"{dur_m}m"
+
+            print(f"{fid:<34} {date_str:<12} {scene:<9} {dur_str:<7} {title}")
+        except Exception as e:
+            print(f"{fid:<34} {'?':<12} {'?':<9} {'?':<7} ERROR: {e}")
+
+
+def cmd_speakers(args):
+    """List recognized speakers."""
+    jwt = load_token()
+    resp = api_get("/speaker/list", jwt, params={"include_embeddings": "true", "last_sync_time": "0"})
+    data = resp.get("data", {})
+    speakers = data.get("speakers", []) if isinstance(data, dict) else data
+
+    if not speakers:
+        print("No speakers found.")
+        return
+
+    print(f"{'Name':<25} {'Speaker ID':<34} {'Auto':<6} {'Manual':<6}")
+    print("-" * 75)
+    for s in speakers:
+        name = s.get("speaker_name", "Unknown")
+        sid = s.get("speaker_id", "?")
+        counts = s.get("sample_counts", {})
+        auto = counts.get("auto", 0)
+        mark = counts.get("mark", 0)
+        print(f"{name:<25} {sid:<34} {auto:<6} {mark:<6}")
+
+
+def cmd_pull(args):
+    """Download transcript + summaries for recordings."""
+    jwt = load_token()
+
+    if args.all:
+        files = api_get("/file/version_v2", jwt, params={"scene": "all_sync"})
+        vlist = files.get("data_version_list", [])
+        file_ids = [f["file_id"] for f in vlist if not f.get("is_deleted") and f.get("file_id")]
+        print(f"Pulling {len(file_ids)} recordings...")
+    elif args.file_id:
+        file_ids = [args.file_id]
+    else:
+        print("Error: Provide a file_id or --all")
+        sys.exit(1)
+
+    pulled = 0
+    skipped = 0
+    errors = 0
+    for i, file_id in enumerate(file_ids, 1):
+        print(f"[{i}/{len(file_ids)}] {file_id}...", end=" ", flush=True)
+        try:
+            detail = api_get(f"/file/detail/{file_id}", jwt)
+            data = detail.get("data", {})
+            md = build_markdown(data)
+            if md:
+                saved = save_markdown(file_id, data, md)
+                print(f"OK -> {saved}")
+                pulled += 1
+            else:
+                print("no content, skipped")
+                skipped += 1
+        except Exception as e:
+            print(f"ERROR: {e}")
+            errors += 1
+
+    print(f"\nDone: {pulled} pulled, {skipped} skipped, {errors} errors")
+
+
+def build_markdown(data):
+    """Build markdown content from file detail response."""
+    file_id = data.get("file_id", "unknown")
+    title = data.get("file_name", "Untitled")
+    start_time = data.get("start_time", 0)
+    duration = data.get("duration", 0)
+    scene = data.get("scene", 0)
+    device_sn = data.get("serial_number", "")
+
+    if isinstance(start_time, (int, float)) and start_time > 0:
+        ts = start_time / 1000 if start_time > 1e12 else start_time
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        date_str = dt.strftime("%Y-%m-%d")
+        time_str = dt.strftime("%H:%M")
+    else:
+        date_str = "unknown"
+        time_str = "unknown"
+
+    # Collect content by type
+    summary_text = ""
+    minutes_parts = []
+    outline_text = ""
+    transcript_segments = []
+    speakers_set = set()
+
+    # Check pre_download_content_list for inline content
+    for item in data.get("pre_download_content_list", []):
+        dtype = item.get("data_type", "")
+        content = extract_text(item.get("content", ""))
+        if dtype == "auto_sum_note" and content:
+            summary_text = content
+        elif dtype == "sum_multi_note" and content:
+            minutes_parts.append(content)
+        elif dtype == "outline" and content:
+            outline_text = content
+
+    # Check content_list for downloadable content
+    for item in data.get("content_list", []):
+        dtype = item.get("data_type", "")
+        link = item.get("data_link", "")
+        tab_name = item.get("data_tab_name", "")
+
+        if not link:
+            continue
+
+        if dtype == "transaction":
+            raw = download_content(link)
+            if raw:
+                try:
+                    segments = json.loads(raw)
+                    if isinstance(segments, list):
+                        transcript_segments = segments
+                        for seg in segments:
+                            spk = seg.get("speaker", seg.get("original_speaker", ""))
+                            if spk:
+                                speakers_set.add(spk)
+                except json.JSONDecodeError:
+                    pass
+
+        elif dtype == "auto_sum_note" and not summary_text:
+            content = extract_text(download_content(link))
+            if content:
+                summary_text = content
+
+        elif dtype == "sum_multi_note":
+            content = extract_text(download_content(link))
+            if content:
+                # Use tab_name as section header if available
+                if tab_name and tab_name != "Meeting Minutes":
+                    minutes_parts.append(f"### {tab_name}\n\n{content}")
+                else:
+                    minutes_parts.append(content)
+
+        elif dtype == "outline" and not outline_text:
+            content = extract_text(download_content(link))
+            if content:
+                outline_text = content
+
+    # If no content at all, skip
+    if not summary_text and not minutes_parts and not transcript_segments:
+        return None
+
+    # Duration in seconds
+    dur_s = int(duration / 1000) if duration > 1000 else int(duration)
+    speakers_list = sorted(speakers_set) if speakers_set else []
+
+    lines = []
+    lines.append("---")
+    lines.append("source: plaud")
+    lines.append(f"file_id: {file_id}")
+    lines.append(f"title: \"{title}\"")
+    lines.append(f"date: {date_str}")
+    lines.append(f"time: {time_str}")
+    lines.append(f"duration: {dur_s}")
+    lines.append(f"scene: {scene_label(scene)}")
+    if speakers_list:
+        lines.append(f"speakers: [{', '.join(speakers_list)}]")
+    if device_sn:
+        lines.append(f"device: {device_sn}")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# {title}")
+    lines.append("")
+
+    if summary_text:
+        lines.append("## Summary")
+        lines.append(summary_text.strip())
+        lines.append("")
+
+    if minutes_parts:
+        lines.append("## Meeting Minutes")
+        for part in minutes_parts:
+            lines.append(part.strip())
+            lines.append("")
+
+    if outline_text:
+        lines.append("## Outline")
+        lines.append(outline_text.strip())
+        lines.append("")
+
+    if transcript_segments:
+        lines.append("## Transcript")
+        for seg in transcript_segments:
+            speaker = seg.get("speaker", seg.get("original_speaker", "Unknown"))
+            start = seg.get("start_time", 0)
+            content = seg.get("content", "").strip()
+            if content:
+                ts_str = format_timestamp(start)
+                lines.append(f"**{speaker}** ({ts_str}): {content}")
+                lines.append("")
+
+    return "\n".join(lines)
+
+
+def save_markdown(file_id, data, md_content):
+    """Save markdown to $EDWIN_HOME/data/plaud/{YYYY-MM}/{file_id}.md"""
+    start_time = data.get("start_time", 0)
+    if isinstance(start_time, (int, float)) and start_time > 0:
+        ts = start_time / 1000 if start_time > 1e12 else start_time
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        month_dir = dt.strftime("%Y-%m")
+    else:
+        month_dir = "unknown"
+
+    out_dir = DATA_DIR / month_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_file = out_dir / f"{file_id}.md"
+    out_file.write_text(md_content, encoding="utf-8")
+    return out_file
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="plaud-cloud",
+        description="Pull recordings, transcripts, and summaries from Plaud API",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("status", help="Account/device info and recording count")
+    sub.add_parser("list", help="List all recordings")
+    sub.add_parser("speakers", help="List recognized speakers")
+
+    pull_p = sub.add_parser("pull", help="Download transcript + summaries")
+    pull_p.add_argument("file_id", nargs="?", help="File ID to pull")
+    pull_p.add_argument("--all", action="store_true", help="Pull all recordings")
+
+    args = parser.parse_args()
+
+    if args.command == "status":
+        cmd_status(args)
+    elif args.command == "list":
+        cmd_list(args)
+    elif args.command == "speakers":
+        cmd_speakers(args)
+    elif args.command == "pull":
+        cmd_pull(args)
+
+
+if __name__ == "__main__":
+    main()

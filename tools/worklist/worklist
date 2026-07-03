@@ -1,0 +1,504 @@
+#!/usr/bin/env python3
+"""
+Worklist -- the living assistant-does vs principal-does split.
+
+A VIEW over the PM database (read-only -- PM stays the single store) that
+splits everything in flight into what only the principal can do, what sits
+with them but could be handed off (the chief-of-staff edge), and what the
+assistant is already carrying.
+
+Usage:
+    worklist generate               # Worklist.md -> Action Tracker + Obsidian
+    worklist generate --no-publish  # skip obsidian-publish (testing)
+    worklist status                 # one-line section counts (for embedding)
+
+Output: briefing-book/docs/3. \U0001f3af Action Tracker/Worklist.md
+A LIVING doc, overwritten each run. Git history in the vault covers history.
+
+Sections:
+    PRINCIPAL-ONLY owner=principal, inherently theirs (decisions, approvals,
+                   personnel, exec/board, legal/money, personal, hard
+                   conversations). Sorted priority + due.
+    DELEGABLE      owner=principal but pattern-matches a delegable class.
+                   Each line carries a proposed delegate (the assistant or a
+                   named team role) and a one-line why. This is the standing
+                   order made operational.
+    ASSISTANT-ACTIVE  owner=assistant open items, one-liners.
+    NEXT-CHAPTER GUARD  fixed footer: principal-only vs delegable counts,
+                   plus one dry line (rotates weekly) when delegable wins.
+
+Hard rules:
+    - READ-ONLY against the PM DB (mode=ro). Never mutates items.
+    - Uncertain classification -> PRINCIPAL-ONLY. Never over-claim delegability.
+    - No em dashes in generated text. One guard line, never a lecture.
+
+Config note: the classification rules below are EXAMPLE seed rules. Tune the
+patterns, delegate roles, and personal/family keywords to your own context --
+that is the intended way to adopt this tool.
+
+Scheduled: Plombery `sys-worklist`, weekdays 6:20 AM.
+"""
+
+import argparse
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from datetime import date, datetime
+from pathlib import Path
+
+EDWIN_HOME = Path(os.environ.get("EDWIN_HOME", Path.home() / "Edwin"))
+TOOL_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = EDWIN_HOME
+DB_PATH = PROJECT_DIR / "data" / "pm" / "prospective.db"
+TRACKER_DIR = PROJECT_DIR / "briefing-book" / "docs" / "3. \U0001f3af Action Tracker"
+PUBLISH_SCRIPT = PROJECT_DIR / "briefing-book" / "scripts" / "obsidian-publish"
+OUT_PATH = TRACKER_DIR / "Worklist.md"
+
+# Who owns the "principal" side. Override PRINCIPAL_NAME to match your PM data.
+PRINCIPAL_NAME = os.environ.get("PRINCIPAL_NAME", "principal").strip().lower()
+PRINCIPAL_LABEL = PRINCIPAL_NAME.capitalize()
+PRINCIPAL_NAMES = {PRINCIPAL_NAME, "principal", "owner"}
+ASSISTANT_NAMES = {"edwin", "assistant"}
+
+PRIORITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+# =============================================================================
+# CONFIG -- classification rules. Evaluated in order; FIRST MATCH WINS.
+# Tune here, nowhere else. Patterns run over the DESCRIPTION only -- context
+# fields are conversational noise (a context mentioning the CEO or a bonus does
+# not make the task itself exec or personnel).
+#
+# Precedence: PRINCIPAL-ONLY first (never over-claim delegability), then the
+# assistant's own infrastructure, then team domains (need an implementation
+# verb AND a domain hit), then the assistant's delegable classes. No match ->
+# PRINCIPAL-ONLY.
+#
+# NOTE: These are EXAMPLE rules. Replace the names, domains, and personal
+# keywords with your own.
+# =============================================================================
+
+# --- PRINCIPAL-ONLY: inherently theirs. (rule name, pattern) ---
+PRINCIPAL_ONLY_RULES = [
+    ("decision / approval",
+     r"\b(decide|decision|go[- /]?no[- ]?go|approve|approval|sign[- ]?off"
+     r"|authorize|resolve[- ]or[- ]kill|veto|position on)\b"),
+    ("personnel / org",
+     r"\b(hire|hiring|fire|firing|PIP\b|raise\b|bonus|promotion"
+     r"|offer\b|resume|candidate|headcount|retention|skip[- ]level"
+     r"|1:1s? with|incentive|role\b|transition to|acting VP"
+     r"|performance review|goals? document|stock options?"
+     r"|PERM\b|immigration|visa)\b"),
+    ("exec / CEO / board relationship",
+     r"\b(CEO\b|board\b|investor|exec\b)\b"),
+    ("legal / money / signature",
+     r"\b(attorney|legal|counsel|lawsuit|contract\b|escrow"
+     r"|pay\b|payment|purchase|buy\b|exercise|expenses?\b|invoice"
+     r"|subscribe|insurance|clawback|agreement pages?)\b"),
+    ("personal / family",
+     r"\b(doctor|appt\b|appointment|dentist|eye appointment"
+     r"|family|spouse|kids?|children|car\b|vehicle|vacation|honeymoon"
+     r"|passport|travel|hotel|photo book|magazine)\b"),
+    ("hard conversation / presence",
+     r"\b(talk (to|with)\b|sit down|have the conversation|walk \w+ through\b"
+     r"|coach\b|brief \w+ (on|at)\b|orient \w+|be more visible|walk the floor"
+     r"|working group|attend\b|in[- ]person|intro meeting"
+     r"|(review|walk|sync) .{0,60} with [A-Z]\w+)"),
+    ("physical console / GUI access",
+     # Some OS-level grants (e.g. Full Disk Access) need a human at the screen.
+     r"\b(Full Disk Access|TCC\b|re-grant)\b"),
+]
+
+# --- The assistant's own infrastructure: always the assistant's,
+#     whatever the verb. ---
+ASSISTANT_INFRA_RULE = (
+    "assistant infrastructure",
+    r"\b(connector|indexer|Qdrant|Neo4j|BlueBubbles"
+    r"|Plombery|briefing[- ]book|Obsidian|bench\b)\b",
+    "assistant-built tooling; it should never have been on your desk",
+)
+
+# --- Team-delegable: implementation verb + team-owned domain.
+#     Replace the delegate names/roles and domain keywords with your own. ---
+IMPL_VERB_RE = re.compile(
+    r"\b(implement|build|fix|deploy|configure|install|migrate|transition"
+    r"|integrate|embed|develop|renew|resolve|update|create|add\b|set up"
+    r"|stand up|reduce|roll ?out|recover|restructure)\b",
+    re.IGNORECASE,
+)
+TEAM_RULES = [
+    ("software-dev execution", "the engineering lead",
+     r"\b(Linear|Jira\b|repo\b|CI\b|SonarQube|code[- ](rewrite|review)"
+     r"|codebase|sprint|dev (team|work|visibility)"
+     r"|software[- ]dev|notification|canary release"
+     r"|user session)\b",
+     "software-dev execution; the engineering lead owns dev and QA"),
+    ("ops / infrastructure", "the ops lead",
+     r"\b(AWS|EKS|K8s|Kubernetes|infra|SRE\b|server\b|VLAN|tagging"
+     r"|reserved instance|log (system|shipping)|centralized log|Tableau"
+     r"|Confluence|GitHub Enterprise|Google Cloud|chatbot|support desk"
+     r"|Intercom)\b",
+     "ops/infra; the ops lead's domain"),
+    ("hardware", "the hardware lead",
+     r"\b(beacon|firmware|hardware|STEP file"
+     r"|PCB|respin|DFU|IMU)\b",
+     "hardware; the hardware lead's domain"),
+    ("QA process", "the QA lead",
+     r"\bQA (process|flow|status|queue)\b",
+     "QA process; the QA lead's lane"),
+    ("intake / PRD tracking", "the product lead",
+     r"\b(intake|PRD (status|timeline|tracking|intake)|sprint gate"
+     r"|release/QA dates)\b",
+     "intake/PRD process; the product lead's gate"),
+]
+
+# --- Assistant-delegable classes: the assistant's skills already cover these.
+#     PRE rules run BEFORE team domains (a slide deck is still a deck);
+#     POST rules run after (implementation work goes to the team first). ---
+ASSISTANT_RULES_PRE = [
+    ("drafting / outbound comms",
+     r"\b(draft|reply|respond|answer|email \w+|text \w+|forward|send\b"
+     r"|post\b|write([- ]up)?\b|acknowledge|ask \w+( \w+)? (to|for|about)\b)\b",
+     "the assistant drafts, you send"),
+    ("document prep",
+     r"\b(prepare|prep\b|compile|one[- ]pager|PPT|timeline|slide|agenda"
+     r"|user stor(y|ies)|template|plan\b)\b",
+     "document prep; the assistant builds the draft, you edit"),
+]
+ASSISTANT_RULES_POST = [
+    ("research / analysis",
+     r"\b(research|investigate|evaluate|assess|compare|dig into|find out"
+     r"|feasibility|analy[sz]e|summari[sz]e|audit\b|map\b"
+     r"|review .{0,40}(PRD|plan|doc|draft|report|resume|expenses))\b",
+     "research/data pull; the assistant's lane"),
+    ("status chasing",
+     r"\b(chase|follow[- ]?up|track\b|verify|confirm|check\b|monitor"
+     r"|push \w+ for|nudge|get .{0,50} from)\b",
+     "status chasing; the assistant runs it down and reports"),
+    ("scheduling",
+     r"\b(schedule|calendar|set up (a )?meeting|reschedule"
+     r"|clarify .{0,30}conflict)\b",
+     "scheduling; the assistant proposes slots"),
+]
+
+# --- NEXT-CHAPTER GUARD phrasing. One line, rotates weekly, never a nag.
+#     Replace with nudges that fit your own goals. ---
+GUARD_LINES = [
+    "{d} of {t} items on your desk are delegable. Your longer-term work is not doing itself.",
+    "Delegable outnumbers principal-only, {d} to {b}. Time frees up when you hand off.",
+    "{d} of the {t} items you are carrying could be someone else's by Friday.",
+    "You are personally holding {d} items someone else could carry.",
+    "{d} delegable vs {b} principal-only. The first number should be heading to zero.",
+]
+
+# =============================================================================
+# End CONFIG
+# =============================================================================
+
+_PRINCIPAL_ONLY = [(n, re.compile(p, re.IGNORECASE)) for n, p in PRINCIPAL_ONLY_RULES]
+_ASSISTANT_INFRA = (ASSISTANT_INFRA_RULE[0], re.compile(ASSISTANT_INFRA_RULE[1], re.IGNORECASE), ASSISTANT_INFRA_RULE[2])
+_TEAM = [(n, d, re.compile(p, re.IGNORECASE), w) for n, d, p, w in TEAM_RULES]
+_ASSISTANT_PRE = [(n, re.compile(p, re.IGNORECASE), w) for n, p, w in ASSISTANT_RULES_PRE]
+_ASSISTANT_POST = [(n, re.compile(p, re.IGNORECASE), w) for n, p, w in ASSISTANT_RULES_POST]
+
+
+# -- Text helpers ---------------------------------------------------------------
+
+
+def sanitize(text: str) -> str:
+    """No em/en dashes in anything we emit. House style is ' -- '."""
+    if not text:
+        return ""
+    text = re.sub(r"\s*—\s*", " -- ", text)  # em dash
+    text = re.sub(r"\s*–\s*", " -- ", text)  # en dash
+    return text
+
+
+def trim(text: str, limit: int = 110) -> str:
+    """Trim at a word boundary, no mid-word cuts."""
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0]
+    return cut.rstrip(",;:") + " ..."
+
+
+# -- PM access (read-only) --------------------------------------------------------
+
+
+def load_items() -> list[dict]:
+    """All non-closed items owned by the principal or the assistant.
+    DB opened read-only."""
+    if not DB_PATH.exists():
+        print(f"PM database not found: {DB_PATH}", file=sys.stderr)
+        return []
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, type, owner, counterparty, description, context,
+                   due_date, priority, status
+            FROM items
+            WHERE status NOT IN ('done', 'cancelled')
+            ORDER BY due_date ASC
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    items = []
+    for r in rows:
+        item = dict(r)
+        item["description"] = sanitize(item.get("description") or "")
+        item["context"] = sanitize(item.get("context") or "")
+        items.append(item)
+    return items
+
+
+def owner_side(item: dict) -> str:
+    o = (item.get("owner") or "").strip().lower()
+    if o in PRINCIPAL_NAMES:
+        return "principal"
+    if o in ASSISTANT_NAMES:
+        return "assistant"
+    return "other"
+
+
+# -- Classification ----------------------------------------------------------------
+
+
+def classify(item: dict) -> dict:
+    """Bucket a principal-owned item. First match wins; no match -> PRINCIPAL-ONLY.
+
+    Returns {"bucket": "principal_only"|"assistant"|"team",
+             "rule": name, "delegate": str|None, "why": str|None}
+    """
+    blob = item["description"]
+
+    for name, rx in _PRINCIPAL_ONLY:
+        if rx.search(blob):
+            return {"bucket": "principal_only", "rule": name, "delegate": None, "why": None}
+
+    name, rx, why = _ASSISTANT_INFRA
+    if rx.search(blob):
+        return {"bucket": "assistant", "rule": name, "delegate": "the assistant", "why": why}
+
+    for name, rx, why in _ASSISTANT_PRE:
+        if rx.search(blob):
+            return {"bucket": "assistant", "rule": name, "delegate": "the assistant", "why": why}
+
+    if IMPL_VERB_RE.search(blob):
+        for name, delegate, rx, why in _TEAM:
+            if rx.search(blob):
+                return {"bucket": "team", "rule": name, "delegate": delegate, "why": why}
+
+    for name, rx, why in _ASSISTANT_POST:
+        if rx.search(blob):
+            return {"bucket": "assistant", "rule": name, "delegate": "the assistant", "why": why}
+
+    return {"bucket": "principal_only", "rule": "unmatched (conservative default)",
+            "delegate": None, "why": None}
+
+
+def collect(today: date) -> dict:
+    """Split PM into the worklist sections."""
+    sections = {"principal_only": [], "delegable_assistant": [], "delegable_team": [], "assistant_active": []}
+    for item in load_items():
+        side = owner_side(item)
+        if side == "assistant":
+            sections["assistant_active"].append(item)
+        elif side == "principal":
+            verdict = classify(item)
+            item["_rule"] = verdict["rule"]
+            item["_delegate"] = verdict["delegate"]
+            item["_why"] = verdict["why"]
+            if verdict["bucket"] == "principal_only":
+                sections["principal_only"].append(item)
+            elif verdict["bucket"] == "team":
+                sections["delegable_team"].append(item)
+            else:
+                sections["delegable_assistant"].append(item)
+        # side == "other": someone else owes it; that's commitment-chaser's ledger.
+    for key in sections:
+        sections[key].sort(key=sort_key)
+    return sections
+
+
+def sort_key(item: dict) -> tuple:
+    pri = PRIORITY_ORDER.get((item.get("priority") or "").strip(), 4)
+    due = item.get("due_date") or "9999-12-31"
+    return (pri, due, item["id"])
+
+
+# -- Report ------------------------------------------------------------------------
+
+
+def meta_line(item: dict, today: date, extra: str = "") -> str:
+    due = item.get("due_date") or ""
+    if due:
+        try:
+            d = (today - date.fromisoformat(due)).days
+            age = f"{d}d overdue (due {due})" if d > 0 else ("due today" if d == 0 else f"due {due}")
+        except ValueError:
+            age = f"due {due}"
+    else:
+        age = "no due date"
+    parts = [age]
+    if item.get("priority"):
+        parts.append(f"pri: {item['priority']}")
+    if item.get("status") not in ("open", None):
+        parts.append(f"status: {item['status']}")
+    if extra:
+        parts.append(extra)
+    parts.append(item["id"])
+    return " | ".join(parts)
+
+
+def guard_block(sections: dict, today: date) -> list[str]:
+    b = len(sections["principal_only"])
+    d = len(sections["delegable_assistant"]) + len(sections["delegable_team"])
+    lines = [
+        "## NEXT-CHAPTER GUARD",
+        "",
+        f"{PRINCIPAL_LABEL}-only: {b}. Delegable: {d} "
+        f"({len(sections['delegable_assistant'])} to the assistant, {len(sections['delegable_team'])} to the team). "
+        f"Assistant already carrying: {len(sections['assistant_active'])}.",
+    ]
+    if d > b:
+        phrase = GUARD_LINES[today.isocalendar()[1] % len(GUARD_LINES)]
+        lines += ["", phrase.format(d=d, b=b, t=b + d)]
+    return lines
+
+
+def build_report(sections: dict, today: date) -> str:
+    b = sections["principal_only"]
+    de = sections["delegable_assistant"]
+    dt = sections["delegable_team"]
+    ea = sections["assistant_active"]
+    total = len(b) + len(de) + len(dt) + len(ea)
+
+    lines = [
+        "---",
+        f"generated: {datetime.now().strftime('%Y-%m-%dT%H:%M')}",
+        "source: worklist",
+        f"items: {total}",
+        "---",
+        "",
+        "# Worklist -- assistant-does vs principal-does",
+        "",
+        "Living view over the PM database (PM is the store; this is the split). "
+        "Regenerated each weekday 6:20 AM.",
+        "",
+        f"**{len(b)} {PRINCIPAL_LABEL}-only / {len(de) + len(dt)} delegable "
+        f"({len(de)} to the assistant, {len(dt)} to team) / {len(ea)} assistant-active**",
+        "",
+        f"## {PRINCIPAL_LABEL.upper()}-ONLY -- {len(b)}",
+        "",
+        "*Only you can do these: decisions, approvals, personnel, exec/board, "
+        "legal/money, personal, the hard conversations.*",
+        "",
+    ]
+    if not b:
+        lines += ["Nothing here.", ""]
+    for item in b:
+        lines += [
+            f"- {trim(item['description'])}",
+            f"  {meta_line(item, today, extra=item['_rule'])}",
+        ]
+    lines.append("")
+
+    lines += [
+        f"## DELEGABLE -- proposed handoff -- {len(de) + len(dt)}",
+        "",
+        "*On your desk, but it does not need to be. Each line has a proposed "
+        "delegate. Say the word and the assistant takes it or drafts the handoff.*",
+        "",
+        f"### To the assistant ({len(de)})",
+        "",
+    ]
+    if not de:
+        lines += ["Nothing here.", ""]
+    for item in de:
+        lines += [
+            f"- {trim(item['description'])}",
+            f"  **-> the assistant** ({item['_why']}) | {meta_line(item, today)}",
+        ]
+    lines += ["", f"### To the team ({len(dt)})", ""]
+    if not dt:
+        lines += ["Nothing here.", ""]
+    for item in dt:
+        lines += [
+            f"- {trim(item['description'])}",
+            f"  **-> {item['_delegate']}** ({item['_why']}) | {meta_line(item, today)}",
+        ]
+    lines.append("")
+
+    lines += [
+        f"## ASSISTANT-ACTIVE -- {len(ea)}",
+        "",
+        "*Open on the assistant's side of the ledger. One line each.*",
+        "",
+    ]
+    if not ea:
+        lines += ["Nothing here.", ""]
+    for item in ea:
+        due = item.get("due_date")
+        pri = item.get("priority") or "-"
+        tail = f" (pri: {pri}, due {due}, {item['id']})" if due else f" (pri: {pri}, {item['id']})"
+        lines.append(f"- {trim(item['description'], 120)}{tail}")
+    lines.append("")
+
+    lines += guard_block(sections, today)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+# -- Output ------------------------------------------------------------------------
+
+
+def write_and_publish(path: Path, content: str, publish: bool) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    print(f"Written: {path}")
+    if publish and PUBLISH_SCRIPT.exists():
+        result = subprocess.run(
+            ["python3", str(PUBLISH_SCRIPT), str(path)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0:
+            print("Published to Obsidian vault.")
+        else:
+            print(f"Publish failed (doc still written): {result.stderr.strip()[:300]}", file=sys.stderr)
+
+
+def status_line(sections: dict) -> str:
+    return (
+        f"Worklist: {len(sections['principal_only'])} {PRINCIPAL_LABEL}-only / "
+        f"{len(sections['delegable_assistant']) + len(sections['delegable_team'])} delegable "
+        f"({len(sections['delegable_assistant'])} assistant, {len(sections['delegable_team'])} team) / "
+        f"{len(sections['assistant_active'])} assistant-active"
+    )
+
+
+# -- Main --------------------------------------------------------------------------
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Worklist -- assistant-does vs principal-does split over PM")
+    parser.add_argument("command", choices=["generate", "status"])
+    parser.add_argument("--no-publish", action="store_true", help="Skip obsidian-publish")
+    args = parser.parse_args()
+
+    today = date.today()
+    sections = collect(today)
+
+    if args.command == "status":
+        print(status_line(sections))
+        return
+
+    write_and_publish(OUT_PATH, build_report(sections, today), not args.no_publish)
+    print(status_line(sections))
+
+
+if __name__ == "__main__":
+    main()

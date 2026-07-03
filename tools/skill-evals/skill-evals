@@ -1,0 +1,862 @@
+#!/usr/bin/env python3
+"""skill-evals -- deterministic eval fixtures + checks for Edwin's skills.
+
+Skills are graded today by honor-system self-checks inside their own prompts.
+This tool is the mechanical layer: per-skill suites of deterministic boolean
+checks that run against the skill's ACTUAL outputs (artifacts + Completion
+Reports), plus frozen input fixtures for offline replay (the prerequisite for
+GEPA-style optimization). Companion to tools/librarian retrieval eval -- same
+.eval-history.jsonl + regression-ALERT conventions.
+
+Commands:
+  check <skill> [--artifact PATH] [--report PATH] [--path-override OLD=NEW]
+      Run the skill's suite (suites/<skill>.json) against its latest (or
+      given) artifact + completion report. Exit 2 on any FAIL.
+  check-all
+      Default suite for every skill in docs/SKILLS.md + full suites where
+      they exist. Summary table. Exit 2 on any FAIL (Plombery non-ok
+      signaling, matching budget-watch's pattern).
+  fixtures freeze <skill>
+      Snapshot the skill's input surface (the "inputs" globs in its suite)
+      into fixtures/<skill>/<date>/ with a manifest. 50MB cap per skill;
+      newest-N sampling per glob; sampled-vs-full recorded in the manifest.
+  list
+      Show the check registry and which suites exist.
+
+Completion reports: the runner looks for the newest file under
+data/skill-evals/reports/<skill>/ (the orchestrator may save the report text
+there after a run). If none exists, report-target checks SKIP -- they never
+fail on absence of a captured report.
+
+History: every check/check-all run appends to .eval-history.jsonl.
+Regression rule (matches tools/librarian/lib/retrieval_eval.py): a
+previously-passing check that fails 2 consecutive runs raises an ALERT line
+(ALERTs also exit 2).
+
+Stdlib only. Runs under any python3.
+"""
+
+import argparse
+import fnmatch
+import json
+import re
+import shutil
+import sys
+from datetime import datetime, timedelta
+import os
+from pathlib import Path
+
+TOOL_DIR = Path(__file__).resolve().parent
+EDWIN_HOME = Path(os.environ.get("EDWIN_HOME", TOOL_DIR.parent.parent))
+SUITES_DIR = TOOL_DIR / "suites"
+FIXTURES_DIR = TOOL_DIR / "fixtures"
+HISTORY_FILE = TOOL_DIR / ".eval-history.jsonl"
+REPORTS_DIR = EDWIN_HOME / "data" / "skill-evals" / "reports"
+SKILLS_INDEX = EDWIN_HOME / "docs" / "SKILLS.md"
+
+FIXTURE_TOTAL_CAP = 50 * 1024 * 1024   # 50MB per skill
+FIXTURE_FILE_CAP = 12 * 1024 * 1024    # skip any single file bigger than this
+FIXTURE_NEWEST_DEFAULT = 40            # newest-N per glob unless overridden
+
+EM_DASH = "—"
+TRUNCATION_RE = re.compile(r"\[truncated\]|\[TRUNCATED\]|\.\.\.\s*\(truncated|…\s*\(truncated")
+
+
+# --- small helpers ----------------------------------------------------------------
+
+def read_text(path):
+    return Path(path).read_text(errors="replace")
+
+
+def parse_frontmatter(text):
+    """Minimal YAML frontmatter parser: leading --- block of `key: value` lines.
+    Returns (dict, ok). Nested/complex YAML is out of scope on purpose --
+    skill artifacts use flat frontmatter."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}, False
+    fm = {}
+    for line in lines[1:]:
+        if line.strip() == "---":
+            return fm, True
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_-]*):\s*(.*)$", line)
+        if not m:
+            return fm, False
+        val = m.group(2).strip()
+        # strip an inline comment ("edition: weekday  # or weekend")
+        val = re.sub(r"\s+#.*$", "", val).strip().strip('"').strip("'")
+        fm[m.group(1)] = val
+    return fm, False  # never saw the closing ---
+
+
+def parse_report(text):
+    """Parse a Completion Report block: `KEY: value` lines, KEY uppercase with
+    underscores. Multi-line values (lists under a field) attach to the last key."""
+    fields = {}
+    order = []
+    current = None
+    for line in text.splitlines():
+        m = re.match(r"^([A-Z][A-Z0-9_]+):\s*(.*)$", line.strip())
+        if m:
+            current = m.group(1)
+            fields[current] = m.group(2).strip()
+            order.append(current)
+        elif current and line.strip():
+            fields[current] += "\n" + line.strip()
+    return fields, order
+
+
+def section_body(text, heading_pattern):
+    """Return the body of the first markdown section whose heading line matches
+    heading_pattern, up to the next heading of the same-or-higher level."""
+    lines = text.splitlines()
+    start = None
+    level = None
+    for i, line in enumerate(lines):
+        hm = re.match(r"^(#{1,6})\s", line)
+        if start is None:
+            if hm and re.search(heading_pattern, line):
+                start = i
+                level = len(hm.group(1))
+        else:
+            if hm and len(hm.group(1)) <= level:
+                return "\n".join(lines[start + 1:i])
+    if start is None:
+        return None
+    return "\n".join(lines[start + 1:])
+
+
+# --- check registry -----------------------------------------------------------------
+# Every check: fn(content, path, params) -> (bool_pass, detail_str)
+# `content` is file text for artifact/path targets, or report text for report targets.
+
+def c_file_exists(content, path, p):
+    if path is None or not Path(path).exists():
+        return False, f"missing: {path}"
+    if Path(path).stat().st_size == 0:
+        return False, f"empty file: {path}"
+    return True, str(path)
+
+
+def c_file_fresh(content, path, p):
+    """Target file's mtime is within params.max_age_hours. Guards system-suite
+    checks against silently passing on a stale artifact (e.g. yesterday's
+    Systems Report after the nightly job died)."""
+    if path is None or not Path(path).exists():
+        return False, f"missing: {path}"
+    age_h = (datetime.now().timestamp() - Path(path).stat().st_mtime) / 3600
+    return age_h <= p["max_age_hours"], f"{age_h:.1f}h old (max {p['max_age_hours']}h)"
+
+
+def c_min_lines(content, path, p):
+    n = len(content.splitlines())
+    return n >= p["min"], f"{n} lines (min {p['min']})"
+
+
+def c_max_lines(content, path, p):
+    n = len(content.splitlines())
+    return n <= p["max"], f"{n} lines (max {p['max']})"
+
+
+def c_frontmatter_parses(content, path, p):
+    fm, ok = parse_frontmatter(content)
+    return ok, f"{len(fm)} fields" if ok else "no valid --- frontmatter block"
+
+
+def c_frontmatter_fields(content, path, p):
+    fm, ok = parse_frontmatter(content)
+    if not ok:
+        return False, "frontmatter did not parse"
+    missing = [k for k in p.get("required", []) if k not in fm]
+    if missing:
+        return False, f"missing fields: {missing}"
+    for k, rex in p.get("value_patterns", {}).items():
+        if k in fm and not re.fullmatch(rex, fm[k]):
+            return False, f"{k}={fm[k]!r} fails /{rex}/"
+    return True, "all required fields present + valid"
+
+
+def c_date_matches_filename(content, path, p):
+    fm, ok = parse_frontmatter(content)
+    if not ok or "date" not in fm:
+        return False, "no parseable date in frontmatter"
+    if path is None:
+        return False, "no file path to compare"
+    fname = Path(path).name
+    if fm["date"] in fname:
+        return True, f"{fm['date']} in {fname}"
+    return False, f"frontmatter date {fm['date']} not in filename {fname}"
+
+
+def c_section_present(content, path, p):
+    if re.search(p["pattern"], content, re.MULTILINE):
+        return True, f"/{p['pattern']}/ found"
+    return False, f"/{p['pattern']}/ not found"
+
+
+def c_sections_in_order(content, path, p):
+    pos = -1
+    for pat in p["patterns"]:
+        m = re.search(pat, content, re.MULTILINE)
+        if not m:
+            return False, f"/{pat}/ not found"
+        if m.start() < pos:
+            return False, f"/{pat}/ appears out of order"
+        pos = m.start()
+    return True, f"{len(p['patterns'])} sections in order"
+
+
+def c_regex_present(content, path, p):
+    n = len(re.findall(p["pattern"], content, re.MULTILINE))
+    need = p.get("min_count", 1)
+    return n >= need, f"{n} matches of /{p['pattern']}/ (need >= {need})"
+
+
+def c_regex_all(content, path, p):
+    missing = [pat for pat in p["patterns"]
+               if not re.search(pat, content, re.MULTILINE)]
+    if missing:
+        return False, f"missing: {missing[:3]}{'...' if len(missing) > 3 else ''}"
+    return True, f"all {len(p['patterns'])} patterns present"
+
+
+def c_regex_absent(content, path, p):
+    m = re.search(p["pattern"], content, re.MULTILINE)
+    if m:
+        line = content[:m.start()].count("\n") + 1
+        return False, f"/{p['pattern']}/ found at line {line}"
+    return True, f"/{p['pattern']}/ absent"
+
+
+def c_no_em_dashes(content, path, p):
+    if EM_DASH in content:
+        line = content[:content.index(EM_DASH)].count("\n") + 1
+        return False, f"em dash (U+2014) at line {line}"
+    return True, "no em dashes"
+
+
+def c_no_truncation_markers(content, path, p):
+    m = TRUNCATION_RE.search(content)
+    if m:
+        line = content[:m.start()].count("\n") + 1
+        return False, f"truncation marker at line {line}"
+    return True, "no truncation markers"
+
+
+def c_counts_equal(content, path, p):
+    a = len(re.findall(p["pattern_a"], content, re.MULTILINE))
+    b = len(re.findall(p["pattern_b"], content, re.MULTILINE))
+    return a == b, f"{a} vs {b} ({p.get('label', 'pattern_a vs pattern_b')})"
+
+
+def c_frontmatter_count_matches(content, path, p):
+    fm, ok = parse_frontmatter(content)
+    if not ok or p["field"] not in fm:
+        return False, f"frontmatter field {p['field']} missing"
+    try:
+        declared = int(fm[p["field"]])
+    except ValueError:
+        return False, f"{p['field']}={fm[p['field']]!r} not an integer"
+    actual = len(re.findall(p["pattern"], content, re.MULTILINE))
+    return declared == actual, f"frontmatter {p['field']}={declared}, counted {actual}"
+
+
+def c_numbered_list_max(content, path, p):
+    body = section_body(content, p["section"])
+    if body is None:
+        return False, f"section /{p['section']}/ not found"
+    n = len(re.findall(r"^\d+\.\s", body, re.MULTILINE))
+    return n <= p["max"], f"{n} numbered items in section (max {p['max']})"
+
+
+def c_checkbox_states_valid(content, path, p):
+    bad = re.findall(r"^\s*[-*] \[([^ xX])\]", content, re.MULTILINE)
+    if bad:
+        return False, f"invalid checkbox states: {sorted(set(bad))}"
+    return True, "all checkbox states are [ ] or [x]"
+
+
+def c_json_parses(content, path, p):
+    try:
+        obj = json.loads(content)
+    except json.JSONDecodeError as e:
+        return False, f"invalid JSON: {e}"
+    missing = [k for k in p.get("required_keys", []) if k not in obj]
+    if missing:
+        return False, f"missing top-level keys: {missing}"
+    return True, "valid JSON"
+
+
+def c_jsonl_parses(content, path, p):
+    for i, line in enumerate(content.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            json.loads(line)
+        except json.JSONDecodeError as e:
+            return False, f"line {i} invalid: {e}"
+    return True, f"{sum(1 for l in content.splitlines() if l.strip())} lines parse"
+
+
+def c_jsonl_schema_fields(content, path, p):
+    required = p.get("required", [])
+    enums = p.get("enums", {})
+    patterns = p.get("field_patterns", {})
+    for i, line in enumerate(content.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            return False, f"line {i} not JSON"
+        missing = [k for k in required if k not in obj]
+        if missing:
+            return False, f"line {i} missing {missing}"
+        for k, allowed in enums.items():
+            if k in obj and obj[k] not in allowed:
+                return False, f"line {i}: {k}={obj[k]!r} not in {allowed}"
+        for k, rex in patterns.items():
+            if k in obj and not re.fullmatch(rex, str(obj[k])):
+                return False, f"line {i}: {k}={obj[k]!r} fails /{rex}/"
+    return True, "all lines carry required schema"
+
+
+def c_report_parses(content, path, p):
+    fields, _ = parse_report(content)
+    if "SKILL_COMPLETE" not in fields:
+        return False, "no SKILL_COMPLETE line"
+    skill = p.get("skill")
+    if skill and fields["SKILL_COMPLETE"].split()[0] != skill:
+        return False, f"SKILL_COMPLETE={fields['SKILL_COMPLETE']!r}, expected {skill}"
+    missing = [k for k in p.get("required_fields", ["STATUS"]) if k not in fields]
+    if missing:
+        return False, f"missing report fields: {missing}"
+    return True, f"report parses ({len(fields)} fields)"
+
+
+def c_report_field_valid(content, path, p):
+    fields, _ = parse_report(content)
+    field = p["field"]
+    if field not in fields:
+        return False, f"no {field} field"
+    value = fields[field].splitlines()[0].strip()
+    allowed = p["allowed"]
+    if value in allowed:
+        return True, f"{field}={value}"
+    return False, f"{field}={value!r} not in {allowed}"
+
+
+def _report_artifact_path(report_text):
+    """Extract the ARTIFACT path from a report. Returns (path_or_None, is_none_claim)."""
+    fields, _ = parse_report(report_text)
+    raw = fields.get("ARTIFACT", "").splitlines()[0].strip() if fields.get("ARTIFACT") else ""
+    if not raw:
+        return None, False
+    low = raw.lower()
+    if low.startswith(("none", "n/a")):
+        return None, True
+    # tolerate trailing annotations like "| none (zero decisions)" leftovers
+    raw = raw.split(" | ")[0].strip()
+    return Path(raw.replace("~", str(Path.home()))), False
+
+
+def c_report_artifact_exists(content, path, p):
+    apath, is_none = _report_artifact_path(content)
+    if is_none:
+        return True, "ARTIFACT: none (explicitly claimed, allowed)"
+    if apath is None:
+        return False, "no ARTIFACT field in report"
+    if apath.exists():
+        return True, f"artifact exists: {apath}"
+    return False, f"claimed artifact missing: {apath}"
+
+
+def c_zero_requires_no_artifact(content, path, p):
+    """A zero count in a report field requires the no-file rule respected
+    (e.g. DECISIONS_FOUND: 0 -> ARTIFACT must be none); nonzero requires a
+    real artifact."""
+    fields, _ = parse_report(content)
+    field = p["field"]
+    if field not in fields:
+        return False, f"no {field} field"
+    first = fields[field].splitlines()[0].strip()
+    m = re.match(r"^(\d+)", first)
+    if not m:
+        return False, f"{field}={first!r} does not start with a count"
+    count = int(m.group(1))
+    apath, is_none = _report_artifact_path(content)
+    if count == 0:
+        if is_none:
+            return True, f"{field}=0 and ARTIFACT=none (no-file rule respected)"
+        return False, f"{field}=0 but ARTIFACT={apath} (should be none)"
+    if apath is not None and apath.exists():
+        return True, f"{field}={count} and artifact exists"
+    return False, f"{field}={count} but no existing artifact claimed"
+
+
+REGISTRY = {
+    "file_exists": c_file_exists,
+    "file_fresh": c_file_fresh,
+    "min_lines": c_min_lines,
+    "max_lines": c_max_lines,
+    "frontmatter_parses": c_frontmatter_parses,
+    "frontmatter_fields": c_frontmatter_fields,
+    "date_matches_filename": c_date_matches_filename,
+    "section_present": c_section_present,
+    "sections_in_order": c_sections_in_order,
+    "regex_present": c_regex_present,
+    "regex_all": c_regex_all,
+    "regex_absent": c_regex_absent,
+    "no_em_dashes": c_no_em_dashes,
+    "no_truncation_markers": c_no_truncation_markers,
+    "counts_equal": c_counts_equal,
+    "frontmatter_count_matches": c_frontmatter_count_matches,
+    "numbered_list_max": c_numbered_list_max,
+    "checkbox_states_valid": c_checkbox_states_valid,
+    "json_parses": c_json_parses,
+    "jsonl_parses": c_jsonl_parses,
+    "jsonl_schema_fields": c_jsonl_schema_fields,
+    "report_parses": c_report_parses,
+    "report_field_valid": c_report_field_valid,
+    "report_artifact_exists": c_report_artifact_exists,
+    "zero_requires_no_artifact": c_zero_requires_no_artifact,
+}
+
+REGISTRY_DOC = {
+    "file_exists": "target file exists and is non-empty",
+    "file_fresh": "target file's mtime is within params.max_age_hours",
+    "min_lines": "line count >= params.min (stub guard)",
+    "max_lines": "line count <= params.max (page-budget guard)",
+    "frontmatter_parses": "leading --- YAML block parses (flat key: value)",
+    "frontmatter_fields": "required frontmatter keys present; optional value regexes",
+    "date_matches_filename": "frontmatter date string appears in the filename",
+    "section_present": "a heading/line matching params.pattern exists",
+    "sections_in_order": "params.patterns all present, in document order",
+    "regex_present": "params.pattern occurs >= params.min_count times",
+    "regex_all": "every pattern in params.patterns matches somewhere",
+    "regex_absent": "params.pattern never matches",
+    "no_em_dashes": "no U+2014 characters (house style: use --)",
+    "no_truncation_markers": "no [truncated]/…(truncated markers (archive rule)",
+    "counts_equal": "count(pattern_a) == count(pattern_b)",
+    "frontmatter_count_matches": "int frontmatter field == count of params.pattern",
+    "numbered_list_max": "numbered items in a named section <= params.max",
+    "checkbox_states_valid": "all markdown checkboxes are [ ] or [x]",
+    "json_parses": "file is valid JSON; optional required top-level keys",
+    "jsonl_parses": "every non-blank line is valid JSON",
+    "jsonl_schema_fields": "each JSONL line has required fields / enums / field regexes",
+    "report_parses": "Completion Report has SKILL_COMPLETE (right skill) + required fields",
+    "report_field_valid": "report field's first line is in params.allowed",
+    "report_artifact_exists": "ARTIFACT path in report exists (or is an explicit 'none')",
+    "zero_requires_no_artifact": "count field 0 => ARTIFACT none; nonzero => artifact exists",
+}
+
+
+# --- target resolution -----------------------------------------------------------
+
+def resolve_artifact(suite, override=None):
+    if override:
+        pth = Path(override).expanduser()
+        return pth if pth.exists() else pth  # let file_exists fail on it
+    candidates = []
+    for glob in suite.get("artifact_globs", []):
+        candidates.extend(EDWIN_HOME.glob(glob))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def resolve_report(skill, override=None):
+    if override:
+        return Path(override).expanduser()
+    rdir = REPORTS_DIR / skill
+    if not rdir.is_dir():
+        return None
+    files = sorted(rdir.glob("*"), key=lambda p: p.stat().st_mtime)
+    return files[-1] if files else None
+
+
+def run_suite(skill, suite, artifact_override=None, report_override=None,
+              file_overrides=None, log=print):
+    """Run every check in a suite. Returns list of result rows."""
+    file_overrides = file_overrides or {}
+    artifact = resolve_artifact(suite, artifact_override)
+    report = resolve_report(skill, report_override)
+    rows = []
+
+    for spec in suite.get("checks", []):
+        name = spec["name"]
+        check_id = spec["check"]
+        target = spec.get("target", "artifact")
+        params = dict(spec.get("params", {}))
+        fn = REGISTRY.get(check_id)
+        if fn is None:
+            rows.append({"skill": skill, "name": name, "check": check_id,
+                         "status": "FAIL", "detail": f"unknown check id {check_id}"})
+            continue
+
+        content, path, skip_reason = None, None, None
+        if target == "artifact":
+            path = artifact
+            if path is None or not Path(path).exists():
+                if check_id == "file_exists":
+                    pass  # let it fail properly
+                else:
+                    skip_reason = "no artifact resolved"
+            else:
+                content = read_text(path)
+        elif target == "report":
+            path = report
+            if path is None or not Path(path).exists():
+                skip_reason = "no completion report captured"
+            else:
+                content = read_text(path)
+        elif target == "report_artifact":
+            # artifact claimed by the report -- default-suite style checks
+            if report is None or not Path(report).exists():
+                skip_reason = "no completion report captured"
+            else:
+                apath, is_none = _report_artifact_path(read_text(report))
+                if is_none:
+                    skip_reason = "report claims no artifact (allowed)"
+                elif apath is None or not apath.exists():
+                    skip_reason = "report artifact unresolvable (report_artifact_exists covers this)"
+                else:
+                    path = apath
+                    content = read_text(apath)
+        elif target == "path":
+            raw = params.get("path", "")
+            raw = file_overrides.get(raw, raw)
+            path = Path(raw) if Path(raw).is_absolute() else EDWIN_HOME / raw
+            if not path.exists():
+                if check_id == "file_exists":
+                    pass
+                else:
+                    skip_reason = f"path missing: {path}"
+            else:
+                content = read_text(path)
+        else:
+            skip_reason = f"unknown target {target}"
+
+        if skip_reason:
+            rows.append({"skill": skill, "name": name, "check": check_id,
+                         "status": "SKIP", "detail": skip_reason})
+            continue
+        try:
+            ok, detail = fn(content or "", path, params)
+        except Exception as e:  # a crashing check is a failing check
+            ok, detail = False, f"check crashed: {e}"
+        rows.append({"skill": skill, "name": name, "check": check_id,
+                     "status": "PASS" if ok else "FAIL", "detail": detail})
+
+    for r in rows:
+        log(f"  [{r['status']:4}] {skill}:{r['name']:32} {r['detail']}")
+    return rows
+
+
+# --- history + regression (librarian conventions) -----------------------------------
+
+def load_history():
+    if not HISTORY_FILE.exists():
+        return []
+    out = []
+    for line in HISTORY_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def detect_regressions(history, current_rows):
+    """Librarian rule: a check that passed in some earlier run and has now
+    failed 2 consecutive runs (previous run containing it + this one) -> ALERT."""
+    alerts = []
+    ever_passed = set()
+    for entry in history:
+        for r in entry.get("results", []):
+            if r["status"] == "PASS":
+                ever_passed.add(f"{r['skill']}:{r['name']}")
+
+    def last_status(key):
+        for entry in reversed(history):
+            for r in entry.get("results", []):
+                if f"{r['skill']}:{r['name']}" == key:
+                    return r["status"]
+        return None
+
+    for r in current_rows:
+        if r["status"] != "FAIL":
+            continue
+        key = f"{r['skill']}:{r['name']}"
+        if key in ever_passed and last_status(key) == "FAIL":
+            alerts.append(f"ALERT: previously-passing check '{key}' has failed 2 consecutive runs")
+    return alerts
+
+
+def append_history(command, rows, alerts):
+    entry = {
+        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "command": command,
+        "pass": sum(1 for r in rows if r["status"] == "PASS"),
+        "fail": sum(1 for r in rows if r["status"] == "FAIL"),
+        "skip": sum(1 for r in rows if r["status"] == "SKIP"),
+        "alerts": alerts,
+        "results": rows,
+    }
+    with HISTORY_FILE.open("a") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return entry
+
+
+# --- suites ------------------------------------------------------------------------
+
+def load_suite(skill):
+    p = SUITES_DIR / f"{skill}.json"
+    if not p.exists():
+        return None
+    return json.loads(p.read_text())
+
+
+def default_suite(skill):
+    """The thin suite every skill gets automatically: completion report parses,
+    STATUS valid, ARTIFACT exists if claimed, no em dashes / truncation markers
+    in the claimed artifact. All report-driven; SKIPs when no report captured."""
+    return {
+        "skill": skill,
+        "checks": [
+            {"name": "report-parses", "check": "report_parses", "target": "report",
+             "params": {"skill": skill, "required_fields": ["STATUS"]}},
+            {"name": "report-status-valid", "check": "report_field_valid", "target": "report",
+             "params": {"field": "STATUS", "allowed": ["success", "partial", "error"]}},
+            {"name": "report-artifact-exists", "check": "report_artifact_exists", "target": "report"},
+            {"name": "artifact-no-em-dashes", "check": "no_em_dashes", "target": "report_artifact"},
+            {"name": "artifact-no-truncation", "check": "no_truncation_markers", "target": "report_artifact"},
+        ],
+    }
+
+
+def skills_from_index():
+    """Skill names = first column of the docs/SKILLS.md table."""
+    names = []
+    if not SKILLS_INDEX.exists():
+        return names
+    for line in SKILLS_INDEX.read_text().splitlines():
+        m = re.match(r"^\|\s*([a-z0-9][a-z0-9-]+)\s*\|", line)
+        if m and m.group(1) not in ("skill",):
+            names.append(m.group(1))
+    return names
+
+
+# --- fixtures ---------------------------------------------------------------------
+
+def expand_placeholders(glob):
+    now = datetime.now()
+    y = now - timedelta(days=1)
+    subs = {
+        "{today}": now.strftime("%Y-%m-%d"),
+        "{yesterday}": y.strftime("%Y-%m-%d"),
+        "{month}": now.strftime("%Y-%m"),
+        "{prev_month}": (now.replace(day=1) - timedelta(days=1)).strftime("%Y-%m"),
+    }
+    for k, v in subs.items():
+        glob = glob.replace(k, v)
+    return glob
+
+
+def freeze_fixtures(skill, log=print):
+    suite = load_suite(skill)
+    if suite is None or not suite.get("inputs"):
+        log(f"No suite (or no 'inputs' surface) for {skill} -- nothing to freeze.")
+        return 1
+    date = datetime.now().strftime("%Y-%m-%d")
+    dest_root = FIXTURES_DIR / skill / date
+    tree = dest_root / "tree"
+    tree.mkdir(parents=True, exist_ok=True)
+
+    manifest = {"skill": skill, "frozen_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "total_cap_bytes": FIXTURE_TOTAL_CAP, "entries": [], "total_bytes": 0,
+                "cap_reached": False}
+    total = 0
+
+    for spec in suite["inputs"]:
+        raw_glob = spec["glob"]
+        glob = expand_placeholders(raw_glob)
+        newest = spec.get("newest", FIXTURE_NEWEST_DEFAULT)
+        file_cap = spec.get("file_cap_bytes", FIXTURE_FILE_CAP)
+        matches = [p for p in EDWIN_HOME.glob(glob) if p.is_file()]
+        matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        picked = matches[:newest]
+        entry = {"glob": raw_glob, "resolved_glob": glob, "files_total": len(matches),
+                 "files_copied": 0, "bytes": 0, "sampled": len(matches) > len(picked),
+                 "skipped_oversize": [], "skipped_cap": 0}
+        for src in picked:
+            size = src.stat().st_size
+            if size > file_cap:
+                entry["skipped_oversize"].append({"path": str(src.relative_to(EDWIN_HOME)), "bytes": size})
+                continue
+            if total + size > FIXTURE_TOTAL_CAP:
+                entry["skipped_cap"] += 1
+                manifest["cap_reached"] = True
+                continue
+            rel = src.relative_to(EDWIN_HOME)
+            dst = tree / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            total += size
+            entry["files_copied"] += 1
+            entry["bytes"] += size
+        manifest["entries"].append(entry)
+        log(f"  {glob}: {entry['files_copied']}/{entry['files_total']} files, "
+            f"{entry['bytes'] / 1024:.0f} KB"
+            + (" (sampled)" if entry["sampled"] else "")
+            + (f", {len(entry['skipped_oversize'])} oversize skipped" if entry["skipped_oversize"] else "")
+            + (f", {entry['skipped_cap']} cap-skipped" if entry["skipped_cap"] else ""))
+
+    manifest["total_bytes"] = total
+    (dest_root / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
+    log(f"Frozen {skill} inputs -> {dest_root}  ({total / (1024 * 1024):.1f} MB)")
+    return 0
+
+
+# --- commands ----------------------------------------------------------------------
+
+def cmd_check(args):
+    suite = load_suite(args.skill)
+    rows = []
+    if suite is not None:
+        print(f"Suite: {args.skill} ({len(suite.get('checks', []))} checks)")
+        rows += run_suite(args.skill, suite, args.artifact, args.report,
+                          dict(o.split("=", 1) for o in args.path_override))
+    print(f"Default suite: {args.skill}")
+    rows += run_suite(args.skill, default_suite(args.skill), None, args.report)
+
+    history = load_history()
+    alerts = detect_regressions(history, rows)
+    if args.no_history:
+        entry = {"pass": sum(1 for r in rows if r["status"] == "PASS"),
+                 "fail": sum(1 for r in rows if r["status"] == "FAIL"),
+                 "skip": sum(1 for r in rows if r["status"] == "SKIP")}
+        alerts = []  # test runs don't alert or baseline
+        print(f"\n{args.skill}: {entry['pass']} pass, {entry['fail']} fail, "
+              f"{entry['skip']} skip (test run, not recorded)")
+        return 2 if entry["fail"] else 0
+    entry = append_history(f"check {args.skill}", rows, alerts)
+    print(f"\n{args.skill}: {entry['pass']} pass, {entry['fail']} fail, "
+          f"{entry['skip']} skip (history: {len(history) + 1} runs)")
+    for a in alerts:
+        print(a)
+    return 2 if (entry["fail"] or alerts) else 0
+
+
+def cmd_check_all(args):
+    skills = skills_from_index()
+    all_rows = []
+    summary = []
+    for skill in skills:
+        suite = load_suite(skill)
+        rows = []
+        if suite is not None:
+            print(f"\n=== {skill} (full suite) ===")
+            rows += run_suite(skill, suite)
+        else:
+            print(f"\n=== {skill} (default suite only) ===")
+        rows += run_suite(skill, default_suite(skill))
+        all_rows += rows
+        summary.append((skill,
+                        sum(1 for r in rows if r["status"] == "PASS"),
+                        sum(1 for r in rows if r["status"] == "FAIL"),
+                        sum(1 for r in rows if r["status"] == "SKIP"),
+                        "full" if suite else "default"))
+
+    # System-level suites: any suites/*.json whose stem is NOT a skill in
+    # docs/SKILLS.md (e.g. suites/system.json). These carry cross-skill /
+    # infrastructure checks -- the self-retro's evaluator ratchet lands
+    # non-skill corrections here. Full suite only; there is no Completion
+    # Report to grade, so no default suite.
+    for p in sorted(SUITES_DIR.glob("*.json")):
+        name = p.stem
+        if name in skills:
+            continue
+        suite = load_suite(name)
+        print(f"\n=== {name} (system-level suite) ===")
+        rows = run_suite(name, suite)
+        all_rows += rows
+        summary.append((name,
+                        sum(1 for r in rows if r["status"] == "PASS"),
+                        sum(1 for r in rows if r["status"] == "FAIL"),
+                        sum(1 for r in rows if r["status"] == "SKIP"),
+                        "system"))
+
+    history = load_history()
+    alerts = detect_regressions(history, all_rows)
+    entry = append_history("check-all", all_rows, alerts)
+
+    print("\n" + "=" * 62)
+    print(f"{'skill':28} {'suite':8} {'pass':>5} {'fail':>5} {'skip':>5}")
+    print("-" * 62)
+    for skill, p, f, s, kind in summary:
+        print(f"{skill:28} {kind:8} {p:>5} {f:>5} {s:>5}")
+    print("-" * 62)
+    print(f"{'TOTAL':28} {'':8} {entry['pass']:>5} {entry['fail']:>5} {entry['skip']:>5}")
+    for a in alerts:
+        print(a)
+    return 2 if (entry["fail"] or alerts) else 0
+
+
+def cmd_fixtures(args):
+    if args.action != "freeze":
+        print("Only 'fixtures freeze <skill>' is supported.")
+        return 1
+    return freeze_fixtures(args.skill)
+
+
+def cmd_list(args):
+    print("Check registry:")
+    for cid, doc in REGISTRY_DOC.items():
+        print(f"  {cid:28} {doc}")
+    print("\nFull suites:")
+    for p in sorted(SUITES_DIR.glob("*.json")):
+        suite = json.loads(p.read_text())
+        print(f"  {p.stem:28} {len(suite.get('checks', []))} checks, "
+              f"{len(suite.get('inputs', []))} input globs")
+    print("\nDefault suite applies to every skill in docs/SKILLS.md:")
+    print("  " + ", ".join(skills_from_index()))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="skill-evals", description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("check", help="run one skill's suite")
+    p.add_argument("skill")
+    p.add_argument("--artifact", help="artifact path override (for corruption tests / replay)")
+    p.add_argument("--report", help="completion report path override")
+    p.add_argument("--path-override", action="append", default=[],
+                   metavar="ORIG=NEW", help="override a path-target (e.g. ledger) for tests")
+    p.add_argument("--no-history", action="store_true",
+                   help="don't record this run (corruption tests / fixture replay)")
+    p.set_defaults(fn=cmd_check)
+
+    p = sub.add_parser("check-all", help="default suite for every skill + full suites where they exist")
+    p.set_defaults(fn=cmd_check_all)
+
+    p = sub.add_parser("fixtures", help="freeze input fixtures")
+    p.add_argument("action", choices=["freeze"])
+    p.add_argument("skill")
+    p.set_defaults(fn=cmd_fixtures)
+
+    p = sub.add_parser("list", help="show check registry + suites")
+    p.set_defaults(fn=cmd_list)
+
+    args = ap.parse_args()
+    sys.exit(args.fn(args))
+
+
+if __name__ == "__main__":
+    main()

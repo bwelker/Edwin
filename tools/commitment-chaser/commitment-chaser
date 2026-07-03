@@ -1,0 +1,577 @@
+#!/usr/bin/env python3
+"""
+Commitment Chaser -- generalized accountability engine for the PM database.
+
+Generalizes the single-counterparty chaser pattern to EVERY counterparty: finds open items
+someone other than the principal/assistant owes (plus principal-owned items with
+counterparties that have aged past 7 days), ages them into triage buckets,
+flags gating items, and drafts nudge messages in the principal's voice.
+
+Usage:
+    commitment-chaser report            # Commitment Aging Report -> Action Tracker + Obsidian
+    commitment-chaser nudges            # Nudge drafts for chase-bucket counterparties -> Drafts
+    commitment-chaser status            # One-line bucket summary (for embedding in other reports)
+    commitment-chaser report --no-publish   # skip obsidian-publish (testing)
+
+Buckets (days overdue):
+    >21   likely stale -- confirm & close (per standing rule: confirmed items
+          get closed at the source so they stop re-flagging)
+    7-21  chase (these counterparties get nudge drafts)
+    <7    watch (recently overdue, not yet due, or no date)
+
+Hard rules:
+    - READ-ONLY against the PM DB (opened with mode=ro). Never mutates items.
+    - Drafts only. This tool NEVER sends anything.
+    - No em dashes in generated text.
+
+State: .chaser-state.json next to this file -- last run + per-item
+first-seen-in-chase date, so a nudge that survives multiple weeks
+escalates to "second ask" / "third ask" (frequency, not volume).
+
+Scheduled: Plombery `sys-commitment-chaser`, Monday 6:30 AM.
+"""
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from datetime import date, datetime
+from pathlib import Path
+
+TOOL_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = TOOL_DIR.parent.parent
+DB_PATH = PROJECT_DIR / "data" / "pm" / "prospective.db"
+TRACKER_DIR = PROJECT_DIR / "briefing-book" / "docs" / "3. \U0001f3af Action Tracker"
+DRAFTS_DIR = PROJECT_DIR / "briefing-book" / "docs" / "4. ✉️ Drafts"
+PUBLISH_SCRIPT = PROJECT_DIR / "briefing-book" / "scripts" / "obsidian-publish"
+STATE_FILE = TOOL_DIR / ".chaser-state.json"
+
+# Owners that count as "us" -- items owned by these are the principal's side
+# of the ledger. Override PRINCIPAL_NAME to match your PM data.
+PRINCIPAL_NAME = os.environ.get("PRINCIPAL_NAME", "principal").strip().lower()
+PRINCIPAL_LABEL = PRINCIPAL_NAME.capitalize()
+SELF_NAMES = {PRINCIPAL_NAME, "principal", "owner", "edwin", "assistant"}
+
+STALE_DAYS = 21   # overdue more than this -> likely stale, confirm & close
+CHASE_DAYS = 7    # overdue more than this (up to STALE_DAYS) -> chase
+PRINCIPAL_AGED_DAYS = 7  # principal-owned items with counterparties, overdue past this, get reported
+
+# Gating vocabulary. An item matching any of these (in description or context),
+# or carrying priority=critical, is flagged GATING.
+GATING_RE = re.compile(
+    r"\b(gate[sd]?\b|gating\b|gated on|blocks\b|blocked on|blocking\b"
+    r"|contract\b|deadline\b|required for|before \w+(?: \w+){0,4} can\b)",
+    re.IGNORECASE,
+)
+
+# "X is gated/blocked/waiting on Y" -- lets nudges split stake from ask.
+STAKE_RE = re.compile(
+    r"^(?P<stake>.{5,140}?)\s+(?:is|are)\s+(?:gated on|blocked on|waiting on|contingent on)\s+(?P<thing>.{5,160})",
+    re.IGNORECASE,
+)
+
+
+# -- Text helpers ---------------------------------------------------------------
+
+
+def sanitize(text: str) -> str:
+    """No em/en dashes in anything we emit. House style is ' -- '."""
+    if not text:
+        return ""
+    text = re.sub(r"\s*—\s*", " -- ", text)  # em dash
+    text = re.sub(r"\s*–\s*", " -- ", text)  # en dash
+    return text
+
+
+def trim(text: str, limit: int = 110) -> str:
+    """Trim at a word boundary, no mid-word cuts."""
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0]
+    return cut.rstrip(",;:") + " ..."
+
+
+def first_clause(text: str) -> str:
+    """First clause of a description: up to ' -- ', ';', newline, or sentence end."""
+    parts = re.split(r"\s+--\s+|[;\n]|(?<=[a-z0-9\)])\.\s", text, maxsplit=1)
+    return parts[0].strip()
+
+
+def ordinal_ask(n: int) -> str:
+    return {1: "first ask", 2: "second ask", 3: "third ask"}.get(n, f"ask #{n}")
+
+
+# -- PM access (read-only) --------------------------------------------------------
+
+
+def load_items() -> list[dict]:
+    """All non-closed items. DB opened read-only -- this tool never writes PM."""
+    if not DB_PATH.exists():
+        print(f"PM database not found: {DB_PATH}", file=sys.stderr)
+        return []
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, type, owner, counterparty, description, context,
+                   due_date, priority, status, created_at, updated_at
+            FROM items
+            WHERE status NOT IN ('done', 'cancelled')
+            ORDER BY due_date ASC
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def is_self(name: str) -> bool:
+    return bool(name) and name.strip().lower() in SELF_NAMES
+
+
+def owed_by(item: dict) -> str:
+    """Who owes this item. Owner if it's a third party, else counterparty."""
+    owner = (item.get("owner") or "").strip()
+    counterparty = (item.get("counterparty") or "").strip()
+    if owner and not is_self(owner):
+        return owner
+    if counterparty and not is_self(counterparty):
+        return counterparty
+    return "Unassigned"
+
+
+def days_overdue(item: dict, today: date) -> int | None:
+    """Positive = days past due. Negative = days until due. None = no date."""
+    due = item.get("due_date") or ""
+    try:
+        return (today - date.fromisoformat(due)).days
+    except ValueError:
+        return None
+
+
+def bucket_of(item: dict, today: date) -> str:
+    d = days_overdue(item, today)
+    if d is None or d <= CHASE_DAYS:
+        return "watch"
+    if d <= STALE_DAYS:
+        return "chase"
+    return "stale"
+
+
+def gating_info(item: dict) -> tuple[bool, str]:
+    """(is_gating, what-it-gates snippet). Priority critical always gates."""
+    blob = sanitize(f"{item.get('description') or ''} {item.get('context') or ''}")
+    m = GATING_RE.search(blob)
+    if m:
+        # Sentence containing the match, as the "what it gates" hint.
+        start = blob.rfind(". ", 0, m.start())
+        start = start + 2 if start != -1 else 0
+        end = blob.find(". ", m.end())
+        end = end + 1 if end != -1 else len(blob)
+        return True, trim(blob[start:end].strip(), 160)
+    if (item.get("priority") or "") == "critical":
+        return True, "priority: critical"
+    return False, ""
+
+
+def last_activity(item: dict) -> str:
+    stamp = item.get("updated_at") or item.get("created_at") or ""
+    return stamp[:10] if stamp else "?"
+
+
+# -- Collection --------------------------------------------------------------------
+
+
+def collect(today: date) -> tuple[list[dict], list[dict]]:
+    """Split open PM items into (others_owe, principal_owed_aged).
+
+    others_owe: owner is a third party, OR type commitment_to_principal.
+    principal_owed_aged: principal-owned, has a counterparty, overdue > PRINCIPAL_AGED_DAYS.
+    """
+    others, principal_aged = [], []
+    for item in load_items():
+        item["description"] = sanitize(item.get("description") or "")
+        item["context"] = sanitize(item.get("context") or "")
+        item["_ower"] = owed_by(item)
+        item["_overdue"] = days_overdue(item, today)
+        item["_bucket"] = bucket_of(item, today)
+        item["_gating"], item["_gates"] = gating_info(item)
+
+        owner_is_self = is_self(item.get("owner") or "")
+        if not owner_is_self or item.get("type") == "commitment_to_principal":
+            others.append(item)
+        elif (
+            (item.get("counterparty") or "").strip()
+            and item["_overdue"] is not None
+            and item["_overdue"] > PRINCIPAL_AGED_DAYS
+        ):
+            principal_aged.append(item)
+    return others, principal_aged
+
+
+def group_by_ower(items: list[dict]) -> dict[str, list[dict]]:
+    groups: dict[str, list[dict]] = {}
+    for item in items:
+        groups.setdefault(item["_ower"], []).append(item)
+    return dict(sorted(groups.items(), key=lambda kv: kv[0].lower()))
+
+
+# -- State -------------------------------------------------------------------------
+
+
+def load_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
+
+
+def update_chase_state(others: list[dict], today: date) -> dict:
+    """Track first-seen date per item in the chase bucket. Items that leave
+    the bucket are pruned, so re-entry restarts the ask count."""
+    state = load_state()
+    first_seen = state.get("chase_first_seen", {})
+    current = {i["id"] for i in others if i["_bucket"] == "chase"}
+    first_seen = {k: v for k, v in first_seen.items() if k in current}
+    for item_id in current:
+        first_seen.setdefault(item_id, today.isoformat())
+    state["chase_first_seen"] = first_seen
+    state["last_run"] = datetime.now().isoformat(timespec="seconds")
+    save_state(state)
+    return first_seen
+
+
+def ask_number(item_id: str, first_seen: dict, today: date) -> int:
+    """1 on the first chase week; +1 per elapsed week the item survives."""
+    seen = first_seen.get(item_id)
+    if not seen:
+        return 1
+    try:
+        return (today - date.fromisoformat(seen)).days // 7 + 1
+    except ValueError:
+        return 1
+
+
+# -- Report ------------------------------------------------------------------------
+
+
+def format_line(item: dict) -> list[str]:
+    d = item["_overdue"]
+    if d is None:
+        age = "no due date"
+    elif d > 0:
+        age = f"{d}d overdue (due {item['due_date']})"
+    elif d == 0:
+        age = "due today"
+    else:
+        age = f"due in {-d}d ({item['due_date']})"
+    flags = "**[GATING]** " if item["_gating"] else ""
+    meta = " | ".join(
+        p for p in (
+            age,
+            f"pri: {item['priority']}" if item.get("priority") else "",
+            f"status: {item['status']}" if item["status"] not in ("open",) else "",
+            f"last activity: {last_activity(item)}",
+            item["id"],
+        ) if p
+    )
+    return [f"- {flags}{trim(item['description'])}", f"  {meta}"]
+
+
+def build_report(others: list[dict], principal_aged: list[dict], today: date) -> str:
+    buckets = {"stale": [], "chase": [], "watch": []}
+    for item in others:
+        buckets[item["_bucket"]].append(item)
+    # Banner covers BOTH ledgers: a gating item recorded under the principal's name
+    # (e.g. "track that X closes") still holds a real outcome hostage.
+    gating = [i for i in others + principal_aged if i["_gating"]]
+
+    lines = [
+        "---",
+        f"generated: {datetime.now().strftime('%Y-%m-%dT%H:%M')}",
+        "source: commitment-chaser",
+        f"items: {len(others) + len(principal_aged)}",
+        "---",
+        "",
+        f"# Commitment Aging -- {today.strftime('%B %d, %Y')}",
+        "",
+        f"**{len(others)} open items owed by others** "
+        f"(stale {len(buckets['stale'])} / chase {len(buckets['chase'])} / watch {len(buckets['watch'])}), "
+        f"plus {len(principal_aged)} principal-owned items with counterparties aged past {PRINCIPAL_AGED_DAYS} days.",
+        "",
+    ]
+
+    if gating:
+        lines += [
+            f"## GATING -- {len(gating)} items holding real outcomes",
+            "",
+            "These match gating vocabulary (gates / blocks / contract / deadline) or are priority-critical.",
+            "",
+        ]
+        for item in sorted(gating, key=lambda i: -(i["_overdue"] or 0)):
+            d = item["_overdue"]
+            age = f"{d}d overdue" if d and d > 0 else ("no due date" if d is None else "not yet due")
+            lines += [
+                f"- **{item['_ower']}** -- {trim(item['description'])}",
+                f"  Gates: {item['_gates']}",
+                f"  {age} | pri: {item.get('priority') or '?'} | {item['id']} | last activity: {last_activity(item)}",
+            ]
+        lines.append("")
+
+    sections = [
+        ("stale",
+         f"Likely stale -- confirm & close (overdue >{STALE_DAYS} days)",
+         "Standing rule: once the principal confirms one of these is handled, close it at the source so it stops re-flagging."),
+        ("chase",
+         f"Chase (overdue {CHASE_DAYS}-{STALE_DAYS} days)",
+         "These counterparties get nudge drafts (see Drafts > Nudges)."),
+        ("watch",
+         f"Watch (overdue <{CHASE_DAYS} days, not yet due, or no date)",
+         ""),
+    ]
+    for key, title, note in sections:
+        items = buckets[key]
+        lines.append(f"## {title} -- {len(items)}")
+        lines.append("")
+        if note:
+            lines += [f"*{note}*", ""]
+        if not items:
+            lines += ["Nothing here.", ""]
+            continue
+        for ower, group in group_by_ower(items).items():
+            lines.append(f"### {ower} ({len(group)})")
+            lines.append("")
+            for item in sorted(group, key=lambda i: -(i["_overdue"] if i["_overdue"] is not None else -9999)):
+                lines += format_line(item)
+            lines.append("")
+
+    lines.append(f"## The principal owes -- overdue >{PRINCIPAL_AGED_DAYS} days -- {len(principal_aged)}")
+    lines.append("")
+    if not principal_aged:
+        lines += ["Nothing here.", ""]
+    else:
+        lines += ["*Principal-owned items with a counterparty waiting on the other end.*", ""]
+        by_cp: dict[str, list[dict]] = {}
+        for item in principal_aged:
+            by_cp.setdefault((item.get("counterparty") or "?").strip(), []).append(item)
+        for cp, group in sorted(by_cp.items(), key=lambda kv: kv[0].lower()):
+            lines.append(f"### {cp} ({len(group)})")
+            lines.append("")
+            for item in sorted(group, key=lambda i: -(i["_overdue"] or 0)):
+                lines += format_line(item)
+            lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+# -- Nudges ------------------------------------------------------------------------
+
+
+# Common leading verbs in PM descriptions, so "verify documentation" reads as
+# "verifying documentation" inside "Where do we stand on ...?".
+LEAD_VERBS = {
+    "verify", "create", "test", "deliver", "send", "provide", "draft", "finalize",
+    "get", "set", "pull", "schedule", "review", "investigate", "build", "process",
+    "apply", "produce", "propose", "onboard", "harden", "migrate", "clarify",
+    "coordinate", "start", "post", "reply", "respond", "confirm", "check", "engage",
+    "map", "make", "prep", "track", "resolve", "answer", "forward", "orient",
+    "email", "text", "talk", "sync", "brief", "route", "address", "implement",
+    "follow", "help", "lock", "own", "stand", "share", "flash", "ship", "fix",
+    "update", "install", "stress", "collaborate", "determine", "document",
+}
+
+
+def gerund(word: str) -> str:
+    w = word.lower()
+    if w.endswith("ing"):
+        return w
+    if w.endswith("e") and not w.endswith(("ee", "oe", "ye")):
+        return w[:-1] + "ing"
+    if re.fullmatch(r"[^aeiou]*[aeiou][^aeiouwxy]", w):  # get, set, map, prep
+        return w + w[-1] + "ing"
+    return w + "ing"
+
+
+def gerundize_lead(clause: str) -> str:
+    """'Verify/create documentation' -> 'verifying/creating documentation'.
+    Only touches the first token, only for known verbs."""
+    parts = clause.split(" ", 1)
+    head, rest = parts[0], (parts[1] if len(parts) > 1 else "")
+    subwords = head.split("/")
+    stems = [w[:-1] if w.lower().endswith("s") and w.lower()[:-1] in LEAD_VERBS else w
+             for w in subwords]
+    if all(s.lower() in LEAD_VERBS for s in stems):
+        head = "/".join(gerund(s) for s in stems)
+    return f"{head} {rest}".strip()
+
+
+def derive_topic(item: dict) -> str:
+    """A short phrase for 'Where do we stand on X?'. Strips the ower's name
+    off the front of the description and gerundizes a leading bare verb."""
+    clause = first_clause(item["description"])
+    ower = item["_ower"]
+    for name in (ower, ower.split()[0] if ower != "Unassigned" else ""):
+        if name and clause.lower().startswith(name.lower()):
+            clause = clause[len(name):]
+            clause = re.sub(r"^\s*[:,]?\s*(?:to\s+|owes\s+|will\s+|and\s+\S+\s+(?:to\s+)?)?", "", clause, flags=re.IGNORECASE)
+            break
+    clause = re.sub(r"^[^A-Za-z0-9\"'(]+", "", clause)      # leftover "+ ", ": "
+    clause = re.sub(r"^[A-Z]{1,4}:\s+", "", clause)          # co-ower alias: "MK: draft X" -> "draft X"
+    clause = re.sub(r"^\S{1,12}\s+owes\s+", "", clause)      # "MK owes X" -> "X"
+    clause = gerundize_lead(clause.strip())
+    return trim(clause.rstrip("."), 100)
+
+
+def derive_stakes(item: dict) -> tuple[str, str]:
+    """(topic, stakes sentence). For 'X is gated on Y' shapes, ask about Y and
+    cite X as the stake. Otherwise fall back to gate snippet or due date."""
+    topic = derive_topic(item)
+    if item["_gating"]:
+        m = STAKE_RE.match(first_clause(item["description"]))
+        if m:
+            thing = trim(m.group("thing").strip().rstrip("."), 100)
+            # Strip a leading ower name off the owed thing too ("JD fixing..." -> "fixing...")
+            fname = item["_ower"].split()[0] if item["_ower"] != "Unassigned" else ""
+            if fname and thing.lower().startswith(fname.lower()):
+                thing = thing[len(fname):].strip()
+            stake = trim(m.group("stake").strip(), 90)
+            return thing, f"{stake} is waiting on it."
+        if item["_gates"] and item["_gates"] != "priority: critical":
+            snippet = item["_gates"].rstrip(".")
+            # Skip the stake if it just restates the ask (mutual-prefix check
+            # against the raw first clause the topic was derived from).
+            fc = first_clause(item["description"]).lower()
+            sl = snippet.lower()
+            if not (sl.startswith(fc[:30]) or fc.startswith(sl[:30])):
+                return topic, f"{snippet}."
+    d = item["_overdue"]
+    if d and d > 0:
+        due = date.fromisoformat(item["due_date"])
+        return topic, f"Due was {due.month}/{due.day}."
+    return topic, ""
+
+
+def draft_message(item: dict, ask_n: int) -> str:
+    topic, stakes = derive_stakes(item)
+    if ask_n <= 1:
+        msg = f"Where do we stand on {topic}?"
+    elif ask_n == 2:
+        msg = f"Still on my list: {topic}. Where are we?"
+    else:
+        msg = f"{ordinal_ask(ask_n).capitalize()} on {topic}. What's blocking it?"
+    if stakes:
+        msg += f" {stakes}"
+    return sanitize(msg)
+
+
+def build_nudges(others: list[dict], first_seen: dict, today: date) -> str:
+    # No nudge without a person to paste it to.
+    chase = [i for i in others if i["_bucket"] == "chase" and i["_ower"] != "Unassigned"]
+    groups = group_by_ower(chase)
+
+    lines = [
+        "---",
+        f"generated: {datetime.now().strftime('%Y-%m-%dT%H:%M')}",
+        "source: commitment-chaser",
+        "type: nudge-drafts",
+        "status: DRAFT -- principal sends manually",
+        "---",
+        "",
+        f"# Nudges -- {today.strftime('%B %d, %Y')}",
+        "",
+        "**DRAFT -- the principal sends manually.** The assistant never sends these.",
+        f"One section per counterparty in the chase window (overdue {CHASE_DAYS}-{STALE_DAYS} days). "
+        "Ready to paste into Teams/iMessage as-is.",
+        "",
+    ]
+
+    if not groups:
+        lines += ["Nothing in the chase window this week.", ""]
+        return "\n".join(lines).rstrip() + "\n"
+
+    for ower, items in groups.items():
+        lines.append(f"## {ower}")
+        lines.append("")
+        for item in sorted(items, key=lambda i: -(i["_overdue"] or 0)):
+            ask_n = ask_number(item["id"], first_seen, today)
+            gate = " | GATING" if item["_gating"] else ""
+            lines += [
+                f"> {draft_message(item, ask_n)}",
+                "",
+                f"*{ordinal_ask(ask_n)} | {item['_overdue']}d overdue (due {item['due_date']}) | "
+                f"{item['id']}{gate} | DRAFT -- principal sends manually*",
+                "",
+            ]
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+# -- Output ------------------------------------------------------------------------
+
+
+def write_and_publish(path: Path, content: str, publish: bool) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    print(f"Written: {path}")
+    if publish and PUBLISH_SCRIPT.exists():
+        result = subprocess.run(
+            ["python3", str(PUBLISH_SCRIPT), str(path)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0:
+            print("Published to Obsidian vault.")
+        else:
+            print(f"Publish failed (doc still written): {result.stderr.strip()[:300]}", file=sys.stderr)
+
+
+def status_line(others: list[dict], principal_aged: list[dict]) -> str:
+    counts = {"stale": 0, "chase": 0, "watch": 0}
+    for item in others:
+        counts[item["_bucket"]] += 1
+    gating = sum(1 for i in others + principal_aged if i["_gating"])
+    return (
+        f"Commitments owed to the principal: {len(others)} open "
+        f"(gating {gating}, stale {counts['stale']}, chase {counts['chase']}, watch {counts['watch']}) | "
+        f"Principal-owed aged >{PRINCIPAL_AGED_DAYS}d: {len(principal_aged)}"
+    )
+
+
+# -- Main --------------------------------------------------------------------------
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Commitment Chaser -- PM accountability engine")
+    parser.add_argument("command", choices=["report", "nudges", "status"])
+    parser.add_argument("--no-publish", action="store_true", help="Skip obsidian-publish")
+    args = parser.parse_args()
+
+    today = date.today()
+    others, principal_aged = collect(today)
+
+    if args.command == "status":
+        print(status_line(others, principal_aged))
+        return
+
+    first_seen = update_chase_state(others, today)
+
+    if args.command == "report":
+        out = TRACKER_DIR / f"Commitment Aging -- {today.isoformat()}.md"
+        write_and_publish(out, build_report(others, principal_aged, today), not args.no_publish)
+    elif args.command == "nudges":
+        out = DRAFTS_DIR / f"Nudges -- {today.isoformat()}.md"
+        write_and_publish(out, build_nudges(others, first_seen, today), not args.no_publish)
+
+    print(status_line(others, principal_aged))
+
+
+if __name__ == "__main__":
+    main()

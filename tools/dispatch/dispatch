@@ -1,0 +1,875 @@
+#!/usr/bin/env python3
+"""
+Edwin Dispatch -- deterministic event dispatch (12-Factor Agents, Factor 8:
+own your control flow).
+
+The orchestrator (LLM) makes NO event-handling decisions. It pipes each event
+here; this tool reads all state itself (nightwatch state file, plan-file
+checkboxes, its own journal, the system clock) and prints ONE JSON
+instruction. The orchestrator executes that instruction verbatim -- zero
+interpretation -- and reports outcomes back via `dispatch ack`.
+
+Usage:
+    dispatch run_skill --skill NAME
+    dispatch nightwatch_heartbeat
+    dispatch nightwatch_start (--hours N | --until HH:MM)
+    dispatch nightwatch_stop
+    dispatch ack --id ID --status spawned|completed|failed [--note TEXT]
+
+Event attributes may also arrive as JSON on stdin (e.g. {"skill": "x"});
+argv wins over stdin.
+
+Actions emitted (the orchestrator's entire vocabulary):
+    noop               do nothing (reason included)
+    report_error       relay the message to the user
+    log_winddown       log "nightwatch wind-down" once, do nothing else
+    spawn              spawn ONE background subagent with the given prompt
+    spawn_planner      spawn ONE background planner subagent
+    spawn_replanner    spawn ONE background re-planner subagent
+    spawn_tasks        spawn ALL listed tasks simultaneously, one subagent
+                       each, each with its own dispatch_id
+    surface_to_user  send the message to the user via iMessage, then ack
+                       the dispatch_id completed
+
+Journal (data/nightwatch/.dispatch-journal.jsonl): every spawn-type
+instruction is journaled with a dispatch id before it is returned. The
+orchestrator acks each id: spawned immediately after the Agent call, then
+completed or failed (--note carries failure context) when the subagent
+returns. In-flight = issued (< 15 min grace) or spawned (< 24 h) without a
+terminal ack; a nightwatch task whose plan checkbox has turned [x] is never
+in flight (the checkbox is ground truth). Failed once -> next heartbeat
+respawns with the failure context appended; failed twice -> surface_to_user
+and no further automated retries. Entries expire after 24 h so a crashed
+session cannot wedge the loop forever.
+
+Env overrides (used by tests): EDWIN_NIGHTWATCH_DIR, EDWIN_SKILLS_DIR,
+EDWIN_DISPATCH_NOW (ISO timestamp).
+
+All time handling: America/New_York, from the system clock, never inferred.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+import uuid
+from datetime import datetime, time as dtime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+TZ = ZoneInfo("America/New_York")
+
+# ---- tunables ---------------------------------------------------------
+INFLIGHT_MAX_AGE_H = 24        # spawned-without-terminal-ack blocks this long
+ISSUED_GRACE_MIN = 15          # issued-but-never-ack'd-spawned blocks this long
+MAX_FAILURES = 2               # per task; at 2, surface to the user, stop retrying
+WINDDOWN_TOD_START = dtime(3, 30)   # hard overnight gate, America/New_York
+WINDDOWN_TOD_END = dtime(6, 0)      # gate applies 03:30 <= tod < 06:00
+JOURNAL_COMPACT_LINES = 4000   # compact journal above this many lines
+JOURNAL_KEEP_DAYS = 7          # compaction keeps this many days
+
+BUDGET_LINE = (
+    "Token budget: typical run ~300K fresh tokens, hard ceiling 1.2M "
+    "(per budget-watch measured p50/p99). If you must wait on a slow external "
+    "process, fire-and-detach with ONE watcher -- never sit in a poll loop. "
+    "If you catch yourself in sustained polling, detach and report what you "
+    "launched instead."
+)
+
+# Bounded status contract every executor returns (DACS REGISTRY discipline).
+# On busy nights a spawn_tasks group runs 3-6 parallel executors; the
+# orchestrator triages them from these compact reports ALONE and opens a full
+# transcript/log for at most ONE task at a time (FOCUS) -- only when STATUS is
+# error/partial or NEEDS_ATTENTION is non-empty. Keep the whole report <=200
+# tokens; the full detail already lives in the overnight log + outcome journal.
+# {task_id} is filled with the task's dispatch_id so the report self-labels.
+STATUS_CONTRACT = (
+    "STATUS CONTRACT -- return EXACTLY these six fields as the LAST thing in "
+    "your reply and NOTHING after them. Hard cap ~200 tokens; one line per "
+    "field. The orchestrator triages a whole group of parallel tasks from "
+    "this report alone, so do NOT paste transcripts, diffs, file contents, or "
+    "step-by-step narration -- that detail is already in the overnight log and "
+    "outcome journal you wrote; the orchestrator opens those for ONE task at a "
+    "time and only when this report says it must.\n"
+    "STATUS: ok | partial | error\n"
+    "TASK_ID: {task_id}\n"
+    "RESULT: <one line -- what concretely exists now that did not before>\n"
+    "NEEDS_ATTENTION: <one line the user must see, or 'none'>\n"
+    "ARTIFACTS: <paths / PR# / commit hashes, or 'none'>\n"
+    "FOLLOWUP: <one line if a deeper pass is warranted, else 'none'>"
+)
+
+EDWIN_HOME = Path(os.environ.get("EDWIN_HOME", Path.home() / "Edwin"))
+OVERNIGHT_LOG = str(EDWIN_HOME / "briefing-book/docs/5. \U0001f319 Overnight/logs/{date}.md")
+
+
+# ---- environment ------------------------------------------------------
+
+def nightwatch_dir() -> Path:
+    return Path(os.environ.get("EDWIN_NIGHTWATCH_DIR",
+                               str(EDWIN_HOME / "data/nightwatch")))
+
+
+def skills_dir() -> Path:
+    return Path(os.environ.get("EDWIN_SKILLS_DIR",
+                               str(EDWIN_HOME / "skills")))
+
+
+def state_path() -> Path:
+    return nightwatch_dir() / ".nightwatch-state.json"
+
+
+def journal_path() -> Path:
+    return nightwatch_dir() / ".dispatch-journal.jsonl"
+
+
+def get_now() -> datetime:
+    override = os.environ.get("EDWIN_DISPATCH_NOW")
+    if override:
+        dt = datetime.fromisoformat(override)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TZ)
+        return dt.astimezone(TZ)
+    return datetime.now(TZ)
+
+
+# ---- small utilities ---------------------------------------------------
+
+def new_id() -> str:
+    return "d-" + uuid.uuid4().hex[:8]
+
+
+def task_key(plan_name: str, text: str) -> str:
+    norm = re.sub(r"\s+", " ", text).strip().lower()[:200]
+    return hashlib.sha1(f"{plan_name}|{norm}".encode()).hexdigest()[:12]
+
+
+def load_json(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def atomic_write_json(path: Path, obj) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def parse_iso(ts: str) -> datetime | None:
+    try:
+        dt = datetime.fromisoformat(ts)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TZ)
+    return dt.astimezone(TZ)
+
+
+# ---- plan parsing ------------------------------------------------------
+
+# A task line is a COLUMN-0 checkbox bullet. Indented `- RESULT ...` lines,
+# indented sub-checklists, and plain `- **note**` bullets are NOT tasks.
+# Tolerated malformations: `-[ ]` (no space), `- []` (empty box = unchecked),
+# `* [ ]`, `- [X]` (capital X).
+TASK_RE = re.compile(r"^[-*]\s*\[([ xX]?)\]\s?(.*)$")
+HEADER_RE = re.compile(r"^##\s+(.*)$")
+
+
+def parse_plan(text: str, plan_name: str):
+    """Return list of sections; a section is a task GROUP iff it contains
+    at least one checkbox task line."""
+    sections = []
+    current = {"header": "(preamble)", "tasks": []}
+    for line_no, line in enumerate(text.splitlines(), 1):
+        m = HEADER_RE.match(line)
+        if m:
+            sections.append(current)
+            current = {"header": m.group(1).strip(), "tasks": []}
+            continue
+        m = TASK_RE.match(line)
+        if m:
+            checked = m.group(1).strip().lower() == "x"
+            task_text = m.group(2).strip()
+            current["tasks"].append({
+                "line_no": line_no,
+                "checked": checked,
+                "text": task_text,
+                "key": task_key(plan_name, task_text),
+            })
+    sections.append(current)
+    return [s for s in sections if s["tasks"]]
+
+
+def resolve_plan_date(now: datetime, state: dict | None) -> str:
+    """The plan is named for the EVENING the nightwatch started (a 1 AM
+    heartbeat on 7/2 reads 2026-07-01-plan.md). Prefer the state file's
+    started_at date; fall back to the before-noon-means-yesterday rule."""
+    if state:
+        started = parse_iso(state.get("started_at", ""))
+        if started:
+            return started.date().isoformat()
+    d = now.date() if now.hour >= 12 else (now - timedelta(days=1)).date()
+    return d.isoformat()
+
+
+def plan_path_for(date_str: str) -> Path:
+    return nightwatch_dir() / f"{date_str}-plan.md"
+
+
+def outcomes_file_for(date_str: str) -> Path:
+    """Outcome journal: one JSON line per executed task, named for the
+    EVENING the nightwatch started (same convention as the plan file)."""
+    return nightwatch_dir() / "outcomes" / f"{date_str}.jsonl"
+
+
+def load_outcomes(date_str: str) -> list[dict]:
+    """Parse the outcome journal for a night. Missing file or bad lines
+    are skipped -- the journal is advisory, never load-bearing."""
+    entries = []
+    try:
+        text = outcomes_file_for(date_str).read_text(encoding="utf-8")
+    except OSError:
+        return entries
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict):
+            entries.append(rec)
+    return entries
+
+
+# ---- journal -----------------------------------------------------------
+
+class Journal:
+    def __init__(self, path: Path, now: datetime):
+        self.path = path
+        self.now = now
+        self.entries: dict[str, dict] = {}
+        self._load()
+
+    def _load(self):
+        if not self.path.exists():
+            return
+        lines = self.path.read_text(encoding="utf-8").splitlines()
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            rid = rec.get("id")
+            if not rid:
+                continue
+            if rec.get("ack"):
+                entry = self.entries.get(rid)
+                if entry is not None:
+                    entry["status"] = rec.get("status", entry["status"])
+                    if rec.get("note"):
+                        entry["note"] = rec["note"]
+                    entry["ack_ts"] = rec.get("ts")
+            else:
+                rec.setdefault("status", "issued")
+                self.entries[rid] = rec
+        if len(lines) > JOURNAL_COMPACT_LINES:
+            self._compact(lines)
+
+    def _compact(self, lines):
+        cutoff = self.now - timedelta(days=JOURNAL_KEEP_DAYS)
+        kept = []
+        for line in lines:
+            try:
+                rec = json.loads(line)
+                ts = parse_iso(rec.get("ts", ""))
+                if ts and ts >= cutoff:
+                    kept.append(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+        os.replace(tmp, self.path)
+
+    def append(self, rec: dict):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+
+    def record_issue(self, kind: str, event: str, action: str, label: str,
+                     extra: dict | None = None) -> str:
+        rid = new_id()
+        rec = {"id": rid, "ts": self.now.isoformat(), "kind": kind,
+               "event": event, "action": action, "label": label,
+               "status": "issued"}
+        if extra:
+            rec.update(extra)
+        self.append(rec)
+        self.entries[rid] = rec
+        return rid
+
+    def _age(self, entry: dict) -> timedelta | None:
+        ts = parse_iso(entry.get("ts", ""))
+        return (self.now - ts) if ts else None
+
+    def _expired(self, entry: dict) -> bool:
+        age = self._age(entry)
+        return age is None or age > timedelta(hours=INFLIGHT_MAX_AGE_H)
+
+    def in_flight(self, kinds: set[str], checked_keys: set[str]) -> dict | None:
+        """First unresolved spawn entry that should block the loop.
+        A task entry whose checkbox is now [x] never blocks (ground truth)."""
+        for entry in self.entries.values():
+            if entry.get("kind") not in kinds:
+                continue
+            if self._expired(entry):
+                continue
+            status = entry.get("status")
+            if status in ("completed", "failed"):
+                continue
+            if entry.get("task_key") and entry["task_key"] in checked_keys:
+                continue
+            if status == "issued":
+                age = self._age(entry)
+                if age is None or age > timedelta(minutes=ISSUED_GRACE_MIN):
+                    continue  # issued but never spawned: short grace only
+                return entry
+            if status == "spawned":
+                return entry
+        return None
+
+    def failures(self, kind: str) -> dict[str, list[dict]]:
+        """Unexpired failed entries grouped by task_key (or kind for
+        keyless planner/replanner entries)."""
+        out: dict[str, list[dict]] = {}
+        for entry in self.entries.values():
+            if entry.get("kind") != kind or entry.get("status") != "failed":
+                continue
+            if self._expired(entry):
+                continue
+            key = entry.get("task_key") or kind
+            out.setdefault(key, []).append(entry)
+        return out
+
+    def surfaced_keys(self) -> set[str]:
+        keys = set()
+        for entry in self.entries.values():
+            if entry.get("kind") != "surface" or self._expired(entry):
+                continue
+            keys.update(entry.get("task_keys", []))
+        return keys
+
+    def winddown_logged(self, started_at: str) -> bool:
+        for entry in self.entries.values():
+            if (entry.get("kind") == "winddown"
+                    and not self._expired(entry)
+                    and entry.get("started_at") == started_at):
+                return True
+        return False
+
+    def count(self, kind: str, status: str) -> int:
+        return sum(1 for e in self.entries.values()
+                   if e.get("kind") == kind and e.get("status") == status
+                   and not self._expired(e))
+
+
+# ---- prompts -----------------------------------------------------------
+
+def skill_prompt(skill: str) -> str:
+    return (
+        f"Read and execute $EDWIN_HOME/skills/{skill}/SKILL.md. Follow all "
+        f"instructions. Return the Completion Report at the end.\n\n"
+        f"{BUDGET_LINE}"
+    )
+
+
+def planner_prompt(plan_path: Path, plan_date: str) -> str:
+    return (
+        "You are the nightwatch PLANNER. You are a planner, NOT an executor: "
+        "do not execute tasks -- your job is to produce the task list.\n\n"
+        "Read and execute $EDWIN_HOME/skills/overnight-loop/SKILL.md. Follow all "
+        f"instructions. Write the plan to {plan_path} (this exact path -- the "
+        "heartbeat loop reads it). Return the Completion Report at the end.\n\n"
+        f"{BUDGET_LINE}"
+    )
+
+
+def replanner_prompt(plan_path: Path, plan_date: str, quarantined: list[str],
+                     failure_note: str | None) -> str:
+    outcomes_file = outcomes_file_for(plan_date)
+    outcomes = load_outcomes(plan_date)
+    p = (
+        "You are the nightwatch RE-PLANNER. You are a PLANNER; do NOT execute "
+        "tasks; do NOT run, attempt, or partially perform any task on the plan; "
+        "do NOT mark or unmark any checkbox. Your ONLY write to the plan file "
+        "is APPENDING one new group section to the end of it.\n\n"
+        "Read $EDWIN_HOME/skills/overnight-loop/SKILL.md for the planning method. "
+        f"The previous plan at {plan_path} is exhausted. Read what was already "
+        "completed in the plan file, do a fresh assessment, and APPEND a new "
+        "'## Group N (APPENDED HH:MM ET)' section with new '- [ ]' tasks to the "
+        "END of the existing plan file. Don't repeat completed work. Do not "
+        "modify any existing line of the plan.\n"
+        "Then return a Completion Report (SKILL_COMPLETE format).\n"
+        "\nWIDE vs DEEP. Tonight's outcome journal is at "
+        f"{outcomes_file} -- read it before proposing new tasks.\n"
+    )
+    if outcomes:
+        p += "Journal entries so far tonight:\n"
+        for rec in outcomes:
+            p += "  " + json.dumps(rec)[:500] + "\n"
+    else:
+        p += ("No outcome journal entries exist yet for tonight (file "
+              "missing or empty).\n")
+    p += (
+        "For each outcome with quality_signal strong or adequate AND a "
+        "non-null followup_candidate, explicitly consider a DEEP task "
+        "(refine or extend that result, guided by its followup_candidate) "
+        "versus WIDE (open new, unrelated work). Label EVERY task you "
+        "append by ending its line with `[deep: builds on task N]` (N = the "
+        "plan task number it extends) or `[wide]`.\n"
+    )
+    strong_followups = [rec for rec in outcomes
+                        if rec.get("quality_signal") == "strong"
+                        and rec.get("followup_candidate")]
+    if strong_followups:
+        p += (
+            "At least one STRONG outcome has a followup_candidate:\n"
+            + "\n".join(f"  - {rec.get('task', '?')[:160]} -> "
+                        f"{str(rec.get('followup_candidate'))[:200]}"
+                        for rec in strong_followups)
+            + "\nYour appended group MUST either include at least one deep "
+            "task, OR contain a plain comment bullet ('- **Deep-vs-wide:** "
+            "...') explaining why you rejected every deep option. Forced "
+            "consideration, not a forced choice.\n"
+        )
+    if quarantined:
+        p += (
+            "\nThese task(s) failed twice, were surfaced to the user, and are "
+            "quarantined -- leave them unchecked and do NOT re-plan or "
+            "re-attempt them:\n"
+            + "\n".join(f"  - {t[:160]}" for t in quarantined) + "\n"
+        )
+    if failure_note:
+        p += (
+            f"\nNOTE: a previous re-planner attempt FAILED ({failure_note}). "
+            "This is the second and FINAL automated attempt.\n"
+        )
+    p += f"\n{BUDGET_LINE}"
+    return p
+
+
+def task_prompt(text: str, plan_path: Path, plan_date: str,
+                failure_note: str | None, dispatch_id: str) -> str:
+    log_file = OVERNIGHT_LOG.format(date=plan_date)
+    outcomes_file = outcomes_file_for(plan_date)
+    p = (
+        f"Execute this nightwatch task: {text}\n\n"
+        f"Plan file: {plan_path}\n"
+        "You are an EXECUTOR of this ONE task only. Do not execute, edit, or "
+        "re-plan any other task on the plan.\n"
+        f"Before starting, run `date` and read {state_path()} -- if the "
+        "current time is past stop_at, stop immediately and return a "
+        "completion report saying so.\n"
+        "When done, mark the task complete in the plan file by changing its "
+        "`- [ ]` to `- [x]` and appending an indented one-line result under "
+        "it. That checkbox flip and your one result line are the ONLY "
+        "plan-file edits you may make.\n"
+        f"Write your work to the overnight log at {log_file}.\n"
+        "OUTCOME JOURNAL (do this whether the task succeeded, partially "
+        "succeeded, or was blocked): append exactly ONE JSON line to "
+        f"{outcomes_file} (create the outcomes/ directory if needed; append, "
+        "never overwrite):\n"
+        '{"task": "<the checkbox text verbatim>", '
+        f'"dispatch_id": "{dispatch_id}", '
+        '"status": "done|partial|blocked", '
+        '"attempted": "<one line: what you tried>", '
+        '"outcome": "<one line, concrete: what exists now that did not '
+        'before>", '
+        '"quality_signal": "strong|adequate|weak", '
+        '"followup_candidate": null}\n'
+        "quality_signal is your honest self-grade of the RESULT, not the "
+        "effort. followup_candidate is null unless a concrete deeper pass "
+        "would add real value -- then one line describing what that deeper "
+        "pass would do. The re-planner reads this journal to decide whether "
+        "to go deep on tonight's best results or open new work.\n\n"
+        + STATUS_CONTRACT.format(task_id=dispatch_id) + "\n"
+    )
+    if failure_note:
+        p += (
+            f"\nRETRY: a previous subagent attempt at this task FAILED "
+            f"({failure_note}). This is the second and FINAL automated "
+            "attempt; if you cannot complete it, say so clearly in your "
+            "completion report and leave the checkbox unchecked.\n"
+        )
+    p += f"\n{BUDGET_LINE}"
+    return p
+
+
+# ---- handlers ----------------------------------------------------------
+
+def handle_run_skill(skill: str | None) -> dict:
+    if not skill:
+        return {"action": "report_error",
+                "message": "run_skill event carried no skill name"}
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", skill):
+        return {"action": "report_error",
+                "message": f"invalid skill name {skill!r}"}
+    skill_md = skills_dir() / skill / "SKILL.md"
+    if not skill_md.is_file():  # follows symlinks (skills/nightwatch -> overnight-loop)
+        return {"action": "report_error",
+                "message": f"unknown skill {skill!r}: {skill_md} not found"}
+    now = get_now()
+    journal = Journal(journal_path(), now)
+    # The nightwatch planner skill participates in the heartbeat loop's
+    # in-flight accounting so a heartbeat can't double-spawn a planner.
+    kind = "planner" if skill in ("nightwatch", "overnight-loop") else "skill"
+    label = f"skill:{skill}"
+    rid = journal.record_issue(kind, "run_skill", "spawn", label)
+    return {
+        "action": "spawn",
+        "dispatch_id": rid,
+        "background": True,
+        "label": label,
+        "prompt": skill_prompt(skill),
+        "on_complete": {"relay_needs_attention": True,
+                        "investigate_on_error": True},
+        "ack": f"tools/dispatch/dispatch ack --id {rid} --status "
+               "spawned|completed|failed [--note WHY]",
+    }
+
+
+def handle_heartbeat() -> dict:
+    now = get_now()
+    state = load_json(state_path())
+    if not state or not state.get("active"):
+        return {"action": "noop",
+                "reason": "nightwatch inactive (state file missing or active=false)"}
+
+    started_at = state.get("started_at", "")
+    journal = Journal(journal_path(), now)
+
+    def winddown(reason: str) -> dict:
+        if journal.winddown_logged(started_at):
+            return {"action": "noop",
+                    "reason": f"already wound down ({reason})"}
+        journal.record_issue("winddown", "nightwatch_heartbeat",
+                             "log_winddown", "winddown",
+                             {"started_at": started_at, "status": "completed"})
+        return {"action": "log_winddown", "reason": reason,
+                "message": "nightwatch wind-down"}
+
+    stop_at = parse_iso(state.get("stop_at", ""))
+    if stop_at is None:
+        return winddown("state file has no parseable stop_at -- refusing to "
+                        "run without a stop gate")
+    if now >= stop_at:
+        return winddown(f"past stop_at {stop_at.isoformat()}")
+    tod = now.time()
+    if WINDDOWN_TOD_START <= tod < WINDDOWN_TOD_END:
+        return winddown("past 03:30 AM ET hard gate")
+
+    plan_date = resolve_plan_date(now, state)
+    plan_file = plan_path_for(plan_date)
+    plan_text = None
+    if plan_file.exists():
+        try:
+            plan_text = plan_file.read_text(encoding="utf-8")
+        except OSError:
+            plan_text = None
+    groups = parse_plan(plan_text, plan_file.name) if plan_text else []
+    checked_keys = {t["key"] for g in groups for t in g["tasks"] if t["checked"]}
+
+    # In-flight check: ANY unresolved nightwatch spawn blocks (matches the
+    # old "if a nightwatch task subagent is currently running, do nothing").
+    blocking = journal.in_flight({"task", "planner", "replanner"}, checked_keys)
+    if blocking:
+        return {"action": "noop",
+                "reason": f"task in flight: {blocking.get('label')} "
+                          f"({blocking['id']}, {blocking['status']})"}
+
+    # Plan missing -> spawn the planner.
+    if plan_text is None:
+        fails = journal.failures("planner").get("planner", [])
+        if len(fails) >= MAX_FAILURES:
+            return _surface(journal, "planner",
+                            [f"nightwatch planner failed {len(fails)} times; "
+                             f"no plan exists at {plan_file}"], [])
+        note = fails[-1].get("note") if fails else None
+        prompt = planner_prompt(plan_file, plan_date)
+        if note:
+            prompt += (f"\n\nNOTE: a previous planner attempt FAILED ({note}). "
+                       "This is the final automated attempt.")
+        rid = journal.record_issue("planner", "nightwatch_heartbeat",
+                                   "spawn_planner", "nightwatch-planner",
+                                   {"plan": str(plan_file)})
+        return {
+            "action": "spawn_planner",
+            "dispatch_id": rid,
+            "background": True,
+            "label": "nightwatch-planner",
+            "prompt": prompt,
+            "ack": f"tools/dispatch/dispatch ack --id {rid} --status "
+                   "spawned|completed|failed [--note WHY]",
+        }
+
+    # Failure accounting for tasks.
+    task_fails = journal.failures("task")
+    surfaced = journal.surfaced_keys()
+    all_tasks = [t for g in groups for t in g["tasks"]]
+    quarantined = {t["key"]: t for t in all_tasks
+                   if not t["checked"]
+                   and len(task_fails.get(t["key"], [])) >= MAX_FAILURES}
+
+    # Double-failed tasks not yet surfaced -> surface first (one instruction
+    # per heartbeat; spawning resumes next beat).
+    unsurfaced = [t for k, t in quarantined.items() if k not in surfaced]
+    if unsurfaced:
+        msgs = []
+        for t in unsurfaced:
+            note = (task_fails[t["key"]][-1].get("note") or "no failure note")
+            msgs.append(f"{t['text'][:200]} -- last failure: {note}")
+        return _surface(journal, "task",
+                        [f"Nightwatch task failed twice, quarantined, needs "
+                         f"your attention: {m}" for m in msgs],
+                        [t["key"] for t in unsurfaced])
+
+    # Current group = first group with any unchecked, non-quarantined task.
+    for group in groups:
+        pending = [t for t in group["tasks"]
+                   if not t["checked"] and t["key"] not in quarantined]
+        if not pending:
+            continue
+        tasks_out = []
+        for t in pending:
+            fails = task_fails.get(t["key"], [])
+            note = fails[-1].get("note") if fails else None
+            rid = journal.record_issue(
+                "task", "nightwatch_heartbeat", "spawn_tasks",
+                "nightwatch-task",
+                {"task_key": t["key"], "task_text": t["text"][:120],
+                 "plan": str(plan_file), "retry": bool(fails)})
+            tasks_out.append({
+                "dispatch_id": rid,
+                "label": "nightwatch-task",
+                "text": t["text"],
+                "retry": bool(fails),
+                "prompt": task_prompt(t["text"], plan_file, plan_date, note,
+                                      rid),
+            })
+        return {
+            "action": "spawn_tasks",
+            "plan": str(plan_file),
+            "group": group["header"],
+            "background": True,
+            "tasks": tasks_out,
+            "note": "Spawn ALL listed tasks simultaneously (one background "
+                    "subagent each, prompts verbatim). Ack each dispatch_id: "
+                    "spawned now, completed/failed when it returns "
+                    "(tools/dispatch/dispatch ack --id ID --status ... "
+                    "[--note WHY]).",
+        }
+
+    # Everything checked (or quarantined+surfaced) -> re-plan.
+    re_fails = journal.failures("replanner").get("replanner", [])
+    if len(re_fails) >= MAX_FAILURES:
+        return _surface(journal, "replanner",
+                        [f"nightwatch re-planner failed {len(re_fails)} times "
+                         f"on {plan_file}; loop halted for the night"], [])
+    if journal.count("replanner", "completed") >= 2:
+        return _surface(journal, "replanner",
+                        [f"re-planner completed twice but {plan_file} still "
+                         "has no executable tasks; loop halted -- check the "
+                         "plan file"], [])
+    note = re_fails[-1].get("note") if re_fails else None
+    rid = journal.record_issue("replanner", "nightwatch_heartbeat",
+                               "spawn_replanner", "nightwatch-replanner",
+                               {"plan": str(plan_file)})
+    return {
+        "action": "spawn_replanner",
+        "dispatch_id": rid,
+        "background": True,
+        "label": "nightwatch-replanner",
+        "prompt": replanner_prompt(
+            plan_file, plan_date,
+            [t["text"] for t in quarantined.values()], note),
+        "ack": f"tools/dispatch/dispatch ack --id {rid} --status "
+               "spawned|completed|failed [--note WHY]",
+    }
+
+
+def _surface(journal: Journal, about_kind: str, messages: list[str],
+             task_keys: list[str]) -> dict:
+    # Keyless surfaces (planner/replanner/plan-level): fire once per 24 h.
+    if not task_keys:
+        already = any(e.get("kind") == "surface"
+                      and e.get("about") == about_kind
+                      and not journal._expired(e)
+                      for e in journal.entries.values())
+        if already:
+            return {"action": "noop",
+                    "reason": f"{about_kind} failure already surfaced"}
+    rid = journal.record_issue("surface", "nightwatch_heartbeat",
+                               "surface_to_user", f"surface:{about_kind}",
+                               {"task_keys": task_keys, "about": about_kind})
+    return {
+        "action": "surface_to_user",
+        "dispatch_id": rid,
+        "message": "\n".join(messages),
+        "note": "Send via iMessage, then: tools/dispatch/dispatch ack "
+                f"--id {rid} --status completed",
+    }
+
+
+def handle_nightwatch_start(hours: float | None, until: str | None) -> dict:
+    now = get_now()
+    if hours is None and not until:
+        return {"action": "report_error",
+                "message": "nightwatch_start needs --hours N or --until HH:MM"}
+    if until:
+        m = re.fullmatch(r"(\d{1,2}):(\d{2})", until.strip())
+        if not m:
+            return {"action": "report_error",
+                    "message": f"--until must be HH:MM, got {until!r}"}
+        stop = now.replace(hour=int(m.group(1)), minute=int(m.group(2)),
+                           second=0, microsecond=0)
+        if stop <= now:
+            stop += timedelta(days=1)   # "until 03:30" said at 21:00 = tomorrow
+    else:
+        stop = now + timedelta(hours=hours)
+    state = {
+        "active": True,
+        "stop_at": stop.isoformat(),
+        "started_at": now.isoformat(),
+        "trigger": "manual",
+    }
+    atomic_write_json(state_path(), state)
+    plan_date = now.date().isoformat()
+    plan_file = plan_path_for(plan_date)
+    journal = Journal(journal_path(), now)
+    rid = journal.record_issue("planner", "nightwatch_start", "spawn_planner",
+                               "nightwatch-planner", {"plan": str(plan_file)})
+    return {
+        "action": "spawn_planner",
+        "dispatch_id": rid,
+        "background": True,
+        "label": "nightwatch-planner",
+        "prompt": planner_prompt(plan_file, plan_date),
+        "state_file": str(state_path()),
+        "state": state,
+        "note": f"nightwatch active until {stop.isoformat()}; state file "
+                "written; the heartbeat pipeline takes over from here",
+        "ack": f"tools/dispatch/dispatch ack --id {rid} --status "
+               "spawned|completed|failed [--note WHY]",
+    }
+
+
+def handle_nightwatch_stop() -> dict:
+    now = get_now()
+    state = load_json(state_path()) or {}
+    was_active = bool(state.get("active"))
+    state["active"] = False
+    state["stopped_at"] = now.isoformat()
+    atomic_write_json(state_path(), state)
+    return {
+        "action": "noop",
+        "reason": ("nightwatch stopped; state file set active=false. Any "
+                   "running subagent finishes its current task; no new tasks "
+                   "will be spawned." if was_active
+                   else "nightwatch was not active; state file confirmed "
+                        "active=false"),
+        "state_file": str(state_path()),
+        "state": state,
+    }
+
+
+def handle_ack(rid: str, status: str, note: str | None) -> dict:
+    now = get_now()
+    journal = Journal(journal_path(), now)
+    if rid not in journal.entries:
+        return {"ok": False, "id": rid,
+                "error": "unknown dispatch id (expired or never issued)"}
+    rec = {"ack": True, "id": rid, "ts": now.isoformat(), "status": status}
+    if note:
+        rec["note"] = note
+    journal.append(rec)
+    return {"ok": True, "id": rid, "status": status}
+
+
+# ---- CLI ---------------------------------------------------------------
+
+def read_stdin_json() -> dict:
+    if sys.stdin.isatty():
+        return {}
+    data = sys.stdin.read().strip()
+    if not data:
+        return {}
+    try:
+        obj = json.loads(data)
+        return obj if isinstance(obj, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def run(argv: list[str]) -> dict:
+    parser = argparse.ArgumentParser(
+        prog="dispatch",
+        description="Edwin deterministic event dispatcher (Factor 8)")
+    sub = parser.add_subparsers(dest="event", required=True)
+
+    p_skill = sub.add_parser("run_skill", help="Dispatch a run_skill event")
+    p_skill.add_argument("--skill")
+
+    sub.add_parser("nightwatch_heartbeat",
+                   help="Dispatch a nightwatch_heartbeat event")
+
+    p_start = sub.add_parser("nightwatch_start", help="Start nightwatch")
+    p_start.add_argument("--hours", type=float)
+    p_start.add_argument("--until")
+
+    sub.add_parser("nightwatch_stop", help="Stop nightwatch")
+
+    p_ack = sub.add_parser("ack", help="Report an instruction outcome")
+    p_ack.add_argument("--id", required=True)
+    p_ack.add_argument("--status", required=True,
+                       choices=["spawned", "completed", "failed"])
+    p_ack.add_argument("--note")
+
+    args = parser.parse_args(argv)
+
+    if args.event == "run_skill":
+        skill = args.skill or read_stdin_json().get("skill")
+        return handle_run_skill(skill)
+    if args.event == "nightwatch_heartbeat":
+        return handle_heartbeat()
+    if args.event == "nightwatch_start":
+        hours, until = args.hours, args.until
+        if hours is None and not until:
+            stdin = read_stdin_json()
+            hours = stdin.get("hours")
+            until = stdin.get("until")
+        return handle_nightwatch_start(hours, until)
+    if args.event == "nightwatch_stop":
+        return handle_nightwatch_stop()
+    if args.event == "ack":
+        return handle_ack(args.id, args.status, args.note)
+    raise SystemExit(f"unhandled event {args.event}")
+
+
+def main():
+    result = run(sys.argv[1:])
+    print(json.dumps(result, indent=2))
+    if result.get("ok") is False:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

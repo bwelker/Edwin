@@ -1,0 +1,52 @@
+{
+  "skill": "decision-ledger",
+  "artifact_globs": [
+    "briefing-book/docs/3. 🎯 Action Tracker/Decision Ledger -- *.md",
+    "briefing-book/docs/3. 🎯 Action Tracker/archive/Decision Ledger -- *.md"
+  ],
+  "checks": [
+    {"name": "artifact-exists", "check": "file_exists", "target": "artifact"},
+    {"name": "frontmatter-parses", "check": "frontmatter_parses", "target": "artifact"},
+    {"name": "frontmatter-fields", "check": "frontmatter_fields", "target": "artifact",
+     "params": {"required": ["date", "type", "harvested", "dying", "authority_flags"],
+                "value_patterns": {"date": "\\d{4}-\\d{2}-\\d{2}",
+                                    "type": "decision-ledger",
+                                    "harvested": "\\d+",
+                                    "dying": "\\d+",
+                                    "authority_flags": "\\d+"}}},
+    {"name": "date-matches-filename", "check": "date_matches_filename", "target": "artifact"},
+    {"name": "report-sections-in-order", "check": "sections_in_order", "target": "artifact",
+     "params": {"patterns": ["^## DYING", "^## AUTHORITY FLAGS", "^## QUIET",
+                              "^## IN-MOTION"]}},
+    {"name": "no-em-dashes", "check": "no_em_dashes", "target": "artifact"},
+    {"name": "no-truncation-markers", "check": "no_truncation_markers", "target": "artifact"},
+    {"name": "one-page-max", "check": "max_lines", "target": "artifact", "params": {"max": 120}},
+    {"name": "ledger-jsonl-parses", "check": "jsonl_parses", "target": "path",
+     "params": {"path": "data/decisions/ledger.jsonl"}},
+    {"name": "ledger-schema", "check": "jsonl_schema_fields", "target": "path",
+     "params": {"path": "data/decisions/ledger.jsonl",
+                "required": ["id", "date", "decision", "quote", "decider", "forum",
+                              "source", "expected_consequence", "authority_flag",
+                              "status", "evidence", "first_seen", "last_checked"],
+                "enums": {"status": ["executed", "in-motion", "quiet", "dying",
+                                       "reversed", "superseded"]},
+                "field_patterns": {"id": "dl-\\d{8}-[a-z0-9-]+",
+                                     "date": "\\d{4}-\\d{2}-\\d{2}",
+                                     "first_seen": "\\d{4}-\\d{2}-\\d{2}",
+                                     "last_checked": "\\d{4}-\\d{2}-\\d{2}"}}},
+    {"name": "ledger-no-truncation", "check": "no_truncation_markers", "target": "path",
+     "params": {"path": "data/decisions/ledger.jsonl"}}
+  ],
+  "inputs": [
+    {"glob": "docs/decision-flow-model.md", "newest": 1},
+    {"glob": "data/decisions/ledger.jsonl", "newest": 1},
+    {"glob": "data/fireflies/transcripts/{month}/*.md", "newest": 15},
+    {"glob": "data/fireflies/transcripts/{prev_month}/*.md", "newest": 10},
+    {"glob": "data/o365/calendar/{month}/*.md", "newest": 10},
+    {"glob": "data/o365/calendar/{prev_month}/*.md", "newest": 8},
+    {"glob": "data/o365/mail/{month}/*.md", "newest": 250},
+    {"glob": "data/o365/teams/named/*.md", "newest": 15},
+    {"glob": "data/o365/teams/oneOnOne/*.md", "newest": 15},
+    {"glob": "data/o365/teams/group/*.md", "newest": 10}
+  ]
+}

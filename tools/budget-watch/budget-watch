@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+"""
+Edwin Budget Watch -- subagent token-usage measurement and runaway detection.
+
+Claude Code's Agent tool exposes no budget parameters, so hard per-spawn
+caps are impossible in this harness. What IS enforceable:
+  - measurement (scan/report): real usage distributions per task label,
+    the p50/p90/p99 foundation for sizing spawn-prompt budget expectations
+  - mechanical alerting (watch): a Plombery job that flags ACTIVE subagent
+    transcripts exceeding token/byte/growth thresholds. Alert only -- it
+    never kills anything; the orchestrator decides.
+
+Data sources:
+  - Task transcripts: /private/tmp/claude-<uid>/<project-slug>/
+    <session-id>/tasks/*.output  (JSONL; one file per subagent, per-message
+    usage blocks on assistant entries)
+  - Session transcripts: ~/.claude/projects/<project-slug>/*.jsonl
+    (main sessions + headless `claude -p` runs)
+    (<project-slug> is EDWIN_HOME with "/" replaced by "-", the format
+     Claude Code uses for its scratch + session directories.)
+
+Usage:
+    budget-watch scan [--days N] [--root DIR] [--sessions-dir DIR]
+    budget-watch report [--days N] [--top N]
+    budget-watch watch [--root DIR] [--sessions-dir DIR] [--state FILE]
+                       [--max-tokens N] [--max-bytes N] [--growth-tokens N]
+                       [--active-minutes N]
+
+Exit codes:
+    scan/report: 0 always (errors reported inline)
+    watch: 0 quiet, 2 on breach (Plombery run_cmd turns exit 2 into
+           ERROR -> notify_complete posts a non-ok job_complete event,
+           which the events-channel no-op filter does NOT swallow)
+
+Token accounting:
+  fresh_tokens  = input_tokens + cache_creation_input_tokens + output_tokens
+                  (the cost-bearing side; watch thresholds key on this)
+  cache_read    = cache_read_input_tokens summed (cheap but a runaway
+                  spin-poll signature -- reported, secondary threshold)
+  context_peak  = max single-message total, i.e. context-window pressure
+"""
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+EDWIN_HOME = Path(os.environ.get("EDWIN_HOME", Path.home() / "Edwin"))
+# Claude Code slugifies the project path (full dir path with "/" -> "-") for
+# both its scratch task dir and its session-transcript dir. Derive from EDWIN_HOME.
+PROJECT_SLUG = str(EDWIN_HOME).replace("/", "-")
+TASKS_ROOT = Path(f"/private/tmp/claude-{os.getuid()}/{PROJECT_SLUG}")
+SESSIONS_DIR = Path.home() / ".claude/projects" / PROJECT_SLUG
+DATA_DIR = EDWIN_HOME / "data/budget-watch"
+USAGE_PATH = DATA_DIR / "usage.jsonl"
+STATE_PATH = DATA_DIR / ".watch-state.json"
+
+# watch defaults -- grounded in the measured 7-day distribution (2026-07-02,
+# n=221 task transcripts): fresh p50 312K / p90 562K / p99 1.10M / max 1.15M;
+# cache-read p50 1.6M / p99 18.5M / max 39M; duration p50 3m / p99 17m / max
+# 40m; bytes p99 704K / max 894K. Cumulative caps apply to TASK transcripts
+# only (bounded jobs); long-lived interactive sessions get growth checks only.
+DEFAULT_MAX_TOKENS = 1_200_000       # fresh tokens per task (~ measured max)
+DEFAULT_MAX_CACHE_READ = 60_000_000  # cumulative cache reads (1.5x max legit)
+DEFAULT_MAX_BYTES = 5_000_000        # transcript size (>5x max observed)
+DEFAULT_GROWTH_TOKENS = 250_000      # fresh growth between checks w/o user input
+DEFAULT_GROWTH_CACHE_READ = 30_000_000  # cache-read growth/interval (spin-poll)
+DEFAULT_ACTIVE_MINUTES = 45          # mtime window that counts as "active"
+
+
+# ---------------------------------------------------------------- parsing
+
+def parse_transcript(path: Path) -> dict | None:
+    """Parse a Claude Code JSONL transcript (task .output or session .jsonl).
+
+    Returns aggregate usage or None if the file has no assistant usage.
+    """
+    fresh = 0
+    inp = 0
+    out = 0
+    cache_creation = 0
+    cache_read = 0
+    context_peak = 0
+    tool_calls = 0
+    assistant_msgs = 0
+    user_msgs = 0          # real user messages (not tool results)
+    last_user_ts = None
+    first_ts = None
+    last_ts = None
+    model = None
+    slug = None
+    first_user_text = None
+    lines = 0
+
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                lines += 1
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+
+                ts = entry.get("timestamp")
+                if ts:
+                    if first_ts is None:
+                        first_ts = ts
+                    last_ts = ts
+                if slug is None:
+                    slug = entry.get("slug")
+
+                etype = entry.get("type")
+                msg = entry.get("message") or {}
+
+                if etype == "user":
+                    if "toolUseResult" not in entry:
+                        user_msgs += 1
+                        last_user_ts = ts
+                        if first_user_text is None:
+                            first_user_text = extract_text(msg.get("content"))
+
+                elif etype == "assistant":
+                    assistant_msgs += 1
+                    model = msg.get("model") or model
+                    usage = msg.get("usage") or {}
+                    i = usage.get("input_tokens", 0) or 0
+                    o = usage.get("output_tokens", 0) or 0
+                    cc = usage.get("cache_creation_input_tokens", 0) or 0
+                    cr = usage.get("cache_read_input_tokens", 0) or 0
+                    inp += i
+                    out += o
+                    cache_creation += cc
+                    cache_read += cr
+                    fresh += i + cc + o
+                    context_peak = max(context_peak, i + cc + cr + o)
+                    content = msg.get("content")
+                    if isinstance(content, list):
+                        tool_calls += sum(
+                            1 for b in content
+                            if isinstance(b, dict) and b.get("type") == "tool_use"
+                        )
+    except OSError:
+        return None
+
+    if assistant_msgs == 0 and user_msgs == 0:
+        return None
+
+    duration_s = None
+    if first_ts and last_ts:
+        try:
+            t0 = datetime.fromisoformat(first_ts.replace("Z", "+00:00"))
+            t1 = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+            duration_s = round((t1 - t0).total_seconds())
+        except ValueError:
+            pass
+
+    return {
+        "fresh_tokens": fresh,
+        "input_tokens": inp,
+        "output_tokens": out,
+        "cache_creation_tokens": cache_creation,
+        "cache_read_tokens": cache_read,
+        "context_peak": context_peak,
+        "tool_calls": tool_calls,
+        "assistant_msgs": assistant_msgs,
+        "user_msgs": user_msgs,
+        "last_user_ts": last_user_ts,
+        "first_ts": first_ts,
+        "last_ts": last_ts,
+        "duration_s": duration_s,
+        "model": model,
+        "slug": slug,
+        "first_user_text": first_user_text,
+        "lines": lines,
+    }
+
+
+def extract_text(content) -> str | None:
+    """Pull plain text out of a message content field."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                return block.get("text")
+    return None
+
+
+def derive_label(first_user_text: str | None, slug: str | None) -> str:
+    """Best-effort task label from the spawn prompt."""
+    import re
+    text = (first_user_text or "").strip()
+    if not text:
+        return slug or "unknown"
+    low = text.lower()
+    if text.startswith("<channel"):
+        return "orchestrator-session"
+    m = re.search(r'<scheduled-task name="([^"]+)"', text)
+    if m:
+        return f"scheduled:{m.group(1)}"
+    # skill executions: "Read and execute $EDWIN_HOME/skills/{skill}/SKILL.md"
+    m = re.search(r"skills/([A-Za-z0-9_-]+)/SKILL\.md", text)
+    if m:
+        return f"skill:{m.group(1)}"
+    if low.startswith("execute this nightwatch task") or "nightwatch task" in low[:80]:
+        return "nightwatch-task"
+    # generic: first 6 words, normalized
+    words = text.split()[:6]
+    label = " ".join(words)
+    return label[:60] if label else (slug or "unknown")
+
+
+# ---------------------------------------------------------------- discovery
+
+def find_task_transcripts(root: Path) -> list[Path]:
+    """All subagent task transcripts under the scratch root."""
+    out = []
+    if not root.is_dir():
+        return out
+    for session_dir in root.iterdir():
+        tasks = session_dir / "tasks"
+        if tasks.is_dir():
+            out.extend(p for p in tasks.iterdir() if p.suffix == ".output")
+    return out
+
+
+def find_session_transcripts(sessions_dir: Path) -> list[Path]:
+    if not sessions_dir.is_dir():
+        return []
+    return sorted(sessions_dir.glob("*.jsonl"))
+
+
+# ---------------------------------------------------------------- scan
+
+def load_recorded() -> dict:
+    """id -> record (last occurrence wins)."""
+    recorded = {}
+    if USAGE_PATH.exists():
+        with open(USAGE_PATH, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    recorded[rec["id"]] = rec
+                except (json.JSONDecodeError, KeyError):
+                    continue
+    return recorded
+
+
+def cmd_scan(args):
+    cutoff = datetime.now(timezone.utc).timestamp() - args.days * 86400
+    recorded = load_recorded()
+    new_records = []
+
+    candidates = []  # (id, kind, path)
+    for p in find_task_transcripts(Path(args.root)):
+        candidates.append((f"task:{p.stem}", "task", p))
+    for p in find_session_transcripts(Path(args.sessions_dir)):
+        candidates.append((f"session:{p.stem}", "session", p))
+
+    scanned = skipped_old = skipped_done = failed = 0
+    for rec_id, kind, path in candidates:
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        if st.st_mtime < cutoff:
+            skipped_old += 1
+            continue
+        prev = recorded.get(rec_id)
+        if prev and prev.get("bytes") == st.st_size:
+            # byte size unchanged since last record -> transcript is finished
+            skipped_done += 1
+            continue
+        info = parse_transcript(path)
+        if info is None:
+            failed += 1
+            continue
+        label = derive_label(info.pop("first_user_text"), info.get("slug"))
+        rec = {
+            "id": rec_id,
+            "kind": kind,
+            "path": str(path),
+            "label": label,
+            "bytes": st.st_size,
+            "mtime": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(),
+            "scanned_at": datetime.now(timezone.utc).isoformat(),
+            **info,
+        }
+        new_records.append(rec)
+        recorded[rec_id] = rec
+        scanned += 1
+
+    if new_records:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(USAGE_PATH, "a", encoding="utf-8") as f:
+            for rec in new_records:
+                f.write(json.dumps(rec) + "\n")
+
+    print(f"Scanned {scanned} transcripts "
+          f"({skipped_done} unchanged, {skipped_old} older than {args.days}d, "
+          f"{failed} unparseable). Records: {USAGE_PATH}")
+
+
+# ---------------------------------------------------------------- report
+
+def pct(sorted_vals: list[int], p: float) -> int:
+    if not sorted_vals:
+        return 0
+    k = max(0, min(len(sorted_vals) - 1, round(p / 100 * (len(sorted_vals) - 1))))
+    return sorted_vals[int(k)]
+
+
+def cmd_report(args):
+    recorded = load_recorded()
+    cutoff = datetime.now(timezone.utc).timestamp() - args.days * 86400
+    rows = []
+    for rec in recorded.values():
+        try:
+            mt = datetime.fromisoformat(rec["mtime"]).timestamp()
+        except (KeyError, ValueError):
+            mt = 0
+        if mt >= cutoff:
+            rows.append(rec)
+
+    if not rows:
+        print(f"No usage records in the last {args.days} days. Run `budget-watch scan` first.")
+        return
+
+    by_label: dict[str, list[dict]] = {}
+    for rec in rows:
+        by_label.setdefault(rec.get("label", "unknown"), []).append(rec)
+
+    print(f"Budget report -- {len(rows)} transcripts, last {args.days} days")
+    print(f"(fresh = input + cache-write + output tokens; cache-rd = cache reads)\n")
+    header = f"{'label':<44} {'n':>4} {'p50':>9} {'p90':>10} {'p99':>10} {'max':>11}"
+    print(header)
+    print("-" * len(header))
+    for label, recs in sorted(by_label.items(), key=lambda kv: -sum(r["fresh_tokens"] for r in kv[1])):
+        vals = sorted(r["fresh_tokens"] for r in recs)
+        print(f"{label[:44]:<44} {len(recs):>4} {pct(vals,50):>9,} {pct(vals,90):>10,} "
+              f"{pct(vals,99):>10,} {vals[-1]:>11,}")
+
+    print(f"\nTop {args.top} burners (fresh tokens):")
+    for rec in sorted(rows, key=lambda r: -r["fresh_tokens"])[:args.top]:
+        dur = rec.get("duration_s")
+        dur_s = f"{dur//60}m{dur%60:02d}s" if isinstance(dur, int) else "?"
+        print(f"  {rec['fresh_tokens']:>10,} fresh | {rec.get('cache_read_tokens',0):>12,} cache-rd "
+              f"| {rec.get('tool_calls',0):>4} tools | {dur_s:>8} "
+              f"| {rec.get('label','?')[:38]:<38} | {rec['id']}")
+
+
+# ---------------------------------------------------------------- watch
+
+def cmd_watch(args):
+    now = datetime.now(timezone.utc).timestamp()
+    active_cutoff = now - args.active_minutes * 60
+
+    try:
+        state = json.loads(Path(args.state).read_text())
+    except (OSError, json.JSONDecodeError):
+        state = {}
+
+    candidates = []
+    for p in find_task_transcripts(Path(args.root)):
+        candidates.append(("task", p))
+    for p in find_session_transcripts(Path(args.sessions_dir)):
+        candidates.append(("session", p))
+
+    alerts = []
+    new_state = {}
+    checked = 0
+    for kind, path in candidates:
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        if st.st_mtime < active_cutoff:
+            continue  # not active; finished transcripts never alert
+        checked += 1
+        info = parse_transcript(path)
+        if info is None:
+            continue
+        key = str(path)
+        prev = state.get(key, {})
+        fresh = info["fresh_tokens"]
+        label = derive_label(info.get("first_user_text"), info.get("slug"))
+        ident = f"{label} [{info.get('slug') or path.stem}]"
+
+        new_state[key] = {
+            "fresh_tokens": fresh,
+            "cache_read_tokens": info["cache_read_tokens"],
+            "bytes": st.st_size,
+            "user_msgs": info["user_msgs"],
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        # Cumulative caps: TASK transcripts only. Interactive sessions (the
+        # orchestrator) legitimately accumulate forever; capping them would
+        # alert permanently. Headless/interactive sessions are covered by
+        # the growth checks below.
+        if kind == "task":
+            if fresh > args.max_tokens:
+                alerts.append(
+                    f"BUDGET ALERT [{kind}] {ident}: {fresh:,} fresh tokens "
+                    f"(limit {args.max_tokens:,}), {info['tool_calls']} tool calls, "
+                    f"{st.st_size:,} bytes -- {path}")
+                continue
+            if info["cache_read_tokens"] > args.max_cache_read:
+                alerts.append(
+                    f"BUDGET ALERT [{kind}] {ident}: {info['cache_read_tokens']:,} cumulative "
+                    f"cache-read tokens (limit {args.max_cache_read:,}) -- spin-poll "
+                    f"signature -- {path}")
+                continue
+            if st.st_size > args.max_bytes:
+                alerts.append(
+                    f"BUDGET ALERT [{kind}] {ident}: transcript {st.st_size:,} bytes "
+                    f"(limit {args.max_bytes:,}) -- {path}")
+                continue
+        # Growth-rate (tasks AND sessions): burn since the last check with no
+        # new real user message (a human steering the session resets this).
+        if prev:
+            growth = fresh - prev.get("fresh_tokens", 0)
+            cr_growth = info["cache_read_tokens"] - prev.get("cache_read_tokens", 0)
+            new_users = info["user_msgs"] - prev.get("user_msgs", info["user_msgs"])
+            if growth > args.growth_tokens and new_users <= 0:
+                alerts.append(
+                    f"BUDGET ALERT [{kind}] {ident}: +{growth:,} fresh tokens since "
+                    f"last check with no user input (limit +{args.growth_tokens:,}) "
+                    f"-- possible runaway loop -- {path}")
+            elif cr_growth > args.growth_cache_read and new_users <= 0:
+                alerts.append(
+                    f"BUDGET ALERT [{kind}] {ident}: +{cr_growth:,} cache-read tokens "
+                    f"since last check with no user input (limit "
+                    f"+{args.growth_cache_read:,}) -- spin-poll signature -- {path}")
+
+    Path(args.state).parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(args.state).with_suffix(".tmp")
+    tmp.write_text(json.dumps(new_state, indent=2))
+    os.replace(tmp, args.state)
+
+    if alerts:
+        print(f"BREACH -- {len(alerts)} budget alert(s) across {checked} active transcripts. "
+              "Alert only: nothing was killed. Orchestrator: inspect the paths below, "
+              "decide kill/continue.")
+        for a in alerts:
+            print(a)
+        sys.exit(2)
+    print(f"OK\nbudget-watch quiet: {checked} active transcript(s) within thresholds "
+          f"(max-tokens {args.max_tokens:,}, growth {args.growth_tokens:,} per interval).")
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    parser = argparse.ArgumentParser(description="Edwin subagent budget watch")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_scan = sub.add_parser("scan", help="Harvest usage from task + session transcripts")
+    p_scan.add_argument("--days", type=int, default=7)
+    p_scan.add_argument("--root", default=str(TASKS_ROOT))
+    p_scan.add_argument("--sessions-dir", default=str(SESSIONS_DIR))
+
+    p_rep = sub.add_parser("report", help="Per-label distribution + top burners")
+    p_rep.add_argument("--days", type=int, default=7)
+    p_rep.add_argument("--top", type=int, default=10)
+
+    p_watch = sub.add_parser("watch", help="Alert on active transcripts over thresholds")
+    p_watch.add_argument("--root", default=str(TASKS_ROOT))
+    p_watch.add_argument("--sessions-dir", default=str(SESSIONS_DIR))
+    p_watch.add_argument("--state", default=str(STATE_PATH))
+    p_watch.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
+    p_watch.add_argument("--max-cache-read", type=int, default=DEFAULT_MAX_CACHE_READ)
+    p_watch.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
+    p_watch.add_argument("--growth-tokens", type=int, default=DEFAULT_GROWTH_TOKENS)
+    p_watch.add_argument("--growth-cache-read", type=int, default=DEFAULT_GROWTH_CACHE_READ)
+    p_watch.add_argument("--active-minutes", type=int, default=DEFAULT_ACTIVE_MINUTES)
+
+    args = parser.parse_args()
+    if args.command == "scan":
+        cmd_scan(args)
+    elif args.command == "report":
+        cmd_report(args)
+    elif args.command == "watch":
+        cmd_watch(args)
+
+
+if __name__ == "__main__":
+    main()

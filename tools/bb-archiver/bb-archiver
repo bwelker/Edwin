@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""Edwin Briefing Book Archiver -- policy-driven retention sweeps.
+
+Moves stale Briefing Book files into their section archive folders,
+mirrored on BOTH sides (Edwin docs working copy + iCloud Obsidian
+vault) in the same pass, so the publish/watcher pipelines can't
+resurrect anything.
+
+NEVER deletes. Moves only, hash-verified before and after.
+
+Policy source of truth: the fenced ```yaml block inside
+"Archive Policy.md" at the VAULT top level (that's the copy the user
+red-pens in Obsidian). Falls back to the docs-side copy if the vault
+copy is missing/unparseable. The human-readable table in the same doc
+mirrors the yaml block -- if they ever disagree, the yaml block wins.
+
+Usage:
+    bb-archiver sweep           # dry-run (unless policy mode: live): report what WOULD move
+    bb-archiver sweep --live    # actually move, both sides, hash-verified
+    bb-archiver status          # mode, last run, exemptions, recent history
+
+Safety rules (hard-coded, not policy-overridable):
+    - Anything inside an archive/ folder (or Daily Archive monthly
+      bucket) is never touched again.
+    - A file is only moved if it exists on BOTH sides with identical
+      hashes (mid-sync or one-sided files are flagged, not moved).
+    - Basename collisions at the destination are flagged, not moved.
+    - Files the user moved OUT of an archive are exempt for
+      exemption_days (default 90), tracked in the state file.
+
+State: tools/bb-archiver/.archiver-state.json
+Reports: appended to "11. <robot> Operations/Archiver Report -- YYYY-MM-DD.md"
+on both sides. Dry-run reports are clearly marked DRY-RUN.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    print("ERROR: PyYAML not available to this interpreter")
+    sys.exit(1)
+
+EDWIN_HOME = Path(os.environ.get("EDWIN_HOME", Path.home() / "Edwin"))
+DOCS = EDWIN_HOME / "briefing-book" / "docs"
+# iCloud Obsidian vault mirror; override with BRIEFING_BOOK_VAULT if the
+# vault lives elsewhere.
+VAULT = Path(os.environ.get(
+    "BRIEFING_BOOK_VAULT",
+    Path.home() / "Library" / "Mobile Documents"
+    / "iCloud~md~obsidian" / "Documents" / "Briefing Book"))
+POLICY_BASENAME = "Archive Policy.md"
+OPS_SECTION = "11. 🤖 Operations"
+STATE_FILE = Path(__file__).resolve().parent / ".archiver-state.json"
+
+DATE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+ARCHIVE_DIR_NAMES = {"archive", "daily archive", "weekly archive"}
+MONTH_BUCKET_RE = re.compile(r"^\d{4}-\d{2}$")
+
+
+def log(msg):
+    print(msg)
+
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except Exception:
+            pass
+    return {"last_run": None, "last_mode": None, "exemptions": {}, "history": []}
+
+
+def save_state(state: dict):
+    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False))
+
+
+def load_policy() -> tuple[dict, str]:
+    """Extract the fenced yaml block from Archive Policy.md.
+    Vault copy is source of truth; docs copy is fallback."""
+    for source, path in (("vault", VAULT / POLICY_BASENAME), ("docs", DOCS / POLICY_BASENAME)):
+        if not path.exists():
+            continue
+        text = path.read_text()
+        m = re.search(r"```yaml\n(.*?)```", text, re.DOTALL)
+        if not m:
+            continue
+        try:
+            policy = yaml.safe_load(m.group(1))
+        except Exception as e:
+            log(f"WARN: yaml block in {source} policy copy unparseable: {e}")
+            continue
+        if isinstance(policy, dict) and "rules" in policy:
+            return policy, source
+    raise RuntimeError(f"No parseable policy block found in '{POLICY_BASENAME}' (vault or docs)")
+
+
+def in_archive(rel: Path) -> bool:
+    """True if any path component is an archive folder or monthly bucket."""
+    for part in rel.parts[:-1]:
+        if part.lower() in ARCHIVE_DIR_NAMES or MONTH_BUCKET_RE.match(part):
+            return True
+    return False
+
+
+def filename_date(name: str) -> datetime | None:
+    m = DATE_RE.search(name)
+    if not m:
+        return None
+    try:
+        return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def file_age_days(rel: Path, now: datetime) -> tuple[float, datetime]:
+    """Conservative age: a file must be old by EVERY signal.
+    Uses the most-recent of (filename date, docs mtime, vault mtime).
+    Returns (age_days, basis_datetime)."""
+    signals = []
+    fd = filename_date(rel.name)
+    if fd:
+        signals.append(fd)
+    for root in (DOCS, VAULT):
+        p = root / rel
+        if p.exists():
+            signals.append(datetime.fromtimestamp(p.stat().st_mtime))
+    basis = max(signals)
+    return (now - basis).total_seconds() / 86400.0, basis
+
+
+def detect_exemptions(state: dict, now: datetime, exemption_days: int) -> list[str]:
+    """If a file we previously archived no longer exists at its archive
+    destination but is back at its original location, the user pulled it
+    out -- exempt it for exemption_days."""
+    new = []
+    for entry in state.get("history", []):
+        if entry.get("mode") != "live":
+            continue
+        src, dest = entry.get("src"), entry.get("dest")
+        if not src or not dest:
+            continue
+        if not (DOCS / dest).exists() and (DOCS / src).exists():
+            until = (now + timedelta(days=exemption_days)).strftime("%Y-%m-%d")
+            existing = state["exemptions"].get(src)
+            if not existing or existing < until:
+                state["exemptions"][src] = until
+                new.append(src)
+    # drop expired exemptions
+    today = now.strftime("%Y-%m-%d")
+    state["exemptions"] = {k: v for k, v in state["exemptions"].items() if v >= today}
+    return new
+
+
+def plan_rule(rule: dict, now: datetime, state: dict) -> list[dict]:
+    """Evaluate one policy rule. Non-recursive: only files at the rule
+    path's top level are considered. Returns candidate dicts."""
+    out = []
+    rel_root = Path(rule["path"])
+    docs_dir = DOCS / rel_root
+    if not docs_dir.is_dir():
+        return out
+    age_limit = float(rule["age_days"])
+    dated_only = bool(rule.get("dated_only", False))
+    exclude = set(rule.get("exclude", []))
+    for p in sorted(docs_dir.iterdir()):
+        if not p.is_file() or p.name.startswith(".") or p.suffix.lower() != ".md":
+            continue
+        if p.name in exclude or p.name == POLICY_BASENAME:
+            continue
+        rel = rel_root / p.name
+        if in_archive(rel):
+            continue
+        fd = filename_date(p.name)
+        if dated_only and not fd:
+            continue
+        age, basis = file_age_days(rel, now)
+        if age <= age_limit:
+            continue
+        cand = {
+            "rule": rule["name"], "src": str(rel),
+            "age_days": round(age, 1), "basis": basis.strftime("%Y-%m-%d"),
+        }
+        # destination ({YYYY-MM} bucket from filename date, else basis month)
+        bucket_dt = fd or basis
+        dest_dir = Path(rule["dest"].replace("{YYYY-MM}", bucket_dt.strftime("%Y-%m")))
+        dest = dest_dir / p.name
+        cand["dest"] = str(dest)
+        # exemption?
+        ex_until = state["exemptions"].get(str(rel))
+        if ex_until:
+            cand["skip"] = f"exempt until {ex_until} (user pulled it from archive)"
+            out.append(cand)
+            continue
+        # both sides present + identical?
+        docs_path, vault_path = DOCS / rel, VAULT / rel
+        if not vault_path.exists():
+            cand["skip"] = "one-sided (missing on vault side; sync pending?)"
+            out.append(cand)
+            continue
+        h_docs, h_vault = sha256(docs_path), sha256(vault_path)
+        if h_docs != h_vault:
+            cand["skip"] = "sides differ (mid-sync); retry next sweep"
+            out.append(cand)
+            continue
+        cand["hash"] = h_docs
+        # collision?
+        if (DOCS / dest).exists() or (VAULT / dest).exists():
+            cand["skip"] = "basename collision at destination"
+            out.append(cand)
+            continue
+        out.append(cand)
+    return out
+
+
+def execute_move(cand: dict) -> str | None:
+    """Move src -> dest on both sides, hash-verified. Returns error or None.
+    If the vault-side move fails after the docs-side succeeded, the
+    docs-side move is rolled back so the two sides never diverge."""
+    rel_src, rel_dest = Path(cand["src"]), Path(cand["dest"])
+    docs_src, docs_dest = DOCS / rel_src, DOCS / rel_dest
+    vault_src, vault_dest = VAULT / rel_src, VAULT / rel_dest
+    pre = cand["hash"]
+    try:
+        docs_dest.parent.mkdir(parents=True, exist_ok=True)
+        vault_dest.parent.mkdir(parents=True, exist_ok=True)
+        os.rename(docs_src, docs_dest)
+    except Exception as e:
+        return f"docs-side move failed: {e}"
+    try:
+        os.rename(vault_src, vault_dest)
+    except Exception as e:
+        os.rename(docs_dest, docs_src)  # rollback
+        return f"vault-side move failed (docs side rolled back): {e}"
+    try:
+        post_docs, post_vault = sha256(docs_dest), sha256(vault_dest)
+    except Exception as e:
+        return f"post-move hash check failed: {e}"
+    if post_docs != pre or post_vault != pre:
+        return f"HASH MISMATCH after move (pre={pre[:12]} docs={post_docs[:12]} vault={post_vault[:12]})"
+    return None
+
+
+def write_report(lines: list[str], now: datetime):
+    """Append a dated report to the Operations section, both sides."""
+    name = f"Archiver Report -- {now.strftime('%Y-%m-%d')}.md"
+    body = "\n".join(lines) + "\n"
+    for root in (DOCS, VAULT):
+        path = root / OPS_SECTION / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            path.write_text(path.read_text().rstrip() + "\n\n" + body)
+        else:
+            path.write_text(f"---\ndate: {now.strftime('%Y-%m-%d')}\ntype: archiver-report\n---\n\n"
+                            f"# Archiver Report -- {now.strftime('%Y-%m-%d')}\n\n" + body)
+    return str(DOCS / OPS_SECTION / name)
+
+
+def cmd_sweep(args) -> int:
+    now = datetime.now()
+    policy, policy_source = load_policy()
+    state = load_state()
+    live = bool(args.live) or str(policy.get("mode", "dry-run")).lower() == "live"
+    mode = "LIVE" if live else "DRY-RUN"
+    exemption_days = int(policy.get("exemption_days", 90))
+
+    new_exempt = detect_exemptions(state, now, exemption_days)
+
+    candidates = []
+    for rule in policy.get("rules", []):
+        candidates.extend(plan_rule(rule, now, state))
+
+    moved, would_move, skipped, errors = [], [], [], []
+    for c in candidates:
+        if "skip" in c:
+            skipped.append(c)
+        elif live:
+            err = execute_move(c)
+            if err:
+                c["skip"] = f"ERROR: {err}"
+                errors.append(c)
+            else:
+                moved.append(c)
+                state["history"].append({
+                    "date": now.strftime("%Y-%m-%dT%H:%M"), "mode": "live",
+                    "src": c["src"], "dest": c["dest"], "rule": c["rule"],
+                })
+        else:
+            would_move.append(c)
+
+    # report
+    rl = [f"## Sweep {now.strftime('%Y-%m-%d %H:%M')} -- **{mode}**"
+          + (" (dry-run: nothing was moved)" if not live else ""),
+          f"Policy read from: {policy_source} copy. "
+          f"Candidates: {len(candidates)}, "
+          + (f"moved: {len(moved)}" if live else f"would move: {len(would_move)}")
+          + f", skipped/flagged: {len(skipped)}, errors: {len(errors)}", ""]
+    if new_exempt:
+        rl.append(f"New exemptions ({exemption_days}d, pulled from archive by the user): "
+                  + ", ".join(new_exempt))
+        rl.append("")
+    acted = moved if live else would_move
+    if acted:
+        rl.append(f"### {'Moved' if live else 'Would move'}")
+        for c in acted:
+            rl.append(f"- `{c['src']}` -> `{c['dest']}`  ({c['rule']}, {c['age_days']}d old)")
+        rl.append("")
+    if skipped or errors:
+        rl.append("### Skipped / flagged")
+        for c in skipped + errors:
+            rl.append(f"- `{c['src']}` -- {c['skip']}  ({c['rule']})")
+        rl.append("")
+    if not candidates:
+        rl.append("Nothing eligible. Briefing Book is within retention windows.")
+        rl.append("")
+    report_path = write_report(rl, now)
+
+    state["last_run"] = now.strftime("%Y-%m-%dT%H:%M:%S")
+    state["last_mode"] = mode
+    save_state(state)
+
+    for line in rl:
+        log(line)
+    log(f"Report appended: {report_path}")
+    if errors:
+        log(f"Sweep finished with {len(errors)} move error(s) -- see report")
+        return 1
+    verb = "moved" if live else "would move"
+    log(f"Sweep complete ({mode}): {len(candidates)} candidates, "
+        f"{len(acted)} {verb}, {len(skipped)} skipped")
+    return 0
+
+
+def cmd_status(args) -> int:
+    try:
+        policy, policy_source = load_policy()
+        log(f"Policy: mode={policy.get('mode', 'dry-run')} "
+            f"({len(policy.get('rules', []))} rules, read from {policy_source} copy)")
+    except RuntimeError as e:
+        log(f"Policy: UNREADABLE -- {e}")
+    state = load_state()
+    log(f"Last run: {state.get('last_run') or 'never'} ({state.get('last_mode') or '-'})")
+    ex = state.get("exemptions", {})
+    log(f"Exemptions: {len(ex)}")
+    for k, v in sorted(ex.items()):
+        log(f"  - {k} (until {v})")
+    hist = state.get("history", [])
+    log(f"Move history: {len(hist)} entries")
+    for h in hist[-10:]:
+        log(f"  - {h['date']} {h['src']} -> {h['dest']}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Briefing Book retention archiver")
+    sub = ap.add_subparsers(dest="command", required=True)
+    p_sweep = sub.add_parser("sweep", help="run a retention sweep (dry-run by default)")
+    p_sweep.add_argument("--live", action="store_true",
+                         help="actually move files (otherwise report-only)")
+    sub.add_parser("status", help="show mode, last run, exemptions, history")
+    args = ap.parse_args()
+    try:
+        if args.command == "sweep":
+            sys.exit(cmd_sweep(args))
+        sys.exit(cmd_status(args))
+    except RuntimeError as e:
+        log(f"ERROR: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
