@@ -1,7 +1,9 @@
 #!/opt/homebrew/bin/python3.12
 """Edwin Memory Indexer — contextual retrieval + hybrid search.
 
-Indexes Edwin markdown data files into Qdrant with:
+Indexes markdown from $EDWIN_HOME/data (connectors, with per-source
+whitelists/exclusions) plus the $EDWIN_HOME/memory working-memory layer
+(excluding memory/archive) into Qdrant with:
   - Dense embeddings (qwen3-embedding:8b via Ollama)
   - Sparse embeddings (BM42 via fastembed)
   - Contextual retrieval prefixes (Haiku via Anthropic API)
@@ -21,6 +23,7 @@ import argparse
 import atexit
 import fcntl
 import json
+import os
 import random
 import signal
 import sys
@@ -36,7 +39,7 @@ from lib.config import (DATA_DIR, LOCK_FILE, COLLECTION_NAME, EMBEDDING_DIM,
                          OLLAMA_URL, EMBEDDING_MODEL, CHARS_PER_TOKEN)
 from lib.metadata import (detect_source, detect_connector, extract_frontmatter,
                            extract_date, extract_channel, extract_payload_fields)
-from lib.scanner import FileScanner
+from lib.scanner import FileScanner, path_to_key, key_to_path
 from lib.chunker import chunk_file
 from lib.embedder import DenseEmbedder, SparseEmbedder
 from lib.qdrant_store import QdrantStore
@@ -60,10 +63,13 @@ def cmd_sync(args):
         log("  Use --force to reindex everything.")
         return 1
 
-    # Scan for changes
-    log(f"Scanning {DATA_DIR}...")
+    # Scan for changes (data/ plus the memory/ working-memory root)
+    log(f"Scanning {DATA_DIR} + memory/ ...")
     to_index, to_delete = scanner.scan(force=args.force, source_filter=args.source)
     log(f"  {len(to_index)} files to index, {len(to_delete)} to delete")
+    if to_index:
+        head = ", ".join(path_to_key(p) for p in to_index[:8])
+        log(f"  Queue head (per-source round-robin): {head}")
 
     # Backfill: pull in any files that were indexed without Haiku context.
     # Bypasses hash check; only adds files that exist on disk and need context.
@@ -71,10 +77,13 @@ def cmd_sync(args):
         if args.no_context:
             log("ERROR: --backfill-context is incompatible with --no-context")
             return 1
-        existing = {str(p.relative_to(DATA_DIR)): p
-                    for p in DATA_DIR.rglob("*.md")}
-        already = {str(p.relative_to(DATA_DIR)) for p in to_index}
-        added = 0
+        from lib.config import MEMORY_DIR
+        existing = {path_to_key(p): p for p in DATA_DIR.rglob("*.md")}
+        if MEMORY_DIR.is_dir():
+            existing.update({path_to_key(p): p
+                             for p in MEMORY_DIR.rglob("*.md")})
+        already = {path_to_key(p) for p in to_index}
+        backfill = []
         for key, info in scanner.state.get("files", {}).items():
             if info.get("context_done", False):
                 continue
@@ -85,9 +94,17 @@ def cmd_sync(args):
             p = existing.get(key)
             if p is None:
                 continue
-            to_index.append(p)
-            added += 1
-        log(f"  +{added} files queued for context backfill")
+            backfill.append(p)
+        # Round-robin the backfill queue across sources (same reason as the
+        # main queue), then apply the per-run cap so Haiku cost trickles
+        # (nightly sys-context-backfill) instead of spiking in one run.
+        backfill = scanner._round_robin(backfill)
+        capped = ""
+        if args.limit is not None and len(backfill) > args.limit:
+            capped = f" (capped from {len(backfill)} by --limit {args.limit})"
+            backfill = backfill[:args.limit]
+        to_index.extend(backfill)
+        log(f"  +{len(backfill)} files queued for context backfill{capped}")
 
     if not to_index and not to_delete:
         log("Nothing to do.")
@@ -115,7 +132,7 @@ def cmd_sync(args):
     if to_delete:
         log(f"Deleting {len(to_delete)} removed files from index...")
         for key in to_delete:
-            file_path = str(DATA_DIR / key)
+            file_path = str(key_to_path(key))
             store.delete_file_points(file_path)
             scanner.remove_file(key)
 
@@ -136,8 +153,17 @@ def cmd_sync(args):
             if context_gen and not scanner.needs_context(file_path):
                 file_context_gen = None
 
+            # Reset completion flag per file (zero-chunk files never reach
+            # contextualize_chunks, which would otherwise leave a stale flag)
+            if file_context_gen:
+                file_context_gen.last_file_context_complete = True
+
             n_chunks = _index_file(file_path, dense, sparse, store, file_context_gen)
-            context_was_done = file_context_gen is not None
+            # context_done only if the generator ran AND finished within its
+            # rate-limit budget. Budget-exhausted files are embedded without
+            # context and left context_done=False for --backfill-context.
+            context_was_done = (file_context_gen is not None
+                                and file_context_gen.last_file_context_complete)
             scanner.update_file(file_path, n_chunks, context_done=context_was_done)
             total_chunks += n_chunks
 
@@ -165,6 +191,9 @@ def cmd_sync(args):
     elapsed = time.time() - start_time
     log(f"\nDone: {len(to_index)} files, {total_chunks} chunks, "
         f"{errors} errors, {elapsed:.1f}s")
+    if context_gen and context_gen.mail_seen:
+        log(f"  Bulk-mail filter: {context_gen.bulk_skipped}/"
+            f"{context_gen.mail_seen} mail files skipped Haiku context")
 
     return 0
 
@@ -366,6 +395,10 @@ def main():
     sync_p.add_argument("--backfill-context", action="store_true",
                         help="Reindex files that were indexed without Haiku context. "
                              "Bypasses hash check; only touches files where context_done=False.")
+    sync_p.add_argument("--limit", type=int, default=None,
+                        help="Cap the number of files --backfill-context may queue "
+                             "per run (per-night Haiku cost cap; remainder waits "
+                             "for the next run)")
 
     # status
     sub.add_parser("status", help="Show index stats")
@@ -389,13 +422,39 @@ def main():
             lock_path = LOCK_FILE.parent / f".sync-{source}.lock"
         else:
             lock_path = LOCK_FILE
-        lock_fd = open(lock_path, "w")
+        # Open append-mode so a contender doesn't truncate the holder's info.
+        # flock is a kernel advisory lock tied to the process: it is released
+        # automatically when the holder exits or is killed, so it cannot go
+        # stale. If acquisition fails, the holder is alive right now.
+        lock_fd = open(lock_path, "a+")
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             scope = f"source '{source}'" if source else "all sources"
-            log(f"ERROR: Another indexer instance is running for {scope}.")
-            return 1
+            holder = ""
+            try:
+                lock_fd.seek(0)
+                info = lock_fd.read().strip()
+                if info:
+                    holder = f" (held by {info})"
+            except OSError:
+                pass
+            lock_fd.close()
+            # Benign overlap: incremental runs can exceed the schedule
+            # interval. Skip cleanly -- the next scheduled run catches up.
+            log(f"SKIP: Another indexer instance is running for {scope}{holder}. "
+                f"Nothing to do; the next scheduled run will pick up changes.")
+            return 0
+
+        # Record holder identity in the lock file for diagnostics.
+        try:
+            lock_fd.seek(0)
+            lock_fd.truncate()
+            lock_fd.write(f"pid {os.getpid()} since "
+                          f"{datetime.now().astimezone().isoformat()}")
+            lock_fd.flush()
+        except OSError:
+            pass
 
         # Register cleanup for lock file on exit/signal
         def _cleanup_lock():

@@ -18,11 +18,28 @@ Transport: stdio
 import hashlib
 import os
 import sqlite3
+import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
+
+# Near-duplicate detection shared with tools/pm-dedup. pm_search is a literal
+# SQL LIKE substring matcher, so a "pm_search before pm_add" dedup step
+# silently misses reworded restatements of the same commitment. The add-time
+# guard below uses fuzzy + token-overlap similarity to catch those.
+# Import is best-effort: if the module can't load, pm_add degrades to its old
+# always-insert behavior rather than breaking.
+_DEDUP_DIR = Path(__file__).resolve().parents[2] / "tools" / "pm-dedup"
+try:
+    if str(_DEDUP_DIR) not in sys.path:
+        sys.path.insert(0, str(_DEDUP_DIR))
+    from dedup_core import find_matches as _find_matches
+
+    _DEDUP_AVAILABLE = True
+except Exception:  # pragma: no cover - defensive
+    _DEDUP_AVAILABLE = False
 
 DB_PATH = Path(
     os.environ.get(
@@ -51,8 +68,15 @@ mcp = FastMCP("edwin-pm")
 
 
 def _get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH))
+    # busy_timeout: wait up to 5s for a lock instead of failing immediately.
+    # Without this, concurrent writers (recurring/dedup/wake cron jobs plus
+    # multiple agent server processes) can make reads raise "database is
+    # locked" or return empty, which can manifest as pm_search returning
+    # "No items found" under contention.
+    conn = sqlite3.connect(str(DB_PATH), timeout=5.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
@@ -207,8 +231,16 @@ def pm_add(
     source_date: str = "",
     external_ref: str = "",
     tags: str = "",
+    force: bool = False,
 ) -> str:
     """Add a new prospective memory item.
+
+    Runs a near-duplicate guard first: if an existing OPEN item looks like a
+    reworded restatement of this one, the item is NOT added and the candidate
+    match(es) are returned instead, so the caller can skip (the commitment is
+    already tracked) or update the existing item. This is a flag-only guard --
+    it never deletes or merges anything. Pass force=True to add anyway when the
+    new item is genuinely distinct.
 
     Args:
         description: What needs to be done
@@ -222,6 +254,7 @@ def pm_add(
         source_date: When the source event happened, ISO date (optional, defaults to today)
         external_ref: External reference like "linear:BRA-75" (optional)
         tags: Comma-separated tags (optional)
+        force: Skip the near-duplicate guard and add unconditionally (default False)
     """
     if type not in VALID_TYPES:
         return f"Error: type must be one of {VALID_TYPES}"
@@ -247,6 +280,38 @@ def pm_add(
 
     conn = _get_conn()
     cursor = conn.cursor()
+
+    # --- Near-duplicate guard (flag-only; skippable with force=True) ----------
+    if _DEDUP_AVAILABLE and not force:
+        open_rows = cursor.execute(
+            """SELECT id, description, status, owner, counterparty, due_date
+               FROM items
+               WHERE status IN ('open','in_progress','waiting','blocked','scheduled','overdue')"""
+        ).fetchall()
+        matches = _find_matches(
+            description,
+            [dict(r) for r in open_rows],
+            owner=owner,
+            counterparty=counterparty,
+        )
+        if matches:
+            conn.close()
+            lines = [
+                "Possible duplicate -- NOT added. "
+                f"Found {len(matches)} open item(s) that look like this commitment "
+                "(literal pm_search would miss these -- they are reworded):",
+            ]
+            for item, score in matches[:5]:
+                due = f" due={item['due_date']}" if item.get("due_date") else ""
+                lines.append(
+                    f"  [{item['id']}] (sim {score}) {item['description'][:100]}"
+                    f" | status={item.get('status')}{due}"
+                )
+            lines.append(
+                "If it's already tracked above, skip (or pm_update the existing "
+                "item). If this is genuinely new, call pm_add again with force=true."
+            )
+            return "\n".join(lines)
 
     item_id = _generate_id(description)
     # Handle collisions

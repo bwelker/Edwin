@@ -11,6 +11,14 @@ INDEXER_DIR = Path(__file__).resolve().parent.parent
 STATE_FILE  = INDEXER_DIR / ".index-state.json"
 LOCK_FILE   = INDEXER_DIR / ".sync.lock"
 
+# Second scan root: Edwin's working-memory layer (session summaries,
+# memory files, librarian curation). Indexed as source "memory".
+# State-file keys for this root are prefixed with MEMORY_KEY_PREFIX so
+# they can never collide with data/-relative keys.
+MEMORY_DIR        = EDWIN_HOME / "memory"
+MEMORY_KEY_PREFIX = "@memory/"
+MEMORY_EXCLUDE_DIRS = {"archive"}  # memory/archive/ is out of scope
+
 # -- Ollama (dense embeddings) -----------------------------------------------
 
 OLLAMA_URL       = os.environ.get("EDWIN_OLLAMA_URL", "http://localhost:11434")
@@ -33,6 +41,18 @@ SPARSE_MODEL = "Qdrant/bm42-all-minilm-l6-v2-attentions"
 ANTHROPIC_MODEL  = "claude-haiku-4-5-20251001"
 ANTHROPIC_RETRIES = 5
 CONTEXT_MIN_DOC_TOKENS = 200  # default: skip contextualization for tiny files
+
+# Rate-limit retry budget: total seconds a single file may spend sleeping on
+# 429/529 responses before context generation is skipped for the rest of the
+# file. The file is still embedded (without context prefixes) and recorded
+# with context_done=False so `indexer sync --backfill-context` fills it later.
+# Override with the CONTEXT_RATE_LIMIT_BUDGET env var (seconds).
+CONTEXT_RATE_LIMIT_BUDGET = int(
+    os.environ.get("CONTEXT_RATE_LIMIT_BUDGET", "600"))
+# Per-sleep caps so no single wait is unbounded or excessive.
+CONTEXT_RATE_LIMIT_SLEEP = 60       # seconds per 429 wait (first 3 hits)
+CONTEXT_RATE_LIMIT_SLEEP_LONG = 300  # seconds per 429 wait after 3 hits
+CONTEXT_OVERLOAD_SLEEP = 120         # seconds per 529 wait
 
 # Per-source context thresholds. 0 = context everything for this source.
 # Sources not listed here use CONTEXT_MIN_DOC_TOKENS.
@@ -102,6 +122,7 @@ CHUNK_CONFIG = {
     "fireflies":      {"tokens": 600,  "overlap": 60,  "strategy": "sections"},
     "limitless":      {"tokens": 600,  "overlap": 60,  "strategy": "speaker"},
     "jira":           {"tokens": 512,  "overlap": 50,  "strategy": "header"},
+    "linear":         {"tokens": 512,  "overlap": 50,  "strategy": "header"},
     "confluence":     {"tokens": 512,  "overlap": 50,  "strategy": "header"},
     "bitbucket":      {"tokens": 512,  "overlap": 50,  "strategy": "header"},
     "sessions":       {"tokens": 600,  "overlap": 60,  "strategy": "turns"},
@@ -111,6 +132,7 @@ CHUNK_CONFIG = {
     "notes":          {"tokens": 512,  "overlap": 50,  "strategy": "header"},
     "photos":         {"tokens": 512,  "overlap": 50,  "strategy": "default"},
     "screentime":     {"tokens": 512,  "overlap": 50,  "strategy": "default"},
+    "memory":         {"tokens": 512,  "overlap": 50,  "strategy": "header"},
     "default":        {"tokens": 512,  "overlap": 50,  "strategy": "default"},
 }
 
@@ -132,6 +154,7 @@ SOURCE_MAP = {
     "fireflies":           "fireflies",
     "limitless":           "limitless",
     "atlassian/jira":      "jira",
+    "linear":              "linear",
     "atlassian/confluence": "confluence",
     "atlassian/bitbucket": "bitbucket",
     "sessions":            "sessions",

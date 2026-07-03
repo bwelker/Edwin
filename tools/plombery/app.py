@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.request
 from pathlib import Path
 from apscheduler.triggers.cron import CronTrigger
@@ -20,19 +21,134 @@ SKILL_EVENTS_URL = os.environ.get("SKILL_EVENTS_URL", "http://127.0.0.1:8790/run
 PLOMBERY_PORT = int(os.environ.get("PLOMBERY_PORT", "8899"))
 
 
-def run_cmd(cmd: str, timeout: int = 7200) -> str:
+# ---------------------------------------------------------------------------
+# Retry policy -- network-flavored CONNECTOR SYNCS only.
+#
+# Plombery pipelines fail once and stay failed until the next scheduled fire.
+# This narrowly restores retry-with-backoff parity: only the pipelines below
+# retry, and only on nonzero exit codes that don't look like credential
+# problems.
+#
+# Deliberately EXCLUDED from retry:
+#   - system tools / watchdogs / evals (a nonzero exit can be a breach SIGNAL,
+#     not a failure -- retrying would suppress the alert)
+#   - skill-trigger pipelines (they just fire an event)
+#   - local-source connectors (imessage, browser, notes, calls, screentime,
+#     photos, documents, sessions -- failures there are disk/schema/permission
+#     problems, not transient network blips; a 30s retry won't heal them)
+#   - TIMEOUT results (a multi-hour job that hit its cap should wait for the
+#     next scheduled fire, not immediately burn another window)
+RETRY_DELAYS = [30, 120]  # seconds before attempt 2 and attempt 3
+
+RETRYABLE_PIPELINES = {
+    "sync-o365",
+    "sync-google",
+    "sync-limitless",
+    "sync-fireflies",
+    "sync-atlassian",
+    "sync-plaud",
+    "sync-contacts",
+}
+
+# Case-insensitive substrings that mark a failure as PERMANENT (no retry --
+# alert immediately). Conservative: a marker only fires on a nonzero exit.
+# Auth failures especially must NOT retry: hammering an expired token can burn
+# the refresh window.
+PERMANENT_FAILURE_MARKERS = [
+    # OAuth / token
+    "invalid_grant",
+    "invalid_client",
+    "unauthorized_client",
+    "interaction_required",
+    "aadsts",                     # Azure AD STS error codes
+    "token expired",
+    "token has expired",
+    "token is expired",
+    "expired_token",
+    "authenticationfailed",
+    "invalidauthenticationtoken",
+    "invalid api key",
+    "invalid_api_key",
+    "credential",
+    # environment problems that won't heal in 30s
+    "permission denied",
+    "no such file or directory",
+]
+
+
+def _current_pipeline_id():
+    """Pipeline id for the currently running task, or None outside a run."""
+    try:
+        return pipeline_context.get().id
+    except Exception:
+        return None
+
+
+def _run_once(cmd: str, timeout: int):
+    """Single subprocess attempt. Returns (status, output, retry_eligible).
+    Only a plain nonzero exit is retry-eligible; TIMEOUT and spawn errors
+    are not (see policy comment above)."""
     try:
         result = subprocess.run(
             cmd, shell=True, cwd=str(EDWIN_HOME),
             capture_output=True, text=True, timeout=timeout
         )
-        status = "OK" if result.returncode == 0 else f"ERROR (exit {result.returncode})"
+        ok = result.returncode == 0
+        status = "OK" if ok else f"ERROR (exit {result.returncode})"
         output = (result.stdout + result.stderr)[-1000:]
-        return f"{status}\n{output}"
+        return status, output, (not ok)
     except subprocess.TimeoutExpired:
-        return "TIMEOUT"
+        return "TIMEOUT", "", False
     except Exception as e:
-        return f"ERROR: {e}"
+        return f"ERROR: {e}", "", False
+
+
+def run_cmd(cmd: str, timeout: int = 7200) -> str:
+    """Run a shell command; retry transient failures for RETRYABLE_PIPELINES.
+
+    Output contract is unchanged for consumers: the first line is the status
+    ("OK" / "ERROR (exit N)" / "TIMEOUT" / "ERROR: ..."), which is what
+    notify_complete keys on, and the subprocess output stays at the end so
+    the events-channel no-op filter still sees the trailing summary line.
+    Retry attempts are narrated on `[retry]` lines in between.
+    """
+    retryable = _current_pipeline_id() in RETRYABLE_PIPELINES
+    max_attempts = 1 + (len(RETRY_DELAYS) if retryable else 0)
+    trail = []
+    status, output = "", ""
+    for attempt in range(1, max_attempts + 1):
+        status, output, retry_eligible = _run_once(cmd, timeout)
+        if status == "OK":
+            if trail:
+                trail.append(f"[retry] attempt {attempt}/{max_attempts}: OK")
+            break
+        if not retryable or not retry_eligible:
+            break
+        marker = next(
+            (m for m in PERMANENT_FAILURE_MARKERS if m in output.lower()), None
+        )
+        if marker is not None:
+            trail.append(
+                f"[retry] attempt {attempt}/{max_attempts}: {status} -- "
+                f"permanent-failure marker '{marker}' matched, not retrying"
+            )
+            break
+        if attempt < max_attempts:
+            delay = RETRY_DELAYS[attempt - 1]
+            line = (f"[retry] attempt {attempt}/{max_attempts}: {status} -- "
+                    f"transient, attempt {attempt + 1}/{max_attempts} after {delay}s")
+            trail.append(line)
+            print(line, flush=True)
+            time.sleep(delay)
+        else:
+            trail.append(
+                f"[retry] attempt {attempt}/{max_attempts}: {status} -- "
+                f"retries exhausted"
+            )
+    parts = [status] + trail
+    if output:
+        parts.append(output)
+    return "\n".join(parts)
 
 
 @task
@@ -40,13 +156,16 @@ def notify_complete(sync_result):
     """Post pipeline completion to the events channel."""
     pipeline = pipeline_context.get()
     status = "ok" if sync_result.startswith("OK") else "error"
+    # Send the full result (run_cmd already caps it at the last 1000 chars).
+    # Head-truncating used to cut off the trailing "Sync complete -- N total
+    # items" summary line, which the events-channel no-op filter keys on.
     payload = json.dumps({
         "event_type": "job_complete",
         "source": "plombery",
         "job": pipeline.id,
         "pipeline": pipeline.name,
         "status": status,
-        "message": sync_result[:500],
+        "message": sync_result,
     })
     try:
         req = urllib.request.Request(
@@ -56,6 +175,10 @@ def notify_complete(sync_result):
         urllib.request.urlopen(req, timeout=5)
     except Exception:
         pass  # don't fail the pipeline over a notification
+    if status != "ok":
+        # Surface subprocess TIMEOUT/ERROR as a real run failure so
+        # Plombery's run history stops masking them.
+        raise RuntimeError(sync_result[:300])
     return sync_result
 
 

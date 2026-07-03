@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""Edwin unified sync runner.
+
+Runs O365 and Google connectors in sequence with file-based logging
+and structured exit codes. Designed for unattended cron execution.
+
+Usage:
+    connectors/sync/sync                 # sync all sources
+    connectors/sync/sync --since 7       # backfill 7 days
+    connectors/sync/sync --o365-only      # O365 only
+    connectors/sync/sync --google-only    # Google only
+    connectors/sync/sync --limitless-only # Limitless only
+    connectors/sync/sync --fireflies-only # Fireflies only
+    connectors/sync/sync --imessage-only    # iMessage only
+    connectors/sync/sync --screentime-only  # Screentime only
+    connectors/sync/sync --calls-only       # Calls only
+    connectors/sync/sync --browser-only     # Browser History only
+    connectors/sync/sync --atlassian-only   # Atlassian (Bitbucket+Jira+Confluence) only
+    connectors/sync/sync --notes-only       # Apple Notes only
+    connectors/sync/sync --photos-only      # Photos metadata only
+    connectors/sync/sync --documents-only   # Documents index only
+    connectors/sync/sync --sessions-only    # Claude Code session logs only
+    connectors/sync/sync --plaud-only       # Plaud recordings only
+    connectors/sync/sync status             # show last sync times
+
+Note: ChatGPT and Sessions are on-demand only — not included in default "sync all".
+  ChatGPT: python3 connectors/chatgpt/chatgpt ingest <path-to-conversations.json>
+
+Exit codes:
+    0  All connectors succeeded
+    1  One or more connectors failed (partial failure)
+    2  All connectors failed
+"""
+
+import subprocess
+import sys
+import os
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+EDWIN_HOME = Path(os.environ.get("EDWIN_HOME", SCRIPT_DIR.parent.parent))
+CONNECTORS_DIR = EDWIN_HOME / "connectors"
+LOG_DIR = EDWIN_HOME / "logs"
+O365_CONNECTOR = CONNECTORS_DIR / "o365" / "o365"
+GOOGLE_CONNECTOR = CONNECTORS_DIR / "google" / "google"
+LIMITLESS_CONNECTOR = CONNECTORS_DIR / "limitless" / "limitless"
+FIREFLIES_CONNECTOR = CONNECTORS_DIR / "fireflies" / "fireflies"
+IMESSAGE_CONNECTOR = CONNECTORS_DIR / "imessage" / "imessage"
+SCREENTIME_CONNECTOR = CONNECTORS_DIR / "screentime" / "screentime"
+CALLS_CONNECTOR = CONNECTORS_DIR / "calls" / "calls"
+BROWSER_CONNECTOR = CONNECTORS_DIR / "browser" / "browser"
+ATLASSIAN_CONNECTOR = CONNECTORS_DIR / "atlassian" / "atlassian"
+NOTES_CONNECTOR = CONNECTORS_DIR / "notes" / "notes"
+PHOTOS_CONNECTOR = CONNECTORS_DIR / "photos" / "photos"
+DOCUMENTS_CONNECTOR = CONNECTORS_DIR / "documents" / "documents"
+SESSIONS_CONNECTOR = CONNECTORS_DIR / "sessions" / "sessions"
+PLAUD_CONNECTOR = CONNECTORS_DIR / "plaud" / "plaud"
+O365_STATE = EDWIN_HOME / "data" / "o365" / ".sync-state.json"
+GOOGLE_STATE = EDWIN_HOME / "data" / "google" / ".sync-state.json"
+LIMITLESS_STATE = EDWIN_HOME / "data" / "limitless" / ".sync-state.json"
+FIREFLIES_STATE = EDWIN_HOME / "data" / "fireflies" / ".sync-state.json"
+IMESSAGE_STATE = EDWIN_HOME / "data" / "imessage" / ".sync-state.json"
+SCREENTIME_STATE = EDWIN_HOME / "data" / "screentime" / ".sync-state.json"
+CALLS_STATE = EDWIN_HOME / "data" / "calls" / ".sync-state.json"
+BROWSER_STATE = EDWIN_HOME / "data" / "browser" / ".sync-state.json"
+ATLASSIAN_STATE = EDWIN_HOME / "data" / "atlassian" / ".sync-state.json"
+NOTES_STATE = EDWIN_HOME / "data" / "notes" / ".sync-state.json"
+PHOTOS_STATE = EDWIN_HOME / "data" / "photos" / ".sync-state.json"
+SESSIONS_STATE = EDWIN_HOME / "data" / "sessions" / ".sync-state.json"
+PLAUD_STATE = EDWIN_HOME / "data" / "plaud" / ".sync-state.json"
+
+MAX_LOG_FILES = 30  # keep last 30 log files
+
+
+def _rotate_logs():
+    """Remove old log files beyond MAX_LOG_FILES."""
+    if not LOG_DIR.exists():
+        return
+    logs = sorted(LOG_DIR.glob("sync-*.log"), reverse=True)
+    for old in logs[MAX_LOG_FILES:]:
+        old.unlink()
+
+
+def _run_connector(name, cmd, log_file):
+    """Run a connector, capturing output to log file. Returns (success, duration)."""
+    start = datetime.now(timezone.utc)
+    log_file.write(f"\n{'='*60}\n")
+    log_file.write(f"[{start.isoformat()}] Starting {name}\n")
+    log_file.write(f"  Command: {' '.join(cmd)}\n")
+    log_file.write(f"{'='*60}\n")
+    log_file.flush()
+
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=7200,  # 2 hour timeout per connector (backfills can be slow)
+        )
+        log_file.write(result.stdout)
+        elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+        status = "OK" if result.returncode == 0 else f"FAILED (exit {result.returncode})"
+        log_file.write(f"\n[{name}] {status} in {elapsed:.1f}s\n")
+        log_file.flush()
+        print(f"  {name}: {status} ({elapsed:.1f}s)")
+        return result.returncode == 0, elapsed
+    except subprocess.TimeoutExpired:
+        elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+        log_file.write(f"\n[{name}] TIMEOUT after {elapsed:.1f}s\n")
+        log_file.flush()
+        print(f"  {name}: TIMEOUT ({elapsed:.1f}s)")
+        return False, elapsed
+    except FileNotFoundError:
+        log_file.write(f"\n[{name}] SKIPPED — connector not found: {cmd[0]}\n")
+        log_file.flush()
+        print(f"  {name}: SKIPPED (not found)")
+        return False, 0
+
+
+def _show_status():
+    """Print last sync times from both state files."""
+    print("Edwin Sync Status")
+    print("=" * 40)
+
+    for label, state_path in [("O365", O365_STATE), ("Google", GOOGLE_STATE), ("Limitless", LIMITLESS_STATE), ("Fireflies", FIREFLIES_STATE), ("iMessage", IMESSAGE_STATE), ("Screentime", SCREENTIME_STATE), ("Calls", CALLS_STATE), ("Browser", BROWSER_STATE), ("Atlassian", ATLASSIAN_STATE), ("Notes", NOTES_STATE), ("Photos", PHOTOS_STATE), ("Sessions", SESSIONS_STATE), ("Plaud", PLAUD_STATE)]:
+        print(f"\n{label}:")
+        if not state_path.exists():
+            print("  No state file found")
+            continue
+        try:
+            state = json.loads(state_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            print("  State file corrupted")
+            continue
+        if not state:
+            print("  Empty state")
+            continue
+        # Handle state files with a top-level lastSync (e.g. sessions connector)
+        if "lastSync" in state and isinstance(state["lastSync"], str):
+            print(f"  {'sessions':12s}  last sync: {state['lastSync']}")
+            continue
+        for source, info in sorted(state.items()):
+            if isinstance(info, dict) and "lastSync" in info:
+                print(f"  {source:12s}  last sync: {info['lastSync']}")
+            elif isinstance(info, str) and source.endswith("_last_sync"):
+                # Google uses top-level keys like mail_last_sync, calendar_last_sync
+                display = source.replace("_last_sync", "")
+                print(f"  {display:12s}  last sync: {info}")
+            elif isinstance(info, dict) and source not in ("calendar",):
+                print(f"  {source:12s}  (no lastSync)")
+
+    # Show latest log
+    if LOG_DIR.exists():
+        logs = sorted(LOG_DIR.glob("sync-*.log"), reverse=True)
+        if logs:
+            print(f"\nLatest log: {logs[0]}")
+    print()
+
+
+def main():
+    args = sys.argv[1:]
+
+    if "status" in args:
+        _show_status()
+        return 0
+
+    only_flags = {"--o365-only", "--google-only", "--limitless-only", "--fireflies-only",
+                   "--imessage-only", "--screentime-only", "--calls-only", "--browser-only",
+                   "--atlassian-only", "--notes-only", "--photos-only",
+                   "--documents-only", "--sessions-only", "--plaud-only"}
+    active_only = only_flags & set(args)
+    run_o365 = not active_only or "--o365-only" in args
+    run_google = not active_only or "--google-only" in args
+    run_limitless = not active_only or "--limitless-only" in args
+    run_fireflies = not active_only or "--fireflies-only" in args
+    run_imessage = not active_only or "--imessage-only" in args
+    run_screentime = not active_only or "--screentime-only" in args
+    run_calls = not active_only or "--calls-only" in args
+    run_browser = not active_only or "--browser-only" in args
+    run_atlassian = not active_only or "--atlassian-only" in args
+    run_notes = not active_only or "--notes-only" in args
+    run_photos = not active_only or "--photos-only" in args
+    run_documents = not active_only or "--documents-only" in args
+    run_sessions = "--sessions-only" in args  # Not in default sync
+    run_plaud = not active_only or "--plaud-only" in args
+
+    # Build connector args
+    connector_args = []
+    if "--since" in args:
+        idx = args.index("--since")
+        if idx + 1 < len(args):
+            connector_args.extend(["--since", args[idx + 1]])
+    if "--verbose" in args:
+        connector_args.append("--verbose")
+
+    # Set up logging
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _rotate_logs()
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_path = LOG_DIR / f"sync-{timestamp}.log"
+
+    results = {}
+    print(f"Edwin sync — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"Log: {log_path}")
+
+    with open(log_path, "w") as log_file:
+        log_file.write(f"Edwin sync started at {datetime.now(timezone.utc).isoformat()}\n")
+
+        if run_o365:
+            cmd = [sys.executable, str(O365_CONNECTOR), "sync", "all"] + connector_args
+            ok, dur = _run_connector("O365", cmd, log_file)
+            results["o365"] = ok
+
+        if run_google:
+            cmd = [sys.executable, str(GOOGLE_CONNECTOR), "sync", "all"] + connector_args
+            ok, dur = _run_connector("Google", cmd, log_file)
+            results["google"] = ok
+
+        if run_limitless:
+            cmd = [sys.executable, str(LIMITLESS_CONNECTOR), "sync", "all"] + connector_args
+            ok, dur = _run_connector("Limitless", cmd, log_file)
+            results["limitless"] = ok
+
+        if run_fireflies:
+            cmd = [sys.executable, str(FIREFLIES_CONNECTOR), "sync", "all"] + connector_args
+            ok, dur = _run_connector("Fireflies", cmd, log_file)
+            results["fireflies"] = ok
+
+        if run_imessage:
+            cmd = [sys.executable, str(IMESSAGE_CONNECTOR), "sync", "all"] + connector_args
+            ok, dur = _run_connector("iMessage", cmd, log_file)
+            results["imessage"] = ok
+
+        if run_screentime:
+            cmd = [sys.executable, str(SCREENTIME_CONNECTOR), "sync", "all"] + connector_args
+            ok, dur = _run_connector("Screentime", cmd, log_file)
+            results["screentime"] = ok
+
+        if run_calls:
+            cmd = [sys.executable, str(CALLS_CONNECTOR), "sync", "all"] + connector_args
+            ok, dur = _run_connector("Calls", cmd, log_file)
+            results["calls"] = ok
+
+        if run_browser:
+            cmd = [sys.executable, str(BROWSER_CONNECTOR), "sync", "all"] + connector_args
+            ok, dur = _run_connector("Browser", cmd, log_file)
+            results["browser"] = ok
+
+        if run_atlassian:
+            cmd = [sys.executable, str(ATLASSIAN_CONNECTOR), "sync", "all"] + connector_args
+            ok, dur = _run_connector("Atlassian", cmd, log_file)
+            results["atlassian"] = ok
+
+        if run_notes:
+            cmd = [sys.executable, str(NOTES_CONNECTOR), "sync", "all"] + connector_args
+            ok, dur = _run_connector("Notes", cmd, log_file)
+            results["notes"] = ok
+
+        if run_photos:
+            cmd = [sys.executable, str(PHOTOS_CONNECTOR), "sync", "all"] + connector_args
+            ok, dur = _run_connector("Photos", cmd, log_file)
+            results["photos"] = ok
+
+        if run_documents:
+            cmd = [sys.executable, str(DOCUMENTS_CONNECTOR), "sync", "all"] + connector_args
+            ok, dur = _run_connector("Documents", cmd, log_file)
+            results["documents"] = ok
+
+        if run_sessions:
+            cmd = [sys.executable, str(SESSIONS_CONNECTOR), "sync"] + connector_args
+            ok, dur = _run_connector("Sessions", cmd, log_file)
+            results["sessions"] = ok
+
+        if run_plaud:
+            cmd = [sys.executable, str(PLAUD_CONNECTOR), "sync", "all"] + connector_args
+            ok, dur = _run_connector("Plaud", cmd, log_file)
+            results["plaud"] = ok
+
+        log_file.write(f"\nSync finished at {datetime.now(timezone.utc).isoformat()}\n")
+
+    successes = sum(1 for v in results.values() if v)
+    total = len(results)
+
+    if successes == total:
+        print("All syncs succeeded.")
+        return 0
+    elif successes > 0:
+        print(f"Partial failure: {successes}/{total} succeeded.")
+        return 1
+    else:
+        print("All syncs failed.")
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

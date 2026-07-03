@@ -380,7 +380,7 @@ Before starting any task, do a quick `memory_search` for related notes to surfac
 ## Prospective Memory
 
 - **Boot check (step 5):** After first response, call `pm_list` with filter "due" to surface overdue/due-today items.
-- **Live capture:** When the user makes a commitment during conversation ("I'll send Pete the plan", "remind me to call Jason"), or mentions someone else's commitment ("Rob said he'd send it Friday"), call `pm_add` immediately. Silently -- don't announce it unless asked.
+- **Live capture:** When the user makes a commitment during conversation ("I'll send Alex the plan", "remind me to call the vendor"), or mentions someone else's commitment ("Sam said they'd send it Friday"), call `pm_add` immediately. Silently -- don't announce it unless asked.
 - **Confidence threshold:** Only capture commitments you're >70% confident about. Casual mentions, jokes, hypotheticals, and vague "we should probably..." are NOT PM items. If low-confidence, use a NOTE instead.
 - **Dedup:** Before adding, call `pm_search` with the description text. If a similar item already exists, skip the add. Don't create duplicates.
 ```

@@ -5,15 +5,26 @@ import yaml
 from pathlib import Path
 from datetime import date
 
-from .config import DATA_DIR, SOURCE_MAP
+from .config import DATA_DIR, MEMORY_DIR, SOURCE_MAP
+
+
+def _is_memory_file(file_path: Path) -> bool:
+    try:
+        file_path.relative_to(MEMORY_DIR)
+        return True
+    except ValueError:
+        return False
 
 
 def detect_source(file_path: Path) -> str:
     """Map file path to source type using SOURCE_MAP.
 
     Tries 2-part match first (e.g., 'o365/mail'), then 1-part.
+    Files under MEMORY_DIR are source 'memory'.
     Returns 'default' if no match.
     """
+    if _is_memory_file(file_path):
+        return "memory"
     try:
         rel = file_path.relative_to(DATA_DIR)
     except ValueError:
@@ -31,6 +42,8 @@ def detect_source(file_path: Path) -> str:
 
 def detect_connector(file_path: Path) -> str:
     """Get the top-level connector directory name."""
+    if _is_memory_file(file_path):
+        return "memory"
     try:
         rel = file_path.relative_to(DATA_DIR)
         return rel.parts[0] if rel.parts else "unknown"
@@ -38,31 +51,56 @@ def detect_connector(file_path: Path) -> str:
         return "unknown"
 
 
+def _fallback_frontmatter(block: str) -> dict:
+    """Line-wise 'key: value' parse for frontmatter that isn't valid YAML.
+
+    Roughly half the jira files have unquoted values like
+    'type: [System] Incident' that make yaml.safe_load throw, which used
+    to silently discard the ENTIRE frontmatter (dates, status, assignee).
+    Values are kept as raw strings.
+    """
+    fm = {}
+    for line in block.splitlines():
+        m = re.match(r"^([A-Za-z_][\w-]*):\s*(.*)$", line)
+        if m:
+            fm[m.group(1)] = m.group(2).strip()
+    return fm
+
+
 def extract_frontmatter(content: str) -> dict:
     """Parse YAML frontmatter from the start of content.
 
-    Returns empty dict if no frontmatter found.
+    Falls back to a line-wise key:value parse when the block isn't valid
+    YAML. Returns empty dict if no frontmatter found.
     """
     if not content.startswith("---"):
         return {}
     end = content.find("\n---", 3)
     if end == -1:
         return {}
+    block = content[3:end]
     try:
-        fm = yaml.safe_load(content[3:end])
-        return fm if isinstance(fm, dict) else {}
+        fm = yaml.safe_load(block)
+        return fm if isinstance(fm, dict) else _fallback_frontmatter(block)
     except (yaml.YAMLError, ValueError):
-        return {}
+        return _fallback_frontmatter(block)
 
 
 def extract_date(file_path: Path, frontmatter: dict) -> str | None:
     """Extract date as YYYY-MM-DD string.
 
-    Tries frontmatter 'date' field first, then filename pattern.
+    Tries frontmatter date-ish fields first ('date', then 'updated'/
+    'modified'/'created' -- jira/confluence issues carry those instead of
+    'date'), then filename pattern, then parent dir (YYYY-MM).
     """
-    # From frontmatter
-    if "date" in frontmatter:
-        d = frontmatter["date"]
+    # From frontmatter: 'date' preferred, then last-activity fields.
+    # Jira files (data/atlassian/jira/) have created/updated but no 'date';
+    # 'updated' is the retrieval-relevant one (48,954 points were invisible
+    # to every dateFrom/dateTo filter before this fallback -- 2026-07-02).
+    for field in ("date", "updated", "modified", "created"):
+        if field not in frontmatter:
+            continue
+        d = frontmatter[field]
         if isinstance(d, date):
             return d.isoformat()
         s = str(d)
