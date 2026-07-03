@@ -405,10 +405,6 @@ def session_slicer():
     return run_cmd(f"{PYTHON} tools/session-slicer/session-slicer sync")
 
 @task
-def email_priority_scan():
-    return run_cmd(f"{PYTHON} tools/email-priority/email-priority --hours 12")
-
-@task
 def nightwatch_heartbeat():
     """Check if nightwatch is active and should continue."""
     import pytz
@@ -488,8 +484,6 @@ register_pipeline(id="sys-pm-recurring", name="System: PM Recurring", descriptio
 register_pipeline(id="sys-ambient-poll", name="System: Ambient Poll", description="Take a snapshot of the user's current context -- calendar, Teams, Limitless. Writes JSON to data/ambient/.", tasks=[ambient_poll, notify_complete], triggers=[Trigger(id="t40", name="Every 30 min", schedule=IntervalTrigger(minutes=30))])
 register_pipeline(id="sys-pm-wake", name="System: PM Wake Check", description="Check deferred PM items for wake conditions. Reactivates items whose due date has arrived.", tasks=[pm_wake, notify_complete], triggers=[Trigger(id="t39", name="Daily 6 AM", schedule=CronTrigger(hour=6))])
 register_pipeline(id="sys-session-slicer", name="System: Session Slicer", description="Split Claude Code session JSONLs into sliding windows for better embedding and retrieval.", tasks=[session_slicer, notify_complete], triggers=[Trigger(id="t45", name="Every 10 min", schedule=IntervalTrigger(minutes=10))])
-register_pipeline(id="sys-email-priority", name="System: Email Priority", description="Classify incoming emails by urgency tier for triage", tasks=[email_priority_scan, notify_complete], triggers=[Trigger(id="t38b", name="Weekdays 7 AM", schedule=CronTrigger(day_of_week="mon-fri", hour=7))])
-
 # -- Skills (fire run_skill event to events channel, orchestrator spawns subagent) --
 register_pipeline(id="skill-morning-brief-archive", name="Skill: Brief Archive", description="Move yesterday's morning/EOD briefs into Daily Archive. Publishes new locations to Obsidian.", tasks=[trigger_morning_brief_daily_archive, notify_complete], triggers=[Trigger(id="t20", name="Daily 5:55 AM", schedule=CronTrigger(hour=5, minute=55))])
 register_pipeline(id="skill-weekly-archive", name="Skill: Weekly Archive", description="Move last week's Weekly Dispatch into Weekly Archive.", tasks=[trigger_weekly_archive, notify_complete], triggers=[Trigger(id="t21", name="Monday 5:50 AM", schedule=CronTrigger(day_of_week="mon", hour=5, minute=50))])

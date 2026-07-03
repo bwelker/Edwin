@@ -1085,14 +1085,11 @@ def sync_teams(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = Fal
 
         # Write per-day-per-channel files for Haiku context indexing.
         # WAVE-2 CLEANUP (2026-07-02): these per-day writes duplicate the
-        # per-conversation files above and were slated for removal, but five
-        # tools still key on the {chat}/YYYY-MM-DD.md layout (dates come from
-        # FILENAMES, so porting them is a rewrite, not a path swap):
+        # per-conversation files above and were slated for removal, but a few
+        # downstream tools still key on the {chat}/YYYY-MM-DD.md layout (dates
+        # come from FILENAMES, so porting them is a rewrite, not a path swap):
         #   tools/teams-unanswered/teams-unanswered  (scheduled weekdays)
         #   tools/ambient-poll/ambient-poll          (scheduled every 30 min)
-        #   tools/relationship-report/relationship-report
-        #   tools/judgment/contact-drive-by-monitor
-        #   tools/dev-daily-reminder/dev-daily-reminder (pipeline disabled)
         # Port those to data/o365/teams/{named,oneOnOne,group}/ (per-message
         # `date:` frontmatter) first, THEN delete this block. Never delete the
         # existing teams-daily files on disk -- they're archive.
@@ -1298,8 +1295,8 @@ def cmd_mail(args):
     # Cap at --max. _paginate follows @odata.nextLink until the *entire* mailbox
     # is exhausted; $top only sets the page size, not a stop condition. Without
     # this islice, `mail --max 30` paged the whole mailbox (hundreds of sequential
-    # Graph calls, each pulling full HTML bodies), routinely blowing past the
-    # email-priority tool's 300s subprocess timeout. islice stops pulling pages
+    # Graph calls, each pulling full HTML bodies), routinely blowing past a
+    # downstream tool's 300s subprocess timeout. islice stops pulling pages
     # from the lazy generator once the cap is hit, so we fetch only the first
     # page and never follow nextLink. (Sync path is unaffected -- it doesn't use
     # cmd_mail.)
