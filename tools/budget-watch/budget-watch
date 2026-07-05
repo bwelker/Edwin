@@ -20,7 +20,7 @@ Data sources:
      Claude Code uses for its scratch + session directories.)
 
 Usage:
-    budget-watch scan [--days N] [--root DIR] [--sessions-dir DIR]
+    budget-watch scan [--days N] [--root DIR] [--sessions-dir DIR] [--force]
     budget-watch report [--days N] [--top N]
     budget-watch watch [--root DIR] [--sessions-dir DIR] [--state FILE]
                        [--max-tokens N] [--max-bytes N] [--growth-tokens N]
@@ -38,11 +38,33 @@ Token accounting:
   cache_read    = cache_read_input_tokens summed (cheap but a runaway
                   spin-poll signature -- reported, secondary threshold)
   context_peak  = max single-message total, i.e. context-window pressure
+
+  All sums are deduplicated per API message id: streaming splits one API
+  message across several JSONL entries (one per content block), each
+  repeating the SAME usage block. Naive per-entry summing over-counts
+  ~2-3x -- a real false-BREACH source (an agent can read ~2.5x its true
+  deduped burn without the dedup below).
+
+  Reconciliation vs the harness: the <subagent_tokens> figure in
+  task-notification records is the agent's FINAL CONTEXT SIZE (last
+  message input + cache_creation + cache_read + output), NOT cumulative
+  burn. It will always be far below fresh_tokens on long tasks -- the two
+  are different metrics and are not expected to match.
+
+Completed-task suppression (watch): before alerting on a task transcript,
+the watcher reads the parent session transcript's task-notification
+records; if the harness reported <status>completed</status> for that
+task-id and the transcript has not been written since, the task is
+finished and never alerts (a finished transcript inside the active-mtime
+window was the other 7/4 false-alert mode). Cumulative-cap alerts also
+re-fire only when the offending metric has GROWN past the last alerted
+value, so a static breach alerts once, not every interval.
 """
 
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,12 +79,16 @@ DATA_DIR = EDWIN_HOME / "data/budget-watch"
 USAGE_PATH = DATA_DIR / "usage.jsonl"
 STATE_PATH = DATA_DIR / ".watch-state.json"
 
-# watch defaults -- grounded in the measured 7-day distribution (2026-07-02,
-# n=221 task transcripts): fresh p50 312K / p90 562K / p99 1.10M / max 1.15M;
-# cache-read p50 1.6M / p99 18.5M / max 39M; duration p50 3m / p99 17m / max
-# 40m; bytes p99 704K / max 894K. Cumulative caps apply to TASK transcripts
-# only (bounded jobs); long-lived interactive sessions get growth checks only.
-DEFAULT_MAX_TOKENS = 1_200_000       # fresh tokens per task (~ measured max)
+# watch defaults -- EXAMPLE thresholds; recalibrate for your own workload with
+# `budget-watch report` (it prints your p50/p90/p99). The important mechanism is
+# that fresh-token sums are per-message-id DEDUPED (see summarize_transcript):
+# before that fix, streaming's repeated usage blocks inflated counts ~2.5-3x, so
+# a cap set against inflated numbers tolerated large real overruns. Set the cap
+# to ~1.25x your observed deduped max: high enough for a legit heavy task, low
+# enough that a runaway (spin-poll, respawn loop) trips the alert. Cumulative
+# caps apply to TASK transcripts only (bounded jobs); long-lived interactive
+# sessions get growth checks only.
+DEFAULT_MAX_TOKENS = 750_000         # fresh tokens per task (example -- see above)
 DEFAULT_MAX_CACHE_READ = 60_000_000  # cumulative cache reads (1.5x max legit)
 DEFAULT_MAX_BYTES = 5_000_000        # transcript size (>5x max observed)
 DEFAULT_GROWTH_TOKENS = 250_000      # fresh growth between checks w/o user input
@@ -76,15 +102,14 @@ def parse_transcript(path: Path) -> dict | None:
     """Parse a Claude Code JSONL transcript (task .output or session .jsonl).
 
     Returns aggregate usage or None if the file has no assistant usage.
+
+    Usage blocks are aggregated once per unique API message id: streaming
+    writes one JSONL entry per content block, and every entry of the same
+    message carries a duplicate of the same usage block. Summing per entry
+    over-counts ~2-3x (the 2026-07-04 false-alert bug).
     """
-    fresh = 0
-    inp = 0
-    out = 0
-    cache_creation = 0
-    cache_read = 0
-    context_peak = 0
+    usage_by_msg: dict[str, dict] = {}   # message id -> usage (last wins)
     tool_calls = 0
-    assistant_msgs = 0
     user_msgs = 0          # real user messages (not tool results)
     last_user_ts = None
     first_ts = None
@@ -127,19 +152,12 @@ def parse_transcript(path: Path) -> dict | None:
                             first_user_text = extract_text(msg.get("content"))
 
                 elif etype == "assistant":
-                    assistant_msgs += 1
                     model = msg.get("model") or model
                     usage = msg.get("usage") or {}
-                    i = usage.get("input_tokens", 0) or 0
-                    o = usage.get("output_tokens", 0) or 0
-                    cc = usage.get("cache_creation_input_tokens", 0) or 0
-                    cr = usage.get("cache_read_input_tokens", 0) or 0
-                    inp += i
-                    out += o
-                    cache_creation += cc
-                    cache_read += cr
-                    fresh += i + cc + o
-                    context_peak = max(context_peak, i + cc + cr + o)
+                    mid = msg.get("id") or f"_noid_{lines}"
+                    usage_by_msg[mid] = usage
+                    # content blocks ARE split across entries, so counting
+                    # tool_use blocks per entry is correct (no duplication)
                     content = msg.get("content")
                     if isinstance(content, list):
                         tool_calls += sum(
@@ -149,8 +167,22 @@ def parse_transcript(path: Path) -> dict | None:
     except OSError:
         return None
 
+    assistant_msgs = len(usage_by_msg)
     if assistant_msgs == 0 and user_msgs == 0:
         return None
+
+    fresh = inp = out = cache_creation = cache_read = context_peak = 0
+    for usage in usage_by_msg.values():
+        i = usage.get("input_tokens", 0) or 0
+        o = usage.get("output_tokens", 0) or 0
+        cc = usage.get("cache_creation_input_tokens", 0) or 0
+        cr = usage.get("cache_read_input_tokens", 0) or 0
+        inp += i
+        out += o
+        cache_creation += cc
+        cache_read += cr
+        fresh += i + cc + o
+        context_peak = max(context_peak, i + cc + cr + o)
 
     duration_s = None
     if first_ts and last_ts:
@@ -277,7 +309,7 @@ def cmd_scan(args):
             skipped_old += 1
             continue
         prev = recorded.get(rec_id)
-        if prev and prev.get("bytes") == st.st_size:
+        if not args.force and prev and prev.get("bytes") == st.st_size:
             # byte size unchanged since last record -> transcript is finished
             skipped_done += 1
             continue
@@ -361,6 +393,46 @@ def cmd_report(args):
 
 # ---------------------------------------------------------------- watch
 
+TASK_NOTIF_RE = re.compile(r"<task-id>(\w+)</task-id>.{0,400}?<status>(\w+)</status>")
+TS_RE = re.compile(r'"timestamp":\s*"([^"]+)"')
+
+
+def load_task_statuses(session_file: Path) -> dict:
+    """task-id -> (last harness-reported status, notification epoch).
+
+    Parsed from task-notification records in the parent session transcript
+    (the harness writes one each time a subagent stops). A completed task
+    can be resumed, so the LAST notification wins, and callers must also
+    check the task transcript was not written after the notification.
+    """
+    statuses: dict = {}
+    if not session_file.is_file():
+        return statuses
+    try:
+        with open(session_file, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if "<task-id>" not in line:
+                    continue
+                m = TASK_NOTIF_RE.search(line)
+                if not m:
+                    continue
+                tid, status = m.group(1), m.group(2)
+                ts = 0.0
+                tm = TS_RE.search(line)
+                if tm:
+                    try:
+                        ts = datetime.fromisoformat(
+                            tm.group(1).replace("Z", "+00:00")).timestamp()
+                    except ValueError:
+                        pass
+                prev = statuses.get(tid)
+                if prev is None or ts >= prev[1]:
+                    statuses[tid] = (status, ts)
+    except OSError:
+        pass
+    return statuses
+
+
 def cmd_watch(args):
     now = datetime.now(timezone.utc).timestamp()
     active_cutoff = now - args.active_minutes * 60
@@ -379,6 +451,7 @@ def cmd_watch(args):
     alerts = []
     new_state = {}
     checked = 0
+    status_cache: dict = {}  # session-id -> load_task_statuses() result
     for kind, path in candidates:
         try:
             st = path.stat()
@@ -386,6 +459,15 @@ def cmd_watch(args):
             continue
         if st.st_mtime < active_cutoff:
             continue  # not active; finished transcripts never alert
+        if kind == "task":
+            # Harness completion check: <root>/<session-id>/tasks/<task-id>.output
+            sid = path.parent.parent.name
+            if sid not in status_cache:
+                status_cache[sid] = load_task_statuses(
+                    Path(args.sessions_dir) / f"{sid}.jsonl")
+            done = status_cache[sid].get(path.stem)
+            if done and done[0] == "completed" and st.st_mtime <= done[1] + 60:
+                continue  # harness says finished, no writes since -> never alert
         checked += 1
         info = parse_transcript(path)
         if info is None:
@@ -396,35 +478,45 @@ def cmd_watch(args):
         label = derive_label(info.get("first_user_text"), info.get("slug"))
         ident = f"{label} [{info.get('slug') or path.stem}]"
 
+        alerted = dict(prev.get("alerted") or {})  # metric -> value last alerted at
         new_state[key] = {
             "fresh_tokens": fresh,
             "cache_read_tokens": info["cache_read_tokens"],
             "bytes": st.st_size,
             "user_msgs": info["user_msgs"],
             "checked_at": datetime.now(timezone.utc).isoformat(),
+            "alerted": alerted,
         }
 
         # Cumulative caps: TASK transcripts only. Interactive sessions (the
         # orchestrator) legitimately accumulate forever; capping them would
         # alert permanently. Headless/interactive sessions are covered by
         # the growth checks below.
+        # A static breach alerts once; it must GROW past the last alerted
+        # value to fire again (kills repeat alerts on stalled/finished work).
         if kind == "task":
             if fresh > args.max_tokens:
-                alerts.append(
-                    f"BUDGET ALERT [{kind}] {ident}: {fresh:,} fresh tokens "
-                    f"(limit {args.max_tokens:,}), {info['tool_calls']} tool calls, "
-                    f"{st.st_size:,} bytes -- {path}")
+                if fresh > alerted.get("fresh", -1):
+                    alerted["fresh"] = fresh
+                    alerts.append(
+                        f"BUDGET ALERT [{kind}] {ident}: {fresh:,} fresh tokens "
+                        f"(limit {args.max_tokens:,}), {info['tool_calls']} tool calls, "
+                        f"{st.st_size:,} bytes -- {path}")
                 continue
             if info["cache_read_tokens"] > args.max_cache_read:
-                alerts.append(
-                    f"BUDGET ALERT [{kind}] {ident}: {info['cache_read_tokens']:,} cumulative "
-                    f"cache-read tokens (limit {args.max_cache_read:,}) -- spin-poll "
-                    f"signature -- {path}")
+                if info["cache_read_tokens"] > alerted.get("cache_read", -1):
+                    alerted["cache_read"] = info["cache_read_tokens"]
+                    alerts.append(
+                        f"BUDGET ALERT [{kind}] {ident}: {info['cache_read_tokens']:,} cumulative "
+                        f"cache-read tokens (limit {args.max_cache_read:,}) -- spin-poll "
+                        f"signature -- {path}")
                 continue
             if st.st_size > args.max_bytes:
-                alerts.append(
-                    f"BUDGET ALERT [{kind}] {ident}: transcript {st.st_size:,} bytes "
-                    f"(limit {args.max_bytes:,}) -- {path}")
+                if st.st_size > alerted.get("bytes", -1):
+                    alerted["bytes"] = st.st_size
+                    alerts.append(
+                        f"BUDGET ALERT [{kind}] {ident}: transcript {st.st_size:,} bytes "
+                        f"(limit {args.max_bytes:,}) -- {path}")
                 continue
         # Growth-rate (tasks AND sessions): burn since the last check with no
         # new real user message (a human steering the session resets this).
@@ -456,7 +548,7 @@ def cmd_watch(args):
             print(a)
         sys.exit(2)
     print(f"OK\nbudget-watch quiet: {checked} active transcript(s) within thresholds "
-          f"(max-tokens {args.max_tokens:,}, growth {args.growth_tokens:,} per interval).")
+          f"(max-tokens {args.max_tokens:,}, growth {args.growth_tokens:,}/interval).")
 
 
 # ---------------------------------------------------------------- main
@@ -469,6 +561,9 @@ def main():
     p_scan.add_argument("--days", type=int, default=7)
     p_scan.add_argument("--root", default=str(TASKS_ROOT))
     p_scan.add_argument("--sessions-dir", default=str(SESSIONS_DIR))
+    p_scan.add_argument("--force", action="store_true",
+                        help="re-parse transcripts even if byte size is "
+                             "unchanged (rebuild records after a counting fix)")
 
     p_rep = sub.add_parser("report", help="Per-label distribution + top burners")
     p_rep.add_argument("--days", type=int, default=7)
