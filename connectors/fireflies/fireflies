@@ -42,6 +42,11 @@ DATA_DIR           = EDWIN_HOME / "data" / "fireflies"
 STATE_FILE         = DATA_DIR / ".sync-state.json"
 LOCK_FILE          = DATA_DIR / ".sync.lock"
 DEFAULT_SINCE      = 30  # days back for initial sync
+OVERLAP_DAYS       = 7   # re-list window behind lastSync: Fireflies transcripts can
+                         # finish processing hours/days after the meeting, so a strict
+                         # lastSync cutoff silently skips late arrivals forever. Dedup
+                         # (idhash marker / path existence) makes the overlap a no-op
+                         # for items already mirrored.
 
 # Rate limiting: 60 req/min = 1/sec
 _MIN_REQUEST_INTERVAL = 1.05
@@ -677,8 +682,12 @@ def sync_transcripts(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool
     last_sync = state.get("transcripts", {}).get("lastSync")
 
     if last_sync:
-        since = _try_parse_iso(last_sync)
-        print(f"  Syncing transcripts since {last_sync}...", file=sys.stderr)
+        # Overlap window: look back OVERLAP_DAYS behind lastSync so transcripts
+        # that finished processing after the previous sync still get picked up.
+        # _transcript_exists() dedups by id, so already-written files are
+        # skipped, never truncated or rewritten.
+        since = _try_parse_iso(last_sync) - timedelta(days=OVERLAP_DAYS)
+        print(f"  Syncing transcripts since {last_sync} (minus {OVERLAP_DAYS}d overlap)...", file=sys.stderr)
     else:
         since = _since_dt(since_days)
         print(f"  Backfilling transcripts {since_days} days...", file=sys.stderr)
@@ -763,8 +772,10 @@ def sync_audio(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = Fal
     last_sync = state.get("audio", {}).get("lastSync")
 
     if last_sync:
-        since = _try_parse_iso(last_sync)
-        print(f"  Downloading audio since {last_sync}...", file=sys.stderr)
+        # Same overlap window as sync_transcripts: late-processing recordings
+        # would otherwise be skipped forever. Path-existence check below dedups.
+        since = _try_parse_iso(last_sync) - timedelta(days=OVERLAP_DAYS)
+        print(f"  Downloading audio since {last_sync} (minus {OVERLAP_DAYS}d overlap)...", file=sys.stderr)
     else:
         since = _since_dt(since_days)
         print(f"  Downloading audio {since_days} days...", file=sys.stderr)
@@ -847,8 +858,10 @@ def sync_video(state: dict, since_days: int = DEFAULT_SINCE, verbose: bool = Fal
     last_sync = state.get("video", {}).get("lastSync")
 
     if last_sync:
-        since = _try_parse_iso(last_sync)
-        print(f"  Downloading video since {last_sync}...", file=sys.stderr)
+        # Same overlap window as sync_transcripts: late-processing recordings
+        # would otherwise be skipped forever. Path-existence check below dedups.
+        since = _try_parse_iso(last_sync) - timedelta(days=OVERLAP_DAYS)
+        print(f"  Downloading video since {last_sync} (minus {OVERLAP_DAYS}d overlap)...", file=sys.stderr)
     else:
         since = _since_dt(since_days)
         print(f"  Downloading video {since_days} days...", file=sys.stderr)
