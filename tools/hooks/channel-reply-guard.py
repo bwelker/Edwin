@@ -106,7 +106,19 @@ def main():
             continue
         if obj.get("isSidechain"):
             continue
-        if obj.get("isMeta"):
+        # A user entry's origin marks its source: "human" (typed at the CLI) or
+        # "channel" (injected by a channel connector such as BlueBubbles). Both
+        # are genuine inbound messages. Channel messages are recorded with
+        # isMeta==true, so we must NOT skip on isMeta -- doing exactly that was
+        # the bug that let unanswered channel inbounds through silently.
+        # Any *other* origin kind is a system/tool-injected synthetic entry and
+        # is ignored. (Injected UserPromptSubmit context -- relevant-memories,
+        # persisted-output, reminders -- arrives as type=="attachment" entries,
+        # not user entries, so it never reaches this scan in the first place.)
+        # When origin is absent (older transcripts), fall back to the content
+        # filters below.
+        origin_kind = (obj.get("origin") or {}).get("kind")
+        if origin_kind is not None and origin_kind not in ("human", "channel"):
             continue
         text = extract_user_text(obj.get("message", {}).get("content"))
         if text is None or not is_genuine_user_text(text):
