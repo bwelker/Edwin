@@ -72,7 +72,8 @@ JOURNAL_KEEP_DAYS = 7          # compaction keeps this many days
 
 BUDGET_LINE = (
     "Token budget: typical run ~300K fresh tokens, hard ceiling 1.2M "
-    "(per budget-watch measured p50/p99). If you must wait on a slow external "
+    "(EXAMPLE figures -- run budget-watch to calibrate p50/p99 for your own "
+    "workload; these are not universal constants). If you must wait on a slow external "
     "process, fire-and-detach with ONE watcher -- never sit in a poll loop. "
     "If you catch yourself in sustained polling, detach and report what you "
     "launched instead."
