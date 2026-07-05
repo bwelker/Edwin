@@ -58,6 +58,8 @@ VALID_TYPES = [
 ]
 VALID_STATUSES = ["open", "in_progress", "waiting", "blocked", "scheduled", "done", "cancelled", "overdue"]
 VALID_PRIORITIES = ["critical", "high", "medium", "low"]
+VALID_FILTERS = ["open", "due", "overdue", "due_today", "due_this_week", "done", "all"]
+VALID_DETAILS = ["concise", "detailed"]
 
 mcp = FastMCP("edwin-pm")
 
@@ -91,7 +93,7 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
     return dict(row)
 
 
-def _format_items(rows: list[sqlite3.Row]) -> str:
+def _format_items(rows: list[sqlite3.Row], detail: str = "concise") -> str:
     if not rows:
         return "No items found."
 
@@ -133,7 +135,29 @@ def _format_items(rows: list[sqlite3.Row]) -> str:
 
         lines.append(" | ".join(parts))
 
+        if detail == "detailed":
+            for label, key in (
+                ("context", "context"),
+                ("source", "source"),
+                ("external_ref", "external_ref"),
+                ("created", "created_at"),
+                ("completed", "completed_at"),
+            ):
+                val = d.get(key)
+                if val:
+                    lines.append(f"    {label}: {val}")
+
     return "\n".join(lines)
+
+
+def _truncation_footer(shown: int, total: int, offset: int, limit: int) -> str:
+    """One-line pagination hint appended when results were cut off."""
+    if offset + shown >= total:
+        return ""
+    return (
+        f"\n-- showing {offset + 1}-{offset + shown} of {total} matching items; "
+        f"pass offset={offset + limit} for the next page (or raise limit)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +173,8 @@ def pm_list(
     counterparty: Optional[str] = None,
     tag: Optional[str] = None,
     limit: int = 50,
+    offset: int = 0,
+    detail: str = "concise",
 ) -> str:
     """List prospective memory items.
 
@@ -159,7 +185,14 @@ def pm_list(
         counterparty: Filter by counterparty name
         tag: Filter by tag
         limit: Max items to return (default 50)
+        offset: Skip this many items (pagination; default 0)
+        detail: "concise" (default, one line per item) or "detailed" (adds context, source, refs, timestamps)
     """
+    if filter not in VALID_FILTERS:
+        return f"Error: unknown filter {filter!r}. Valid filters: {VALID_FILTERS}"
+    if detail not in VALID_DETAILS:
+        return f"Error: detail must be one of {VALID_DETAILS}"
+
     conn = _get_conn()
     cursor = conn.cursor()
 
@@ -192,8 +225,6 @@ def pm_list(
         where.append("items.status = 'done'")
     elif filter == "all":
         pass  # no status filter
-    else:
-        where.append("items.status IN ('open', 'in_progress', 'waiting')")
 
     if type:
         where.append("items.type = ?")
@@ -209,13 +240,29 @@ def pm_list(
         params.append(tag)
 
     where_clause = (" WHERE " + " AND ".join(where)) if where else ""
-    query = f"SELECT * FROM items{where_clause} ORDER BY due_date ASC NULLS LAST, created_at DESC LIMIT ?"
-    params.append(limit)
-
-    rows = cursor.execute(query, params).fetchall()
+    total = cursor.execute(
+        f"SELECT COUNT(*) FROM items{where_clause}", params
+    ).fetchone()[0]
+    query = (
+        f"SELECT * FROM items{where_clause} "
+        "ORDER BY due_date ASC NULLS LAST, created_at DESC LIMIT ? OFFSET ?"
+    )
+    rows = cursor.execute(query, params + [limit, offset]).fetchall()
     conn.close()
 
-    return _format_items(rows)
+    if not rows:
+        active = [f"filter={filter}"]
+        for k, v in (("type", type), ("owner", owner), ("counterparty", counterparty), ("tag", tag)):
+            if v:
+                active.append(f"{k}={v}")
+        if offset:
+            active.append(f"offset={offset}")
+        return (
+            f"No items found ({', '.join(active)}). "
+            "Try filter='all', drop a filter, or check spelling of owner/counterparty/tag values (exact match)."
+        )
+
+    return _format_items(rows, detail) + _truncation_footer(len(rows), total, offset, limit)
 
 
 @mcp.tool()
@@ -363,7 +410,7 @@ def pm_complete(item_id: str) -> str:
     row = cursor.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
     if not row:
         conn.close()
-        return f"Error: item {item_id} not found"
+        return f"Error: item {item_id!r} not found. IDs look like 'pm-a3f8c2' -- find the right one with pm_search (single keyword) or pm_list."
 
     now = datetime.now().isoformat(timespec="seconds")
     cursor.execute(
@@ -405,7 +452,7 @@ def pm_update(
     row = cursor.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
     if not row:
         conn.close()
-        return f"Error: item {item_id} not found"
+        return f"Error: item {item_id!r} not found. IDs look like 'pm-a3f8c2' -- find the right one with pm_search (single keyword) or pm_list."
 
     updates = []
     params: list = []
@@ -476,23 +523,39 @@ def pm_update(
 
 
 @mcp.tool()
-def pm_search(query: str, limit: int = 20) -> str:
-    """Search prospective memory items by description text.
+def pm_search(query: str, limit: int = 20, offset: int = 0, detail: str = "concise") -> str:
+    """Search prospective memory items by description text. LITERAL substring match (SQL LIKE), not semantic -- multi-word queries only hit exact phrasing.
 
     Args:
-        query: Text to search for in descriptions (case-insensitive)
+        query: Text to search for in descriptions (case-insensitive substring)
         limit: Max results (default 20)
+        offset: Skip this many results (pagination; default 0)
+        detail: "concise" (default) or "detailed" (adds context, source, refs, timestamps)
     """
+    if detail not in VALID_DETAILS:
+        return f"Error: detail must be one of {VALID_DETAILS}"
+
     conn = _get_conn()
     cursor = conn.cursor()
 
+    total = cursor.execute(
+        "SELECT COUNT(*) FROM items WHERE description LIKE ?", (f"%{query}%",)
+    ).fetchone()[0]
     rows = cursor.execute(
-        "SELECT * FROM items WHERE description LIKE ? ORDER BY created_at DESC LIMIT ?",
-        (f"%{query}%", limit),
+        "SELECT * FROM items WHERE description LIKE ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        (f"%{query}%", limit, offset),
     ).fetchall()
     conn.close()
 
-    return _format_items(rows)
+    if not rows:
+        return (
+            f"No items matched {query!r}. pm_search is a LITERAL substring matcher "
+            "(not semantic) -- a reworded item will NOT match. Try a single distinctive "
+            "token (e.g. a name or keyword), or pm_list with filters. For dedup before "
+            "pm_add, rely on pm_add's built-in near-duplicate guard instead."
+        )
+
+    return _format_items(rows, detail) + _truncation_footer(len(rows), total, offset, limit)
 
 
 if __name__ == "__main__":

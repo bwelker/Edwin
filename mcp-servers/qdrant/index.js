@@ -21,6 +21,7 @@ import { dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { z } from 'zod';
 import { parseTemporal } from './temporal.js';
+import { formatSearchResponse } from './format.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -82,6 +83,44 @@ const config = {
   // outrank the expected memory doc, while a modest 1.15 held all metrics.
   // MEMORY_BOOST=1 disables.
   memoryBoost: Number(process.env.MEMORY_BOOST ?? 1.15),
+
+  // --- Recency / importance weighting on retrieval ranking ---
+  // Generative-Agents pattern: recent (and important) memories surface
+  // higher WITHOUT deleting old ones (memory is an archive).
+  //
+  // Scoped to REORDER the already-selected result set ONLY (like the rerank
+  // stage) -- it can change the order of returned results but never their
+  // MEMBERSHIP, so it provably cannot push a hit out of hit@8. Two knobs
+  // because the two active sort scales differ: an ADDITIVE logit bonus on
+  // the reranked path (rerank scores are unbounded logits, ~[-10,10]) and a
+  // MULTIPLICATIVE factor on the degraded RRF/dense path (bounded scores).
+  //
+  // Recency is a bounded BONUS (recent lifted, old never pushed below its
+  // relevance baseline) so a still-highly-relevant old memory can't be
+  // buried: at the default weights the recency swing (~1 logit) is dwarfed
+  // by the relevance spread (real-vs-junk ~10 logits). Importance is a
+  // CENTERED term (payload.importance in [0,1]; absent -> 0.5 neutral -> no
+  // effect) -- wired for a future importance signal, inert until one exists.
+  recencyEnabled: process.env.RECENCY_DISABLED !== '1',
+  // Exponential half-life in days: recency=1.0 at age 0, 0.5 at halfLife,
+  // 0.25 at 2*halfLife. 90d gives a gentle gradient across a multi-month
+  // corpus without burying relevant older material. RECENCY_DISABLED=1 off.
+  recencyHalfLifeDays: Number(process.env.RECENCY_HALF_LIFE_DAYS ?? 90),
+  // Recency assigned to UNDATED docs (curation files, some memory-tier):
+  // 0.5 places them mid-pack -- above ancient dated docs, below fresh ones
+  // -- rather than penalizing them to the bottom for a missing date.
+  recencyNeutral: Number(process.env.RECENCY_NEUTRAL ?? 0.5),
+  // Additive logit bonus on the reranked path: finalScore = rerankScore +
+  // recencyRerankWeight * recency. 1.0 => today +1.0, one half-life +0.5.
+  recencyRerankWeight: Number(process.env.RECENCY_RERANK_WEIGHT ?? 1.0),
+  // Additive logit term for importance (centered at 0.5): +/- this*0.5 max.
+  importanceRerankWeight: Number(process.env.IMPORTANCE_RERANK_WEIGHT ?? 0.5),
+  // Multiplicative recency factor on the DEGRADED (no-rerank) path, applied
+  // to the RRF fused / dense cosine sort score: *(1 + recencyMultWeight *
+  // recency). 0.15 mirrors the memoryBoost magnitude (15%).
+  recencyMultWeight: Number(process.env.RECENCY_MULT_WEIGHT ?? 0.15),
+  // Multiplicative importance factor (centered): *(1 + w*(importance-0.5)).
+  importanceMultWeight: Number(process.env.IMPORTANCE_MULT_WEIGHT ?? 0.10),
 };
 
 const qdrant = new QdrantClient({ url: config.qdrantUrl });
@@ -231,6 +270,48 @@ async function rerankScores(query, docs) {
   return msg.scores;
 }
 
+// ---------------------------------------------------------------------------
+// Recency / importance weighting
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse a payload `date` value to epoch ms. Handles both corpus formats:
+ * day precision ("2026-06-17") and full timestamps
+ * ("2026-01-29T12:45:11+00:00"). Anything unparseable -> null (neutral).
+ */
+function parseDateMs(dateStr) {
+  if (!dateStr || typeof dateStr !== 'string') return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(dateStr);
+  if (!m) return null;
+  // Interpret the day at UTC midnight — consistent with how the corpus
+  // stamps dates (UTC-or-day precision) and the temporal filter boundaries.
+  const ms = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * Recency score in [0,1]: 1.0 at age 0, halving every `halfLifeDays`.
+ * Undated docs return the configured neutral value (mid-pack, not buried).
+ * Future-dated docs (clock skew) clamp to 1.0.
+ */
+function recencyScore(dateStr, nowMs, halfLifeDays, neutral) {
+  const ms = parseDateMs(dateStr);
+  if (ms === null) return neutral;
+  const ageDays = Math.max(0, (nowMs - ms) / 86400000);
+  return Math.pow(0.5, ageDays / halfLifeDays);
+}
+
+/**
+ * Importance in [0,1] from an optional payload.importance field. Absent or
+ * malformed -> null, which callers treat as 0.5 (neutral, zero effect).
+ * Wired ahead of an importance signal; inert until the indexer populates it.
+ */
+function importanceScore(payload) {
+  const v = Number(payload?.importance);
+  if (!Number.isFinite(v)) return null;
+  return Math.min(1, Math.max(0, v));
+}
+
 /**
  * Build Qdrant payload filter from optional search parameters.
  *
@@ -277,7 +358,7 @@ const server = new McpServer({
 
 server.tool(
   'memory_search',
-  'Hybrid semantic search across Edwin memory (Qdrant, dense qwen3 + sparse BM42 fused with RRF, then cross-encoder reranked). Supports source, date, and people filters. Unambiguous leading/trailing temporal phrases ("last week", "in June", "since June 15") are auto-stripped into date filters (response shows rewritten_query + parsed_range); explicit dateFrom/dateTo disable that. Curated memory-source summaries get a small rank boost unless sources is set. Response includes no_strong_match when retrieval found nothing solid.',
+  'Hybrid semantic search across Edwin memory (Qdrant, dense qwen3 + sparse BM42 fused with RRF, then cross-encoder reranked). Supports source, date, and people filters. Unambiguous leading/trailing temporal phrases ("last week", "in June", "since June 15") are auto-stripped into date filters (response shows rewritten_query + parsed_range); explicit dateFrom/dateTo disable that. Curated memory-source summaries get a small rank boost unless sources is set. Results are then recency-weighted (recent memories surface higher via a bounded age-decay bonus that reorders — never drops — results; old highly-relevant memories are not buried). Response includes no_strong_match when retrieval found nothing solid.',
   {
     query: z.string().describe('Natural language search query. A leading/trailing temporal phrase is parsed into date filters automatically.'),
     sources: z.array(z.string()).optional().describe('Filter by data source (e.g. "fireflies", "o365-mail", "imessage")'),
@@ -286,8 +367,10 @@ server.tool(
     dateFrom: z.string().optional().describe('ISO date — only results on or after this date. Passing this (or dateTo) disables temporal phrase parsing.'),
     dateTo: z.string().optional().describe('ISO date — only results on or before this date. Passing this (or dateFrom) disables temporal phrase parsing.'),
     people: z.array(z.string()).optional().describe('Filter by people mentioned in content'),
+    detail: z.enum(['concise', 'detailed']).optional().describe('Response verbosity (default "concise": content + one relevance score per hit, snippets capped at maxSnippetChars). "detailed" adds all pipeline scores (dense/RRF/rerank/recency), config metadata, and untruncated snippets — for retrieval debugging.'),
+    maxSnippetChars: z.number().optional().describe('Per-hit snippet cap in concise mode (default 2000; 0 = uncapped). Truncated hits carry a marker telling how to fetch the full text via memory_get.'),
   },
-  async ({ query, sources, maxResults, minScore, dateFrom, dateTo, people }) => {
+  async ({ query, sources, maxResults, minScore, dateFrom, dateTo, people, detail, maxSnippetChars }) => {
     try {
       // --- Temporal query rewriting ---
       // Deterministic pre-parse (temporal.js, NOT an LLM call): an
@@ -428,6 +511,10 @@ server.tool(
         selected.push(c);
       }
 
+      // Clock for recency weighting — read once so every candidate in this
+      // search is aged against the same instant.
+      const nowMs = Date.now();
+
       // --- Cross-encoder rerank stage ---------------------------------------
       // Score the SELECTED results as (query, chunk) pairs and re-order by
       // relevance. The top score also drives no_strong_match (calibrated,
@@ -444,13 +531,59 @@ server.tool(
         try {
           const scores = await rerankScores(searchText, docs);
           block.forEach((c, i) => { c.rerankScore = scores[i]; });
-          block.sort((a, b) => b.rerankScore - a.rerankScore);
+          // Answerability uses the MAX raw rerank logit, independent of the
+          // final order — recency below may reorder the block, but "is there
+          // anything strongly relevant here?" must stay a relevance question,
+          // preserving the calibrated rerankNoMatchThreshold semantics.
+          topRerank = Math.max(...block.map((c) => c.rerankScore));
+          // --- Recency / importance re-ranking (additive, logit scale) ------
+          // Fold a bounded recency bonus (+ centered importance term) into
+          // each rerank logit, then sort by the combined score. Membership is
+          // unchanged (still the same block) — this only reorders, so hit@8
+          // is preserved; a large relevance gap dwarfs the ~1-logit recency
+          // swing, so a highly-relevant old memory stays on top.
+          if (config.recencyEnabled) {
+            for (const c of block) {
+              const p = c.hit.payload || {};
+              const rec = recencyScore(p.date, nowMs, config.recencyHalfLifeDays, config.recencyNeutral);
+              const imp = importanceScore(p);
+              c.recency = rec;
+              c.importance = imp;
+              c.finalScore = c.rerankScore
+                + config.recencyRerankWeight * rec
+                + config.importanceRerankWeight * ((imp ?? 0.5) - 0.5);
+            }
+            block.sort((a, b) => b.finalScore - a.finalScore);
+          } else {
+            block.sort((a, b) => b.rerankScore - a.rerankScore);
+          }
           selected = block.concat(selected.slice(config.rerankMaxDocs));
-          topRerank = block[0].rerankScore;
           searchMode = searchMode === 'hybrid-rrf' ? 'hybrid-rerank' : 'dense-rerank';
         } catch (err) {
           console.error(`[edwin-qdrant] rerank failed, keeping RRF order: ${err.message}`);
         }
+      }
+
+      // --- Recency / importance re-ranking on the DEGRADED path -------------
+      // When rerank did NOT run (disabled or helper down), reorder the ALREADY
+      // -selected set by a recency/importance-scaled version of its primary
+      // sort score (RRF fused, or dense cosine in fallback). Membership is
+      // locked, so this only reorders the returned list — never changes which
+      // docs are returned. This is the path where recency matters most: it's
+      // the only "freshness" signal when the cross-encoder is unavailable.
+      if (config.recencyEnabled && topRerank === null && selected.length > 0) {
+        for (const c of selected) {
+          const p = c.hit.payload || {};
+          const rec = recencyScore(p.date, nowMs, config.recencyHalfLifeDays, config.recencyNeutral);
+          const imp = importanceScore(p);
+          c.recency = rec;
+          c.importance = imp;
+          const base = c.fusedScore ?? c.denseScore ?? 0;
+          c.finalScore = base
+            * (1 + config.recencyMultWeight * rec)
+            * (1 + config.importanceMultWeight * ((imp ?? 0.5) - 0.5));
+        }
+        selected.sort((a, b) => b.finalScore - a.finalScore);
       }
 
       const results = selected.map((c) => ({
@@ -460,6 +593,8 @@ server.tool(
         score: c.denseScore,          // cosine similarity (null = sparse-only hit)
         fusedScore: c.fusedScore,     // RRF fusion score (null in dense-fallback)
         rerankScore: c.rerankScore ?? null, // cross-encoder logit (null = not reranked)
+        recencyScore: c.recency ?? null,    // age-decay weight in [0,1] (null = recency off)
+        finalScore: c.finalScore ?? null,   // combined rank score after recency/importance
         snippet: c.hit.payload?.text || '',
         context: c.hit.payload?.context || '',
         source: c.hit.payload?.source || 'memory',
@@ -501,6 +636,13 @@ server.tool(
           rerank_model: config.rerankModel,
           top_rerank_score: Number(topRerank.toFixed(3)),
         }),
+        ...(config.recencyEnabled && {
+          recency_weighting: {
+            half_life_days: config.recencyHalfLifeDays,
+            rerank_weight: config.recencyRerankWeight,
+            mult_weight: config.recencyMultWeight,
+          },
+        }),
         no_strong_match: noStrongMatch,
       };
       if (noStrongMatch) {
@@ -511,7 +653,7 @@ server.tool(
       }
 
       return {
-        content: [{ type: 'text', text: JSON.stringify(response, null, 2) }],
+        content: [{ type: 'text', text: formatSearchResponse(response, detail || 'concise', maxSnippetChars ?? undefined) }],
       };
     } catch (err) {
       return {
@@ -540,7 +682,11 @@ server.tool(
 
       if (!existsSync(fullPath)) {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ text: '', path: filePath, error: 'File not found' }) }],
+          content: [{ type: 'text', text: JSON.stringify({
+            text: '',
+            path: filePath,
+            error: `File not found: ${fullPath}. Relative paths resolve against ${config.workspacePath}; if the file lives elsewhere, pass an absolute path — memory_search results return absolute paths you can pass through unchanged.`,
+          }) }],
         };
       }
 
