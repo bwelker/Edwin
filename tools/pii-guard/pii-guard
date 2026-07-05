@@ -161,7 +161,7 @@ STRUCTURAL_PATTERNS = [
 # catches short/low-entropy real secrets (password: hunter2...) while ignoring
 # `api_key = self.api_key` and similar plumbing. group(1) = the value.
 _NAMED_SECRET_RE = re.compile(
-    r"""\b(?:password|passwd|secret|token|api[_\-]?key|access[_\-]?key
+    r"""(?:\b|_)(?:password|passwd|pass|secret|token|api[_\-]?key|access[_\-]?key
         |client[_\-]?secret|private[_\-]?key|auth[_\-]?token|credential)
         \b\s*[:=]\s*
         ['"]?([^\s'"#]{6,})['"]?""",

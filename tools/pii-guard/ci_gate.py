@@ -50,6 +50,19 @@ PII_GUARD = HERE / "pii-guard"
 GATE_SEVERITY = "high"
 SEV = {"low": 0, "medium": 1, "high": 2}
 
+# NEVER-PORT gate (pm-b44800): denylist classes that must fail the build at ANY
+# severity, not just >= GATE_SEVERITY. pii-guard seeds private component / tool /
+# skill names (`sensitive_project`), private machine / workspace identifiers
+# (`machine_specific` denylist hits), and private place names (`location`) at
+# MEDIUM severity -- but every one of these only ever fires on the injected
+# private seed, and each is a leak of an internal identifier that pii-guard's
+# structural patterns cannot catch by design (they are ordinary-looking words,
+# not emails/keys/paths). This is the exact leak class that put an internal
+# component name into a public file once before. Any hit here is genuine; gate
+# it regardless of the medium label pii-guard assigns. Person names / business
+# terms / emails / phones / keys / paths already gate at high on their own.
+ALWAYS_GATE_CLASSES = {"sensitive_project", "machine_specific", "location"}
+
 # --- Path excludes ---------------------------------------------------------
 # Files/dirs that INTENTIONALLY contain PII-like patterns or confidentiality
 # tripwire words as fixtures or documentation. Scanning them yields guaranteed
@@ -151,9 +164,13 @@ def is_noise(f: dict) -> bool:
         return False
 
     if klass == "machine_specific":
-        # EDWIN_HOME env convention (+ the BlueBubbles public project name, if
-        # denylisted) are sanctioned. Medium severity, but drop explicitly.
-        return True
+        # EDWIN_HOME and the BlueBubbles FOSS name are the sanctioned markers,
+        # but pii-guard already suppresses those upstream via SANCTIONED_ALLOW,
+        # so anything of this class that reaches here is a DENYLIST hit on a
+        # real private machine / workspace identifier injected from the seed --
+        # a genuine leak. Do NOT drop it. (See ALWAYS_GATE_CLASSES below: it is
+        # seeded at medium severity but must still fail the gate.)
+        return False
 
     if klass == "binary_unverified":
         ext = Path(f.get("file", "")).suffix.lower()
@@ -232,7 +249,9 @@ def main():
         else:
             kept.append(f)
 
-    gating = [f for f in kept if SEV[f["severity"]] >= SEV[GATE_SEVERITY]]
+    gating = [f for f in kept
+              if SEV[f["severity"]] >= SEV[GATE_SEVERITY]
+              or f.get("class") in ALWAYS_GATE_CLASSES]
 
     print(f"ci_gate: scanned {scanned} file(s); {len(findings)} raw finding(s); "
           f"{dropped} noise-floor dropped; {len(kept)} kept; "

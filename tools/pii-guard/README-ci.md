@@ -20,6 +20,23 @@ into this public repository.
    **never committed**. This gives full name-recall without the seed ever
    touching the public tree.
 
+## The NEVER-PORT component-name gate
+
+Structural detection (layer 1) cannot catch a leaked **internal identifier** —
+a private tool / skill / project / component name, a machine or workspace id, or
+a private place name — because those are ordinary-looking words, not emails,
+keys, or paths. A private component name reached a public file once this way.
+
+To close that class, put those identifiers in the private seed under
+`sensitive_projects`, `machine_terms`, and `locations`. `ci_gate.py` treats a
+denylist hit on any of those (classes `sensitive_project`, `machine_specific`,
+`location`) as **always-gating**: it fails the build regardless of the *medium*
+severity `pii-guard` assigns, via `ALWAYS_GATE_CLASSES`. Person names, business
+terms, emails, phones, keys, and paths already gate at `high` on their own, so
+they need no special handling. These sections only ever match the injected
+private seed, so external-contributor PRs (which cannot read the secret) are
+unaffected — nothing of these classes ever fires without the seed.
+
 ## What blocks vs. what only reports
 
 - **`pii-gate` (blocking)** scans the **changed files** in the push/PR. A build
