@@ -87,6 +87,16 @@ CONFIG = {
     "rerank_no_match_threshold": -5.0,         # config.rerankNoMatchThreshold
     # --- Summary-tier boost (mirrors config.memoryBoost) ---
     "memory_boost": float(os.environ.get("EVAL_MEMORY_BOOST", "1.15")),
+    # --- Recency / importance weighting (mirrors config.recency* in index.js) ---
+    # Reorders the already-selected result set by an age-decay bonus; never
+    # changes membership (hit@8 preserved). EVAL_RECENCY=0 evals with it off.
+    "recency_enabled": os.environ.get("EVAL_RECENCY", "1") != "0",
+    "recency_half_life_days": float(os.environ.get("RECENCY_HALF_LIFE_DAYS", "90")),
+    "recency_neutral": float(os.environ.get("RECENCY_NEUTRAL", "0.5")),
+    "recency_rerank_weight": float(os.environ.get("RECENCY_RERANK_WEIGHT", "1.0")),
+    "importance_rerank_weight": float(os.environ.get("IMPORTANCE_RERANK_WEIGHT", "0.5")),
+    "recency_mult_weight": float(os.environ.get("RECENCY_MULT_WEIGHT", "0.15")),
+    "importance_mult_weight": float(os.environ.get("IMPORTANCE_MULT_WEIGHT", "0.10")),
     # --- Temporal query rewriting: run the PRODUCTION parser via its CLI ---
     "temporal_parser": str(EDWIN_HOME / "mcp-servers" / "qdrant" / "temporal.js"),
     # Frozen clock for the parser: relative phrases in eval queries resolve
@@ -201,6 +211,47 @@ def _qdrant_query(body):
     return r["result"]["points"]
 
 
+# --- Recency / importance weighting (mirrors index.js recency helpers) ----------
+# Aged against a FROZEN clock (EVAL_NOW) so recency grades deterministically on
+# every run, exactly as the temporal parser is frozen.
+
+def _recency_now_ms():
+    dt = datetime.fromisoformat(CONFIG["eval_now"])
+    return dt.timestamp() * 1000.0
+
+
+NOW_MS = _recency_now_ms()
+
+_DATE_RE = __import__("re").compile(r"^(\d{4})-(\d{2})-(\d{2})")
+
+
+def _parse_date_ms(date_str):
+    if not date_str or not isinstance(date_str, str):
+        return None
+    m = _DATE_RE.match(date_str)
+    if not m:
+        return None
+    from calendar import timegm
+    return timegm((int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                   0, 0, 0, 0, 0, 0)) * 1000.0
+
+
+def recency_score(date_str):
+    ms = _parse_date_ms(date_str)
+    if ms is None:
+        return CONFIG["recency_neutral"]
+    age_days = max(0.0, (NOW_MS - ms) / 86400000.0)
+    return 0.5 ** (age_days / CONFIG["recency_half_life_days"])
+
+
+def importance_score(payload):
+    try:
+        v = float(payload.get("importance"))
+    except (TypeError, ValueError):
+        return None
+    return min(1.0, max(0.0, v))
+
+
 def production_search(query_text, vector, sparse_vec, qfilter, helper=None,
                       boost_memory=True):
     """Replicates the memory_search tool body in index.js.
@@ -308,13 +359,42 @@ def production_search(query_text, vector, sparse_vec, qfilter, helper=None,
             scores = helper.rerank(query_text, docs)
             for c, s in zip(block, scores):
                 c["rerank"] = s
-            block.sort(key=lambda c: c["rerank"], reverse=True)
+            # Answerability uses the MAX raw rerank logit (order-independent).
+            top_rerank = max(c["rerank"] for c in block)
+            # Recency / importance re-ranking (additive, logit scale). Membership
+            # unchanged -> hit@8 preserved; only reorders the block.
+            if CONFIG["recency_enabled"]:
+                for c in block:
+                    rec = recency_score(c["payload"].get("date"))
+                    imp = importance_score(c["payload"])
+                    c["final"] = (c["rerank"]
+                                  + CONFIG["recency_rerank_weight"] * rec
+                                  + CONFIG["importance_rerank_weight"]
+                                  * ((imp if imp is not None else 0.5) - 0.5))
+                block.sort(key=lambda c: c["final"], reverse=True)
+            else:
+                block.sort(key=lambda c: c["rerank"], reverse=True)
             selected = block + selected[CONFIG["rerank_max_docs"]:]
-            top_rerank = block[0]["rerank"]
             search_mode = ("hybrid-rerank" if search_mode == "hybrid-rrf"
                            else "dense-rerank")
         except Exception:
             pass  # graceful degradation, exactly like production
+
+    # Recency / importance re-ranking on the DEGRADED (no-rerank) path: reorder
+    # the already-selected set by a recency-scaled primary score. Membership is
+    # locked, so this only reorders the returned list (hit@8 preserved).
+    if CONFIG["recency_enabled"] and top_rerank is None and selected:
+        for c in selected:
+            rec = recency_score(c["payload"].get("date"))
+            imp = importance_score(c["payload"])
+            base = c.get("fused")
+            if base is None:
+                base = c.get("dense") or 0.0
+            c["final"] = (base
+                          * (1 + CONFIG["recency_mult_weight"] * rec)
+                          * (1 + CONFIG["importance_mult_weight"]
+                             * ((imp if imp is not None else 0.5) - 0.5)))
+        selected.sort(key=lambda c: c["final"], reverse=True)
 
     selected_paths = [c["path"] for c in selected]
 
@@ -545,7 +625,9 @@ def run_eval(timestamp=None, log=print):
                    ("min_score", "no_match_threshold", "max_chunks_per_file",
                     "candidate_multiplier", "limit", "rerank_enabled",
                     "rerank_max_docs", "rerank_no_match_threshold",
-                    "memory_boost")},
+                    "memory_boost", "recency_enabled",
+                    "recency_half_life_days", "recency_rerank_weight",
+                    "recency_mult_weight")},
         "queries": per_query,
     }
 
