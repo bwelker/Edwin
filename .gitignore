@@ -51,6 +51,7 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+.obsidian/
 
 # Plombery state
 *.db
